@@ -1,0 +1,60 @@
+From a9e5dcc619e7c33915c0bde0051a64505e5e191b Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 02:02:19 -0700
+Subject: [PATCH 92/97] WWE 2K14: player-visible launch-error text and
+ MessageBox title say WWE 2K14 (were WWE '13); Vulkan application name 'WWE
+ 2K14 Recomp' (was Xenia)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/vulkan/vulkan_instance.cpp  | 2 +-
+ src/ui/windowed_app_main_posix.cpp | 2 +-
+ src/ui/windowed_app_main_win.cpp   | 4 ++--
+ 3 files changed, 4 insertions(+), 4 deletions(-)
+
+diff --git a/src/ui/vulkan/vulkan_instance.cpp b/src/ui/vulkan/vulkan_instance.cpp
+index 8e2f486..2ef267d 100644
+--- a/src/ui/vulkan/vulkan_instance.cpp
++++ b/src/ui/vulkan/vulkan_instance.cpp
+@@ -285,7 +285,7 @@ std::unique_ptr<VulkanInstance> VulkanInstance::Create(const bool with_surface,
+   VkApplicationInfo application_info;
+   application_info.sType = VK_STRUCTURE_TYPE_APPLICATION_INFO;
+   application_info.pNext = nullptr;
+-  application_info.pApplicationName = "Xenia";
++  application_info.pApplicationName = "WWE 2K14 Recomp";
+   application_info.applicationVersion = 1;
+   application_info.pEngineName = nullptr;
+   application_info.engineVersion = 0;
+diff --git a/src/ui/windowed_app_main_posix.cpp b/src/ui/windowed_app_main_posix.cpp
+index d917779..ed3b12e 100644
+--- a/src/ui/windowed_app_main_posix.cpp
++++ b/src/ui/windowed_app_main_posix.cpp
+@@ -50,7 +50,7 @@ extern "C" int main(int argc_pre_gtk, char** argv_pre_gtk) {
+   auto init_result = rex::cvar::Init(argc_post_gtk, argv_post_gtk);
+   if (init_result.parse_error) {
+     std::fprintf(stderr,
+-                 "WWE '13 could not start: invalid launch option: %s. Check your shortcut or launcher settings.\n",
++                 "WWE 2K14 could not start: invalid launch option: %s. Check your shortcut or launcher settings.\n",
+                  init_result.parse_error->c_str());
+     return EXIT_FAILURE;
+   }
+diff --git a/src/ui/windowed_app_main_win.cpp b/src/ui/windowed_app_main_win.cpp
+index b46e23b..ff4791f 100644
+--- a/src/ui/windowed_app_main_win.cpp
++++ b/src/ui/windowed_app_main_win.cpp
+@@ -71,10 +71,10 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+   }
+   auto init_result = rex::cvar::Init(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
+   if (init_result.parse_error) {
+-    std::string message = "WWE '13 could not start: invalid launch option: " +
++    std::string message = "WWE 2K14 could not start: invalid launch option: " +
+                           *init_result.parse_error +
+                           ". Check your shortcut or launcher settings.";
+-    MessageBoxA(nullptr, message.c_str(), "WWE '13", MB_OK | MB_ICONERROR);
++    MessageBoxA(nullptr, message.c_str(), "WWE 2K14", MB_OK | MB_ICONERROR);
+     return EXIT_FAILURE;
+   }
+   if (init_result.exit_requested) {
+-- 
+2.43.0
+

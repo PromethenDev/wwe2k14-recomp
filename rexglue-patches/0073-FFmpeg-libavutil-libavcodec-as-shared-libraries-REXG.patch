@@ -1,0 +1,273 @@
+From 0ae9ea5fdc5dd794647d80803ae8ed0f87d137c2 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 19:04:40 -0700
+Subject: [PATCH 73/97] FFmpeg libavutil/libavcodec as shared libraries
+ (REXGLUE_FFMPEG_SHARED, default ON) for LGPL compliance
+
+Windows: avutil-56.dll / avcodec-58.dll (export-all + ff_reverse DATA .def); Linux: libavutil.so.56 /
+libavcodec.so.58 with $ORIGIN RUNPATH; copied next to the game exe post-build. Vendored FFmpeg tree untouched
+(config.h / reverse.h / version script shadowed in the build tree). Configs stay CONFIG_GPL/NONFREE/VERSION3 = 0.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt                  |   1 +
+ cmake/ffmpeg-avutil-private.def |   2 +
+ cmake/rexglueConfig.cmake.in    |   1 +
+ cmake/rexglue_helpers.cmake     |  42 +++++++++++
+ thirdparty/CMakeLists.txt       | 120 +++++++++++++++++++++++++++++++-
+ 5 files changed, 164 insertions(+), 2 deletions(-)
+ create mode 100644 cmake/ffmpeg-avutil-private.def
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index b986f15..410a51d 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -17,6 +17,7 @@ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (ex
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" OFF)
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" OFF)
+ option(REXGLUE_PROFILE_GUEST_FUNCTIONS     "Enable per-function Tracy zones in recompiled guest code (high overhead)" OFF)
++option(REXGLUE_FFMPEG_SHARED "Build FFmpeg libavutil/libavcodec as shared libraries" ON)
+ 
+ # Propagate profiling defines globally (compiled out in Release)
+ if(REXGLUE_ENABLE_TRACY)
+diff --git a/cmake/ffmpeg-avutil-private.def b/cmake/ffmpeg-avutil-private.def
+new file mode 100644
+index 0000000..0751c4f
+--- /dev/null
++++ b/cmake/ffmpeg-avutil-private.def
+@@ -0,0 +1,2 @@
++EXPORTS
++    ff_reverse DATA
+diff --git a/cmake/rexglueConfig.cmake.in b/cmake/rexglueConfig.cmake.in
+index 4e18bd1..ee3b866 100644
+--- a/cmake/rexglueConfig.cmake.in
++++ b/cmake/rexglueConfig.cmake.in
+@@ -10,6 +10,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/rexglue_helpers.cmake")
+ 
+ # Ensure bundled dependencies are found from the SDK install prefix
+ list(PREPEND CMAKE_PREFIX_PATH "${PACKAGE_PREFIX_DIR}")
++set(REXGLUE_FFMPEG_SHARED @REXGLUE_FFMPEG_SHARED@)
+ 
+ # Required dependencies
+ find_dependency(fmt CONFIG)
+diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
+index 69fec67..7f3c262 100644
+--- a/cmake/rexglue_helpers.cmake
++++ b/cmake/rexglue_helpers.cmake
+@@ -63,6 +63,48 @@ function(rexglue_configure_target target_name)
+         # ARM64 NEON is enabled via -march=armv8-a above
+     endif()
+ 
++    # rexaudio is a static SDK library, so its private FFmpeg link dependency
++    # must reach the final game link. In shared builds, add the exported FFmpeg
++    # targets explicitly so CMake also sees them as runtime dependencies.
++    if(TARGET rex::libavcodec AND TARGET rex::libavutil)
++        get_target_property(_avcodec_type rex::libavcodec TYPE)
++        get_target_property(_avutil_type rex::libavutil TYPE)
++        if(_avcodec_type STREQUAL "SHARED_LIBRARY" AND _avutil_type STREQUAL "SHARED_LIBRARY")
++            target_link_libraries(${target_name} PRIVATE rex::libavcodec rex::libavutil)
++            if(UNIX AND NOT APPLE)
++                # Resolve copied runtime libraries beside the executable, both
++                # in the build tree and after a release folder is moved.
++                set_target_properties(${target_name} PROPERTIES
++                    BUILD_WITH_INSTALL_RPATH TRUE
++                    INSTALL_RPATH "$ORIGIN"
++                )
++                add_custom_command(TARGET ${target_name} POST_BUILD
++                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                        "$<TARGET_SONAME_FILE:rex::libavcodec>"
++                        "$<TARGET_FILE_DIR:${target_name}>"
++                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                        "$<TARGET_SONAME_FILE:rex::libavutil>"
++                        "$<TARGET_FILE_DIR:${target_name}>"
++                    VERBATIM
++                )
++            elseif(WIN32)
++                # The SDK kernel also calls BCrypt directly. With FFmpeg now
++                # in DLLs, its former static-library bcrypt dependency no
++                # longer supplies this system import to the final executable.
++                target_link_libraries(${target_name} PRIVATE bcrypt)
++                add_custom_command(TARGET ${target_name} POST_BUILD
++                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                        "$<TARGET_FILE:rex::libavcodec>"
++                        "$<TARGET_FILE_DIR:${target_name}>"
++                    COMMAND ${CMAKE_COMMAND} -E copy_if_different
++                        "$<TARGET_FILE:rex::libavutil>"
++                        "$<TARGET_FILE_DIR:${target_name}>"
++                    VERBATIM
++                )
++            endif()
++        endif()
++    endif()
++
+     # Copy runtime DLLs next to the executable
+     if(WIN32)
+         add_custom_command(TARGET ${target_name} POST_BUILD
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index 755ca33..da635f7 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -347,6 +347,62 @@ endif()
+ 
+ set(FFMPEG_DIR "${CMAKE_CURRENT_SOURCE_DIR}/FFmpeg")
+ 
++# The vendored FFmpeg config headers describe the existing static build. For
++# shared builds, shadow config.h in the build tree and flip only the two build
++# mode flags after including the selected platform config. This keeps the
++# read-only FFmpeg submodule untouched while enabling its Windows dllimport
++# declarations for cross-library references.
++if(REXGLUE_FFMPEG_SHARED)
++  set(FFMPEG_SHARED_CONFIG_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-shared-config")
++  file(MAKE_DIRECTORY "${FFMPEG_SHARED_CONFIG_DIR}")
++  file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/config.h"
++    "#include \"${FFMPEG_DIR}/config.h\"\n"
++    "#undef CONFIG_SHARED\n#define CONFIG_SHARED 1\n"
++    "#undef CONFIG_STATIC\n#define CONFIG_STATIC 0\n")
++  # FFmpeg's reverse.h does not use av_export_avutil on its private const
++  # table. Shadow it in the build tree so libavcodec emits a data import
++  # reference for this cross-DLL dependency (the vendored header is untouched).
++  file(MAKE_DIRECTORY "${FFMPEG_SHARED_CONFIG_DIR}/libavutil")
++  file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/libavutil/reverse.h"
++    "#ifndef AVUTIL_REVERSE_H\n#define AVUTIL_REVERSE_H\n"
++    "#include <stdint.h>\n"
++    "#if defined(_WIN32) && !defined(BUILDING_avutil)\n"
++    "extern __declspec(dllimport) const uint8_t ff_reverse[256];\n"
++    "#else\nextern const uint8_t ff_reverse[256];\n#endif\n"
++    "#endif /* AVUTIL_REVERSE_H */\n")
++  # FFmpeg's upstream avutil version script hides non-av* symbols, but
++  # libavcodec directly reads this shared const table from libavutil. Preserve
++  # upstream exports and expose this one required cross-DSO data symbol in the
++  # generated build-tree script; never edit the read-only FFmpeg checkout.
++  file(READ "${FFMPEG_DIR}/libavutil/libavutil.v" FFMPEG_AVUTIL_VERSION_SCRIPT)
++  string(REPLACE "        av*;"
++    "        av*;\n        ff_reverse;"
++    FFMPEG_AVUTIL_VERSION_SCRIPT "${FFMPEG_AVUTIL_VERSION_SCRIPT}")
++  file(WRITE "${FFMPEG_SHARED_CONFIG_DIR}/libavutil.v"
++    "${FFMPEG_AVUTIL_VERSION_SCRIPT}")
++  set(FFMPEG_LIBRARY_TYPE SHARED)
++else()
++  set(FFMPEG_LIBRARY_TYPE STATIC)
++endif()
++
++function(ffmpeg_read_version_component out_var header component)
++  file(STRINGS "${header}" _version_line
++    REGEX "^#define [A-Z0-9_]+_VERSION_${component}[ \t]+[0-9]+")
++  if(NOT _version_line)
++    message(FATAL_ERROR "Could not read FFmpeg ${component} version from ${header}")
++  endif()
++  string(REGEX REPLACE ".*VERSION_${component}[ \t]+([0-9]+).*" "\\1"
++    _version_value "${_version_line}")
++  set(${out_var} "${_version_value}" PARENT_SCOPE)
++endfunction()
++
++foreach(_ffmpeg_component MAJOR MINOR MICRO)
++  ffmpeg_read_version_component(FFMPEG_AVUTIL_${_ffmpeg_component}
++    "${FFMPEG_DIR}/libavutil/version.h" "${_ffmpeg_component}")
++  ffmpeg_read_version_component(FFMPEG_AVCODEC_${_ffmpeg_component}
++    "${FFMPEG_DIR}/libavcodec/version.h" "${_ffmpeg_component}")
++endforeach()
++
+ # Overlay generated FFmpeg list files
+ set(FFMPEG_OVERLAY_SRC_DIR "${CMAKE_CURRENT_SOURCE_DIR}/ffmpeg-overlay")
+ set(FFMPEG_OVERLAY_BUILD_DIR "${CMAKE_CURRENT_BINARY_DIR}/ffmpeg-overlay")
+@@ -386,7 +442,7 @@ if(IS_ARM64)
+ endif()
+ 
+ # libavutil - FFmpeg utility library (must build first)
+-add_library(libavutil STATIC
++add_library(libavutil ${FFMPEG_LIBRARY_TYPE}
+     ${FFMPEG_DIR}/libavutil/adler32.c
+     ${FFMPEG_DIR}/libavutil/aes.c
+     ${FFMPEG_DIR}/libavutil/aes_ctr.c
+@@ -496,14 +552,47 @@ target_include_directories(libavutil
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+     PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+ )
++if(REXGLUE_FFMPEG_SHARED)
++    target_include_directories(libavutil BEFORE PRIVATE "${FFMPEG_SHARED_CONFIG_DIR}")
++endif()
+ target_compile_definitions(libavutil PRIVATE ${FFMPEG_COMMON_DEFINES})
+ target_compile_options(libavutil PRIVATE -w)  # Suppress warnings in third-party code
+ if(WIN32)
+     target_link_libraries(libavutil PRIVATE bcrypt)
+ endif()
+ 
++set_target_properties(libavutil PROPERTIES
++    OUTPUT_NAME avutil
++    DEBUG_POSTFIX ""
++    RELWITHDEBINFO_POSTFIX ""
++)
++if(REXGLUE_FFMPEG_SHARED)
++    set_target_properties(libavutil PROPERTIES
++        VERSION "${FFMPEG_AVUTIL_MAJOR}.${FFMPEG_AVUTIL_MINOR}.${FFMPEG_AVUTIL_MICRO}"
++        SOVERSION "${FFMPEG_AVUTIL_MAJOR}"
++    )
++    if(WIN32)
++        # CMake generates the module-definition export file from the compiled
++        # object symbols for clang-cl/lld-link. This exports FFmpeg's av* ABI
++        # without editing the vendored MSVC-style sources.
++        target_compile_definitions(libavutil PRIVATE BUILDING_avutil)
++        target_sources(libavutil PRIVATE
++            "${PROJECT_SOURCE_DIR}/cmake/ffmpeg-avutil-private.def"
++        )
++        set_target_properties(libavutil PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
++        set_target_properties(libavutil PROPERTIES
++            PREFIX ""
++            OUTPUT_NAME "avutil-${FFMPEG_AVUTIL_MAJOR}"
++        )
++    else()
++        target_link_options(libavutil PRIVATE
++            "LINKER:--version-script=${FFMPEG_SHARED_CONFIG_DIR}/libavutil.v"
++        )
++    endif()
++endif()
++
+ # libavcodec - FFmpeg codec library (depends on libavutil)
+-add_library(libavcodec STATIC
++add_library(libavcodec ${FFMPEG_LIBRARY_TYPE}
+     ${FFMPEG_DIR}/libavcodec/ac3_parser.c
+     ${FFMPEG_DIR}/libavcodec/adts_parser.c
+     ${FFMPEG_DIR}/libavcodec/allcodecs.c
+@@ -625,6 +714,9 @@ target_include_directories(libavcodec
+         $<INSTALL_INTERFACE:${CMAKE_INSTALL_INCLUDEDIR}>
+     PRIVATE ${FFMPEG_ATOMICS_INCLUDE}
+ )
++if(REXGLUE_FFMPEG_SHARED)
++    target_include_directories(libavcodec BEFORE PRIVATE "${FFMPEG_SHARED_CONFIG_DIR}")
++endif()
+ target_compile_definitions(libavcodec PRIVATE ${FFMPEG_COMMON_DEFINES})
+ target_compile_options(libavcodec PRIVATE -w)  # Suppress warnings in third-party code
+ target_link_libraries(libavcodec PUBLIC libavutil)
+@@ -632,5 +724,29 @@ if(WIN32)
+     target_link_libraries(libavcodec PRIVATE bcrypt)
+ endif()
+ 
++set_target_properties(libavcodec PROPERTIES
++    OUTPUT_NAME avcodec
++    DEBUG_POSTFIX ""
++    RELWITHDEBINFO_POSTFIX ""
++)
++if(REXGLUE_FFMPEG_SHARED)
++    set_target_properties(libavcodec PROPERTIES
++        VERSION "${FFMPEG_AVCODEC_MAJOR}.${FFMPEG_AVCODEC_MINOR}.${FFMPEG_AVCODEC_MICRO}"
++        SOVERSION "${FFMPEG_AVCODEC_MAJOR}"
++    )
++    if(WIN32)
++        target_compile_definitions(libavcodec PRIVATE BUILDING_avcodec)
++        set_target_properties(libavcodec PROPERTIES WINDOWS_EXPORT_ALL_SYMBOLS ON)
++        set_target_properties(libavcodec PROPERTIES
++            PREFIX ""
++            OUTPUT_NAME "avcodec-${FFMPEG_AVCODEC_MAJOR}"
++        )
++    else()
++        target_link_options(libavcodec PRIVATE
++            "LINKER:--version-script=${FFMPEG_DIR}/libavcodec/libavcodec.v"
++        )
++    endif()
++endif()
++
+ # IDE folder organization
+ set_target_properties(libavutil libavcodec PROPERTIES FOLDER "FFmpeg")
+-- 
+2.43.0
+

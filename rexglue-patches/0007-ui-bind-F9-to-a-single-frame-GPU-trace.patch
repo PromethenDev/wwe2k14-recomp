@@ -1,0 +1,46 @@
+From 0bbddfb974d1617adab00bf4469347b7637794fd Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 16:29:34 -0700
+Subject: [PATCH 07/97] ui: bind F9 to a single-frame GPU trace
+
+Registers bind_gpu_frame_trace (default F9) calling
+GraphicsSystem::RequestFrameTrace(), which was implemented but had no
+trigger. The .xtr is written under trace_gpu_prefix. Used to capture a
+HUD-only blackout frame vs a normal frame for offline comparison.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/rex_app.cpp | 10 ++++++++++
+ 1 file changed, 10 insertions(+)
+
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 04a31de..25f26e8 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -233,6 +233,14 @@ bool ReXApp::OnInitialize() {
+       }
+     }
+     window_->SetPresenter(presenter);
++
++    // Single-frame GPU trace (.xtr) written to trace_gpu_prefix, for offline
++    // inspection with the trace dump tool.
++    rex::ui::RegisterBind("bind_gpu_frame_trace", "F9", "Capture a single-frame GPU trace",
++                          [graphics_system] {
++                            REXLOG_INFO("GPU frame trace requested");
++                            graphics_system->RequestFrameTrace();
++                          });
+   }
+ 
+   // Launch module in background
+@@ -280,6 +288,8 @@ void ReXApp::OnDestroy() {
+   // Notify subclass before cleanup
+   OnShutdown();
+ 
++  rex::ui::UnregisterBind("bind_gpu_frame_trace");
++
+   // ImGui cleanup (reverse of setup)
+   settings_overlay_.reset();
+   console_overlay_.reset();
+-- 
+2.43.0
+

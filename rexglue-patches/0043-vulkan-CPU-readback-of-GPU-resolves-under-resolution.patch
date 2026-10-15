@@ -1,0 +1,910 @@
+From 63a9fa76b7a5ac920f0f6bdf57dc8bb67edb2741 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 02:33:37 -0700
+Subject: [PATCH 43/97] vulkan: CPU readback of GPU resolves under resolution
+ scaling (upscaling blocker)
+
+ReadbackGpuWrittenRange refused when draw resolution scaling was on, so the
+retro-HBK fix (game hook at XGUntileSurface -> MakeGpuWritesVisibleToCpu) left
+retro HBK black at 2x. Scaled resolves are now tracked with their exact ranges
+and guest pixel size (separate from the host buffer element size), read from
+the scaled resolve buffer with the existing resolve-downscale compute shader
+(one sample per scale block, original 32x32-tiled layout) and written to guest
+memory; exact unscaled GPU writes (memexport) keep the shared-memory path;
+unknown-destination memexports keep the old invalidation. Scale 1 unchanged.
+
+Gates (Linux, Attitude Era tag match, fixed 420/480 s entrance timeline):
+2x PASS, retro HBK in colour, 9 scaled readbacks; 3x (3840x2160) PASS, same;
+1x PASS, scaled path unused. v1 (whole unknown memexport marked unscaled) and
+v2 (bpe used as pixel size) broke 2x output and were rejected.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/pipeline/texture/cache.h |  19 +-
+ include/rex/graphics/util/draw.h              |   3 +
+ .../rex/graphics/vulkan/command_processor.h   |   4 +
+ src/graphics/d3d12/command_processor.cpp      |   8 +-
+ src/graphics/d3d12/render_target_cache.cpp    |   4 +-
+ src/graphics/pipeline/texture/cache.cpp       | 229 +++++++++-
+ src/graphics/util/draw.cpp                    |  18 +-
+ src/graphics/vulkan/command_processor.cpp     | 402 +++++++++++++++++-
+ src/graphics/vulkan/render_target_cache.cpp   |   4 +-
+ 9 files changed, 661 insertions(+), 30 deletions(-)
+
+diff --git a/include/rex/graphics/pipeline/texture/cache.h b/include/rex/graphics/pipeline/texture/cache.h
+index 537c7c0..29c6735 100644
+--- a/include/rex/graphics/pipeline/texture/cache.h
++++ b/include/rex/graphics/pipeline/texture/cache.h
+@@ -16,6 +16,7 @@
+ #include <cstring>
+ #include <memory>
+ #include <unordered_map>
++#include <utility>
+ #include <vector>
+ 
+ #include <rex/assert.h>
+@@ -80,7 +81,19 @@ class TextureCache {
+   virtual void BeginSubmission(uint64_t new_submission_index);
+   virtual void BeginFrame();
+ 
+-  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled);
++  struct ScaledResolveRange {
++    uint32_t start;
++    uint32_t length;
++    uint32_t pixel_size_log2;
++  };
++  void MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
++                           uint32_t pixel_size_log2, bool scaled);
++  void GetScaledResolveRanges(uint32_t start_unscaled, uint32_t length_unscaled,
++                              std::vector<ScaledResolveRange>& ranges_out);
++  void MarkRangeAsUnscaledGpuWrite(uint32_t start_unscaled, uint32_t length_unscaled);
++  void GetUnscaledGpuWriteRanges(
++      uint32_t start_unscaled, uint32_t length_unscaled,
++      std::vector<std::pair<uint32_t, uint32_t>>& ranges_out);
+   // Ensures the memory backing the range in the scaled resolve address space is
+   // allocated and returns whether it is.
+   virtual bool EnsureScaledResolveMemoryCommitted(uint32_t start_unscaled, uint32_t length_unscaled,
+@@ -568,6 +581,8 @@ class TextureCache {
+   // Checks if there are any pages that contain scaled resolve data within the
+   // range.
+   bool IsRangeScaledResolved(uint32_t start_unscaled, uint32_t length_unscaled);
++  void RemoveScaledResolveRanges(uint32_t address_first, uint32_t address_last);
++  void RemoveUnscaledGpuWriteRanges(uint32_t address_first, uint32_t address_last);
+   // Global shared memory invalidation callback for invalidating scaled resolved
+   // texture data.
+   static void ScaledResolveGlobalWatchCallbackThunk(
+@@ -593,6 +608,8 @@ class TextureCache {
+   // >> 12 for 4 KB pages, >> 5 for uint32_t level 1 bits, >> 6 for uint64_t
+   // level 2 bits.
+   uint64_t scaled_resolve_pages_l2_[SharedMemory::kBufferSize >> (12 + 5 + 6)];
++  std::vector<ScaledResolveRange> scaled_resolve_ranges_;
++  std::vector<std::pair<uint32_t, uint32_t>> unscaled_gpu_write_ranges_;
+ 
+   // Global watch for scaled resolve data invalidation.
+   SharedMemory::GlobalWatchHandle scaled_resolve_global_watch_handle_ = nullptr;
+diff --git a/include/rex/graphics/util/draw.h b/include/rex/graphics/util/draw.h
+index b6c914d..4355e8c 100644
+--- a/include/rex/graphics/util/draw.h
++++ b/include/rex/graphics/util/draw.h
+@@ -439,6 +439,9 @@ struct ResolveCopyShaderInfo {
+   // prevents binding the entire shared memory buffer with smaller element
+   // sizes).
+   uint32_t dest_bpe_log2;
++  // Log2 of the guest destination pixel size in bytes. Unlike dest_bpe_log2,
++  // this describes the resolve format, not the host storage-buffer element.
++  uint32_t dest_pixel_size_log2;
+   // Log2 of number of pixels in a single thread group along X and Y. 64 threads
+   // per group preferred (GCN lane count).
+   uint32_t group_size_x_log2, group_size_y_log2;
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 443e922..703d7e0 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -478,6 +478,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+   bool IssueCopy_ReadbackResolvePath();
+   void LogResolveDiagnostic(uint32_t written_address, uint32_t written_length);
+   bool ReadbackGpuWrittenRange(uint32_t physical_address, uint32_t length) override;
++  bool ReadbackScaledGpuWrittenRanges(
++      const std::vector<std::pair<uint32_t, uint32_t>>& runs,
++      const std::vector<TextureCache::ScaledResolveRange>& scaled_ranges,
++      const std::vector<std::pair<uint32_t, uint32_t>>& unscaled_ranges);
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+ 
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index 12ff744..fd2d483 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -2729,12 +2729,14 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
+     // Invalidate textures in memexported memory and watch for changes.
+     if (!memexport_ranges_.empty()) {
+       for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+-        shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
+-                                          memexport_range.size_bytes);
++        uint32_t start = memexport_range.base_address_dwords << 2;
++        texture_cache_->MarkRangeAsUnscaledGpuWrite(start, memexport_range.size_bytes);
+       }
+     } else {
+       // Stream constants can be invalid or dynamic, so exact destinations may
+-      // be unknown. Keep invalidation conservative in this case.
++      // be unknown. Keep texture invalidation conservative, but don't classify
++      // the entire shared memory as unscaled: that would discard scaled-resolve
++      // metadata for destinations the draw may not have written.
+       shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+     }
+     if (IsReadbackMemexportEnabled() &&
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 8e269c4..9a7acf5 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -1318,7 +1318,9 @@ bool D3D12RenderTargetCache::Resolve(const memory::Memory& memory, D3D12SharedMe
+ 
+           // Invalidate textures and mark the range as scaled if needed.
+           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+-                                            resolve_info.copy_dest_extent_length);
++                                            resolve_info.copy_dest_extent_length,
++                                            copy_shader_info.dest_pixel_size_log2,
++                                            draw_resolution_scaled);
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index 7e21439..accd560 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -312,19 +312,32 @@ void TextureCache::BeginFrame() {
+   ResetTextureBindings();
+ }
+ 
+-void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled) {
++void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_unscaled,
++                                       uint32_t pixel_size_log2, bool scaled) {
+   if (length_unscaled == 0) {
+     return;
+   }
+   start_unscaled &= 0x1FFFFFFF;
+   length_unscaled = std::min(length_unscaled, 0x20000000 - start_unscaled);
+ 
+-  if (IsDrawResolutionScaled()) {
++  if (!IsDrawResolutionScaled()) {
++    shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
++    return;
++  }
++  if (!scaled || pixel_size_log2 > 3) {
++    MarkRangeAsUnscaledGpuWrite(start_unscaled, length_unscaled);
++    return;
++  }
++  // Keep invalidation and replacement of the scaled-resolve metadata atomic
++  // with respect to CPU memory writes and range queries.
++  auto global_lock = global_critical_region_.Acquire();
++  shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
++
++  {
+     uint32_t page_first = start_unscaled >> 12;
+     uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
+     uint32_t block_first = page_first >> 5;
+     uint32_t block_last = page_last >> 5;
+-    auto global_lock = global_critical_region_.Acquire();
+     for (uint32_t i = block_first; i <= block_last; ++i) {
+       uint32_t add_bits = UINT32_MAX;
+       if (i == block_first) {
+@@ -336,11 +349,210 @@ void TextureCache::MarkRangeAsResolved(uint32_t start_unscaled, uint32_t length_
+       scaled_resolve_pages_[i] |= add_bits;
+       scaled_resolve_pages_l2_[i >> 6] |= UINT64_C(1) << (i & 63);
+     }
++
++    const uint32_t end_unscaled = start_unscaled + length_unscaled;
++    RemoveUnscaledGpuWriteRanges(start_unscaled, end_unscaled - 1);
++    std::vector<ScaledResolveRange> updated_ranges;
++    updated_ranges.reserve(scaled_resolve_ranges_.size() + 1);
++    for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
++      const uint32_t range_end = range.start + range.length;
++      if (range_end <= start_unscaled || range.start >= end_unscaled) {
++        updated_ranges.push_back(range);
++        continue;
++      }
++      if (range.start < start_unscaled) {
++        updated_ranges.push_back(
++            {range.start, start_unscaled - range.start, range.pixel_size_log2});
++      }
++      if (range_end > end_unscaled) {
++        updated_ranges.push_back(
++            {end_unscaled, range_end - end_unscaled, range.pixel_size_log2});
++      }
++    }
++    auto insertion = std::lower_bound(
++        updated_ranges.begin(), updated_ranges.end(), start_unscaled,
++        [](const ScaledResolveRange& range, uint32_t start) { return range.start < start; });
++    updated_ranges.insert(insertion, {start_unscaled, length_unscaled, pixel_size_log2});
++
++    scaled_resolve_ranges_.clear();
++    scaled_resolve_ranges_.reserve(updated_ranges.size());
++    for (const ScaledResolveRange& range : updated_ranges) {
++      if (!scaled_resolve_ranges_.empty()) {
++        ScaledResolveRange& previous = scaled_resolve_ranges_.back();
++        if (previous.start + previous.length == range.start &&
++            previous.pixel_size_log2 == range.pixel_size_log2) {
++          previous.length += range.length;
++          continue;
++        }
++      }
++      scaled_resolve_ranges_.push_back(range);
++    }
++  }
++}
++
++void TextureCache::GetScaledResolveRanges(uint32_t start_unscaled, uint32_t length_unscaled,
++                                          std::vector<ScaledResolveRange>& ranges_out) {
++  ranges_out.clear();
++  if (!IsDrawResolutionScaled() || !length_unscaled ||
++      start_unscaled >= SharedMemory::kBufferSize) {
++    return;
++  }
++  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
++  const uint64_t end_unscaled = uint64_t(start_unscaled) + length_unscaled;
++  auto global_lock = global_critical_region_.Acquire();
++  for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
++    const uint64_t range_end = uint64_t(range.start) + range.length;
++    if (range_end <= start_unscaled) {
++      continue;
++    }
++    if (range.start >= end_unscaled) {
++      break;
++    }
++    uint32_t intersection_start = std::max(start_unscaled, range.start);
++    uint32_t intersection_end = uint32_t(std::min(end_unscaled, range_end));
++    ranges_out.push_back(
++        {intersection_start, intersection_end - intersection_start, range.pixel_size_log2});
++  }
++}
++
++void TextureCache::GetUnscaledGpuWriteRanges(
++    uint32_t start_unscaled, uint32_t length_unscaled,
++    std::vector<std::pair<uint32_t, uint32_t>>& ranges_out) {
++  ranges_out.clear();
++  if (!IsDrawResolutionScaled() || !length_unscaled ||
++      start_unscaled >= SharedMemory::kBufferSize) {
++    return;
++  }
++  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
++  const uint64_t end_unscaled = uint64_t(start_unscaled) + length_unscaled;
++  auto global_lock = global_critical_region_.Acquire();
++  for (const auto& range : unscaled_gpu_write_ranges_) {
++    const uint64_t range_end = uint64_t(range.first) + range.second;
++    if (range_end <= start_unscaled) {
++      continue;
++    }
++    if (range.first >= end_unscaled) {
++      break;
++    }
++    uint32_t intersection_start = std::max(start_unscaled, range.first);
++    uint32_t intersection_end = uint32_t(std::min(end_unscaled, range_end));
++    ranges_out.emplace_back(intersection_start, intersection_end - intersection_start);
++  }
++}
++
++void TextureCache::RemoveScaledResolveRanges(uint32_t address_first, uint32_t address_last) {
++  const uint64_t invalidation_end = uint64_t(address_last) + 1;
++  std::vector<ScaledResolveRange> updated_ranges;
++  updated_ranges.reserve(scaled_resolve_ranges_.size());
++  for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
++    const uint64_t range_end = uint64_t(range.start) + range.length;
++    if (range_end <= address_first || range.start >= invalidation_end) {
++      updated_ranges.push_back(range);
++      continue;
++    }
++    if (range.start < address_first) {
++      updated_ranges.push_back(
++          {range.start, address_first - range.start, range.pixel_size_log2});
++    }
++    if (range_end > invalidation_end) {
++      updated_ranges.push_back({uint32_t(invalidation_end),
++                                uint32_t(range_end - invalidation_end), range.pixel_size_log2});
++    }
++  }
++  scaled_resolve_ranges_.swap(updated_ranges);
++}
++
++void TextureCache::RemoveUnscaledGpuWriteRanges(uint32_t address_first, uint32_t address_last) {
++  const uint64_t invalidation_end = uint64_t(address_last) + 1;
++  std::vector<std::pair<uint32_t, uint32_t>> updated_ranges;
++  updated_ranges.reserve(unscaled_gpu_write_ranges_.size());
++  for (const auto& range : unscaled_gpu_write_ranges_) {
++    const uint64_t range_end = uint64_t(range.first) + range.second;
++    if (range_end <= address_first || range.first >= invalidation_end) {
++      updated_ranges.push_back(range);
++      continue;
++    }
++    if (range.first < address_first) {
++      updated_ranges.emplace_back(range.first, address_first - range.first);
++    }
++    if (range_end > invalidation_end) {
++      updated_ranges.emplace_back(uint32_t(invalidation_end),
++                                  uint32_t(range_end - invalidation_end));
++    }
+   }
++  unscaled_gpu_write_ranges_.swap(updated_ranges);
++}
+ 
+-  // Invalidate textures. Toggling individual textures between scaled and
+-  // unscaled also relies on invalidation through shared memory.
++void TextureCache::MarkRangeAsUnscaledGpuWrite(uint32_t start_unscaled,
++                                               uint32_t length_unscaled) {
++  if (!IsDrawResolutionScaled() || !length_unscaled ||
++      start_unscaled >= SharedMemory::kBufferSize) {
++    if (!IsDrawResolutionScaled()) {
++      shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
++    }
++    return;
++  }
++  length_unscaled = std::min(length_unscaled, SharedMemory::kBufferSize - start_unscaled);
++  uint32_t page_first = start_unscaled >> 12;
++  uint32_t page_last = (start_unscaled + length_unscaled - 1) >> 12;
++  auto global_lock = global_critical_region_.Acquire();
+   shared_memory().RangeWrittenByGpu(start_unscaled, length_unscaled);
++
++  if (!start_unscaled && length_unscaled == SharedMemory::kBufferSize) {
++    scaled_resolve_ranges_.clear();
++    unscaled_gpu_write_ranges_.clear();
++    unscaled_gpu_write_ranges_.emplace_back(0, SharedMemory::kBufferSize);
++    std::memset(scaled_resolve_pages_.get(), 0,
++                (SharedMemory::kBufferSize / 4096 / 32) * sizeof(uint32_t));
++    std::memset(scaled_resolve_pages_l2_, 0, sizeof(scaled_resolve_pages_l2_));
++    return;
++  }
++
++  RemoveScaledResolveRanges(start_unscaled, start_unscaled + length_unscaled - 1);
++  RemoveUnscaledGpuWriteRanges(start_unscaled, start_unscaled + length_unscaled - 1);
++  for (uint32_t page = page_first; page <= page_last; ++page) {
++    uint32_t block = page >> 5;
++    scaled_resolve_pages_[block] &= ~(UINT32_C(1) << (page & 31));
++    if (!scaled_resolve_pages_[block]) {
++      scaled_resolve_pages_l2_[block >> 6] &= ~(UINT64_C(1) << (block & 63));
++    }
++  }
++
++  uint64_t page_range_start = uint64_t(page_first) << 12;
++  uint64_t page_range_end = (uint64_t(page_last) + 1) << 12;
++  for (const ScaledResolveRange& range : scaled_resolve_ranges_) {
++    uint64_t range_end = uint64_t(range.start) + range.length;
++    if (range_end <= page_range_start || range.start >= page_range_end) {
++      continue;
++    }
++    uint32_t surviving_page_first = std::max(page_first, range.start >> 12);
++    uint32_t surviving_page_last =
++        std::min(page_last, uint32_t((range_end - 1) >> 12));
++    for (uint32_t page = surviving_page_first; page <= surviving_page_last; ++page) {
++      uint32_t block = page >> 5;
++      scaled_resolve_pages_[block] |= UINT32_C(1) << (page & 31);
++      scaled_resolve_pages_l2_[block >> 6] |= UINT64_C(1) << (block & 63);
++    }
++  }
++
++  uint32_t end_unscaled = start_unscaled + length_unscaled;
++  auto insertion = std::lower_bound(
++      unscaled_gpu_write_ranges_.begin(), unscaled_gpu_write_ranges_.end(), start_unscaled,
++      [](const std::pair<uint32_t, uint32_t>& range, uint32_t start) {
++        return range.first < start;
++      });
++  unscaled_gpu_write_ranges_.insert(insertion, {start_unscaled, length_unscaled});
++  std::vector<std::pair<uint32_t, uint32_t>> merged_ranges;
++  merged_ranges.reserve(unscaled_gpu_write_ranges_.size());
++  for (const auto& range : unscaled_gpu_write_ranges_) {
++    if (!merged_ranges.empty() &&
++        uint64_t(merged_ranges.back().first) + merged_ranges.back().second == range.first) {
++      merged_ranges.back().second += range.second;
++    } else {
++      merged_ranges.push_back(range);
++    }
++  }
++  unscaled_gpu_write_ranges_.swap(merged_ranges);
+ }
+ 
+ uint32_t TextureCache::GuestToHostSwizzle(uint32_t guest_swizzle, uint32_t host_format_swizzle) {
+@@ -1155,10 +1367,11 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
+     uint32_t address_last, bool invalidated_by_gpu) {
+   assert_true(IsDrawResolutionScaled());
+   if (invalidated_by_gpu) {
+-    // Resolves themselves do exactly the opposite of what this should do.
++    // GPU writes are tracked explicitly by their call sites - resolve writes
++    // may preserve scaled data, while memexports invalidate it.
+     return;
+   }
+-  // Mark scaled resolve ranges as non-scaled. Textures themselves will be
++  // CPU writes invalidate scaled resolve contents. Textures themselves will be
+   // invalidated by their shared memory watches.
+   uint32_t resolve_page_first = address_first >> 12;
+   uint32_t resolve_page_last = address_last >> 12;
+@@ -1192,6 +1405,8 @@ void TextureCache::ScaledResolveGlobalWatchCallback(
+       }
+     }
+   }
++  RemoveScaledResolveRanges(address_first, address_last);
++  RemoveUnscaledGpuWriteRanges(address_first, address_last);
+ }
+ 
+ }  // namespace rex::graphics
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index f191b02..200afc0 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -751,15 +751,15 @@ void GetResolveEdramTileSpan(ResolveEdramInfo edram_info, ResolveCoordinateInfo
+ }
+ 
+ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderIndex::kCount)] = {
+-    {"Resolve Copy Fast 32bpp 1x/2xMSAA", false, 4, 4, 6, 3},
+-    {"Resolve Copy Fast 32bpp 4xMSAA", false, 4, 4, 6, 3},
+-    {"Resolve Copy Fast 64bpp 1x/2xMSAA", false, 4, 4, 5, 3},
+-    {"Resolve Copy Fast 64bpp 4xMSAA", false, 3, 4, 5, 3},
+-    {"Resolve Copy Full 8bpp", true, 2, 3, 6, 3},
+-    {"Resolve Copy Full 16bpp", true, 2, 3, 5, 3},
+-    {"Resolve Copy Full 32bpp", true, 2, 4, 5, 3},
+-    {"Resolve Copy Full 64bpp", true, 2, 4, 5, 3},
+-    {"Resolve Copy Full 128bpp", true, 2, 4, 4, 3},
++    {"Resolve Copy Fast 32bpp 1x/2xMSAA", false, 4, 4, 2, 6, 3},
++    {"Resolve Copy Fast 32bpp 4xMSAA", false, 4, 4, 2, 6, 3},
++    {"Resolve Copy Fast 64bpp 1x/2xMSAA", false, 4, 4, 3, 5, 3},
++    {"Resolve Copy Fast 64bpp 4xMSAA", false, 3, 4, 3, 5, 3},
++    {"Resolve Copy Full 8bpp", true, 2, 3, 0, 6, 3},
++    {"Resolve Copy Full 16bpp", true, 2, 3, 1, 5, 3},
++    {"Resolve Copy Full 32bpp", true, 2, 4, 2, 5, 3},
++    {"Resolve Copy Full 64bpp", true, 2, 4, 3, 5, 3},
++    {"Resolve Copy Full 128bpp", true, 2, 4, 4, 4, 3},
+ };
+ 
+ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index cc366fa..a129b6b 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
+ #include <chrono>
+ #include <cstdint>
+ #include <cstdlib>
+@@ -4680,12 +4681,14 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+   // Invalidate textures in memexported memory and watch for changes.
+   if (!memexport_ranges_.empty()) {
+     for (const draw_util::MemExportRange& memexport_range : memexport_ranges_) {
+-      shared_memory_->RangeWrittenByGpu(memexport_range.base_address_dwords << 2,
+-                                        memexport_range.size_bytes);
++      uint32_t start = memexport_range.base_address_dwords << 2;
++      texture_cache_->MarkRangeAsUnscaledGpuWrite(start, memexport_range.size_bytes);
+     }
+   } else if (memexport_writes_possible) {
+     // Stream constants can be invalid or dynamic, so exact destinations may be
+-    // unknown. Keep invalidation conservative in this case.
++    // unknown. Keep texture invalidation conservative, but don't classify the
++    // entire shared memory as unscaled: that would discard scaled-resolve
++    // metadata for destinations the draw may not have written.
+     shared_memory_->RangeWrittenByGpu(0, SharedMemory::kBufferSize);
+   }
+ 
+@@ -5416,18 +5419,401 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   return true;
+ }
+ 
+-bool VulkanCommandProcessor::ReadbackGpuWrittenRange(uint32_t physical_address,
+-                                                     uint32_t length) {
+-  if (texture_cache_->IsDrawResolutionScaled()) {
+-    // Resolved data lives in the scaled resolve buffer; not handled here.
+-    REXGPU_WARN("ReadbackGpuWrittenRange: draw resolution scaling is not supported");
++bool VulkanCommandProcessor::ReadbackScaledGpuWrittenRanges(
++    const std::vector<std::pair<uint32_t, uint32_t>>& runs,
++    const std::vector<TextureCache::ScaledResolveRange>& scaled_ranges,
++    const std::vector<std::pair<uint32_t, uint32_t>>& unscaled_ranges) {
++  struct ReadbackJob {
++    uint32_t address;
++    uint32_t length;
++    uint32_t transfer_address;
++    uint32_t transfer_length;
++    uint32_t readback_offset;
++    uint32_t pixel_size_log2;
++    uint32_t tile_count;
++    uint32_t source_offset_bytes;
++    VkDeviceSize source_buffer_offset;
++    VkDeviceSize source_buffer_range;
++  };
++  constexpr uint32_t kUnscaledJob = UINT32_MAX;
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  std::vector<ReadbackJob> jobs;
++  uint64_t readback_size_64 = 0;
++  uint32_t max_downscale_length = 0;
++
++  auto append_unscaled_job = [&](uint32_t start, uint32_t end) -> bool {
++    if (start >= end) {
++      return true;
++    }
++    uint32_t transfer_start = start & ~uint32_t(3);
++    uint64_t transfer_end = (uint64_t(end) + 3) & ~uint64_t(3);
++    if (transfer_end > SharedMemory::kBufferSize ||
++        transfer_end - transfer_start > UINT32_MAX ||
++        readback_size_64 + (transfer_end - transfer_start) > UINT32_MAX) {
++      return false;
++    }
++    uint32_t transfer_length = uint32_t(transfer_end - transfer_start);
++    jobs.push_back({start, end - start, transfer_start, transfer_length,
++                    uint32_t(readback_size_64), kUnscaledJob, 0, 0, 0, 0});
++    readback_size_64 += transfer_length;
++    return true;
++  };
++
++  auto append_scaled_job = [&](uint32_t start, uint32_t end,
++                               uint32_t pixel_size_log2) -> bool {
++    if (start >= end) {
++      return true;
++    }
++    if (pixel_size_log2 > 3) {
++      REXGPU_ERROR("ReadbackGpuWrittenRange: unsupported scaled resolve pixel size {}",
++                   pixel_size_log2);
++      return false;
++    }
++    uint32_t tile_size = 32 * 32 * (uint32_t(1) << pixel_size_log2);
++    uint32_t transfer_start = start & ~(tile_size - 1);
++    uint64_t transfer_end = (uint64_t(end) + tile_size - 1) & ~uint64_t(tile_size - 1);
++    if (transfer_end > SharedMemory::kBufferSize ||
++        transfer_end - transfer_start > UINT32_MAX ||
++        readback_size_64 + (transfer_end - transfer_start) > UINT32_MAX) {
++      REXGPU_ERROR("ReadbackGpuWrittenRange: scaled resolve tile range is out of bounds");
++      return false;
++    }
++    uint32_t transfer_length = uint32_t(transfer_end - transfer_start);
++    if (transfer_length > vulkan_device->properties().maxStorageBufferRange) {
++      REXGPU_ERROR("ReadbackGpuWrittenRange: downscale output exceeds the Vulkan storage range");
++      return false;
++    }
++    uint64_t scaled_start = 0;
++    uint64_t scaled_length = 0;
++    if (!texture_cache_->GetScaledResolveRange(transfer_start, transfer_length, 0,
++                                               scaled_start, scaled_length) ||
++        !scaled_length ||
++        !texture_cache_->CommitScaledResolveRange(transfer_start, transfer_length)) {
++      REXGPU_ERROR("ReadbackGpuWrittenRange: failed to map scaled resolve tiles at {:08X}+{}",
++                   transfer_start, transfer_length);
++      return false;
++    }
++    VkDeviceSize source_alignment = std::max(
++        VkDeviceSize(1), vulkan_device->properties().minStorageBufferOffsetAlignment);
++    VkDeviceSize source_buffer_offset = scaled_start - (scaled_start % source_alignment);
++    uint64_t source_offset_bytes = scaled_start - source_buffer_offset;
++    uint64_t source_buffer_range = source_offset_bytes + scaled_length;
++    if (source_offset_bytes > UINT32_MAX ||
++        source_buffer_range > vulkan_device->properties().maxStorageBufferRange) {
++      REXGPU_ERROR("ReadbackGpuWrittenRange: scaled resolve descriptor range is unsupported");
++      return false;
++    }
++    uint32_t tile_count = transfer_length / tile_size;
++    jobs.push_back({start, end - start, transfer_start, transfer_length,
++                    uint32_t(readback_size_64), pixel_size_log2, tile_count,
++                    uint32_t(source_offset_bytes), source_buffer_offset, source_buffer_range});
++    readback_size_64 += transfer_length;
++    max_downscale_length = std::max(max_downscale_length, transfer_length);
++    return true;
++  };
++
++  // Use exact resolve and unscaled-writer spans inside the shared memory GPU-
++  // written runs. Page-level padding around scaled resolves has no shared-memory
++  // resolve contents and must not be copied to guest memory.
++  size_t scaled_range_index = 0;
++  size_t unscaled_range_index = 0;
++  for (const auto& run : runs) {
++    uint32_t run_end = run.first + run.second;
++    while (scaled_range_index < scaled_ranges.size() ||
++           unscaled_range_index < unscaled_ranges.size()) {
++      bool take_scaled = unscaled_range_index >= unscaled_ranges.size() ||
++                         (scaled_range_index < scaled_ranges.size() &&
++                          scaled_ranges[scaled_range_index].start <=
++                              unscaled_ranges[unscaled_range_index].first);
++      uint32_t range_start = take_scaled ? scaled_ranges[scaled_range_index].start
++                                         : unscaled_ranges[unscaled_range_index].first;
++      uint32_t range_length = take_scaled ? scaled_ranges[scaled_range_index].length
++                                          : unscaled_ranges[unscaled_range_index].second;
++      uint32_t range_end = range_start + range_length;
++      if (range_end <= run.first) {
++        if (take_scaled) {
++          ++scaled_range_index;
++        } else {
++          ++unscaled_range_index;
++        }
++        continue;
++      }
++      if (range_start >= run_end) {
++        break;
++      }
++      uint32_t intersection_start = std::max(run.first, range_start);
++      uint32_t intersection_end = std::min(run_end, range_end);
++      bool job_added = take_scaled
++                           ? append_scaled_job(
++                                 intersection_start, intersection_end,
++                                 scaled_ranges[scaled_range_index].pixel_size_log2)
++                           : append_unscaled_job(intersection_start, intersection_end);
++      if (!job_added) {
++        return false;
++      }
++      if (range_end <= run_end) {
++        if (take_scaled) {
++          ++scaled_range_index;
++        } else {
++          ++unscaled_range_index;
++        }
++      } else {
++        break;
++      }
++    }
++  }
++  if (jobs.empty() || !readback_size_64) {
++    return true;
++  }
++
++  static std::atomic<bool> scaled_readback_logged{false};
++  if (!scaled_readback_logged.exchange(true, std::memory_order_relaxed)) {
++    REXGPU_INFO("ReadbackGpuWrittenRange: scaled resolve readback active ({}x{})",
++                texture_cache_->draw_resolution_scale_x(),
++                texture_cache_->draw_resolution_scale_y());
++  }
++
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  VkBuffer readback_buffer = VK_NULL_HANDLE;
++  VkDeviceMemory readback_memory = VK_NULL_HANDLE;
++  uint32_t readback_size = AlignReadbackBufferSize(uint32_t(readback_size_64));
++  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++          vulkan_device, readback_size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++          ui::vulkan::util::MemoryPurpose::kReadback, readback_buffer, readback_memory)) {
++    REXGPU_ERROR("ReadbackGpuWrittenRange: failed to create a {} KB scaled readback buffer",
++                 readback_size >> 10);
+     return false;
+   }
++
++  void* mapping = nullptr;
++  bool ok = dfn.vkMapMemory(device, readback_memory, 0, VK_WHOLE_SIZE, 0, &mapping) == VK_SUCCESS;
++  if (!ok) {
++    REXGPU_ERROR("ReadbackGpuWrittenRange: failed to map the scaled readback buffer");
++  }
++
++  if (ok && max_downscale_length) {
++    uint32_t downscale_buffer_size = AlignReadbackBufferSize(max_downscale_length);
++    if (downscale_buffer_size > resolve_downscale_buffer_size_) {
++      VkBuffer new_buffer = VK_NULL_HANDLE;
++      VkDeviceMemory new_memory = VK_NULL_HANDLE;
++      if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++              vulkan_device, downscale_buffer_size,
++              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_SRC_BIT,
++              ui::vulkan::util::MemoryPurpose::kDeviceLocal, new_buffer, new_memory)) {
++        REXGPU_ERROR("ReadbackGpuWrittenRange: failed to create a {} KB downscale buffer",
++                     downscale_buffer_size >> 10);
++        ok = false;
++      } else if ((resolve_downscale_buffer_ != VK_NULL_HANDLE ||
++                  resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) &&
++                 !AwaitAllQueueOperationsCompletion()) {
++        dfn.vkDestroyBuffer(device, new_buffer, nullptr);
++        dfn.vkFreeMemory(device, new_memory, nullptr);
++        ok = false;
++      } else {
++        if (resolve_downscale_buffer_ != VK_NULL_HANDLE) {
++          dfn.vkDestroyBuffer(device, resolve_downscale_buffer_, nullptr);
++        }
++        if (resolve_downscale_buffer_memory_ != VK_NULL_HANDLE) {
++          dfn.vkFreeMemory(device, resolve_downscale_buffer_memory_, nullptr);
++        }
++        resolve_downscale_buffer_ = new_buffer;
++        resolve_downscale_buffer_memory_ = new_memory;
++        resolve_downscale_buffer_size_ = downscale_buffer_size;
++      }
++    }
++    if (resolve_downscale_buffer_ == VK_NULL_HANDLE || !resolve_downscale_pipeline_ ||
++        !resolve_downscale_pipeline_layout_) {
++      REXGPU_ERROR("ReadbackGpuWrittenRange: scaled resolve downscale resources are unavailable");
++      ok = false;
++    }
++  }
++
++  bool submission_begun = false;
++  if (ok) {
++    ok = BeginSubmission(true);
++    submission_begun = ok;
++  }
++  if (ok) {
++    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
++    texture_cache_->UseScaledResolveBufferForRead();
++    SubmitBarriers(true);
++
++    for (const ReadbackJob& job : jobs) {
++      if (job.pixel_size_log2 == kUnscaledJob) {
++        VkBufferCopy copy = {};
++        copy.srcOffset = job.transfer_address;
++        copy.dstOffset = job.readback_offset;
++        copy.size = job.transfer_length;
++        deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), readback_buffer, 1,
++                                                &copy);
++        continue;
++      }
++
++      VkDescriptorSet descriptor_set = AllocateSingleTransientDescriptor(
++          SingleTransientDescriptorLayout::kStorageBufferPairCompute);
++      if (descriptor_set == VK_NULL_HANDLE) {
++        ok = false;
++        break;
++      }
++      VkDescriptorBufferInfo buffer_infos[2] = {};
++      buffer_infos[0].buffer = texture_cache_->scaled_resolve_buffer();
++      buffer_infos[0].offset = job.source_buffer_offset;
++      buffer_infos[0].range = job.source_buffer_range;
++      buffer_infos[1].buffer = resolve_downscale_buffer_;
++      buffer_infos[1].range = job.transfer_length;
++      VkWriteDescriptorSet descriptor_writes[2] = {};
++      for (uint32_t i = 0; i < 2; ++i) {
++        descriptor_writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
++        descriptor_writes[i].dstSet = descriptor_set;
++        descriptor_writes[i].dstBinding = i;
++        descriptor_writes[i].descriptorCount = 1;
++        descriptor_writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
++        descriptor_writes[i].pBufferInfo = &buffer_infos[i];
++      }
++      dfn.vkUpdateDescriptorSets(device, 2, descriptor_writes, 0, nullptr);
++
++      VkBufferMemoryBarrier pre_barrier = {};
++      pre_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++      pre_barrier.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
++      pre_barrier.dstAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++      pre_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      pre_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      pre_barrier.buffer = resolve_downscale_buffer_;
++      pre_barrier.size = job.transfer_length;
++      deferred_command_buffer_.CmdVkPipelineBarrier(
++          VK_PIPELINE_STAGE_TRANSFER_BIT | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++          VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0, 0, nullptr, 1, &pre_barrier, 0, nullptr);
++
++      BindExternalComputePipeline(resolve_downscale_pipeline_);
++      ResolveDownscaleConstants constants;
++      constants.scale_x = texture_cache_->draw_resolution_scale_x();
++      constants.scale_y = texture_cache_->draw_resolution_scale_y();
++      constants.pixel_size_log2 = job.pixel_size_log2;
++      constants.tile_count = job.tile_count;
++      constants.source_offset_bytes = job.source_offset_bytes;
++      constants.half_pixel_offset =
++          (REXCVAR_GET(readback_resolve_half_pixel_offset) &&
++           (constants.scale_x > 1 || constants.scale_y > 1))
++              ? 1u
++              : 0u;
++      deferred_command_buffer_.CmdVkPushConstants(resolve_downscale_pipeline_layout_,
++                                                  VK_SHADER_STAGE_COMPUTE_BIT, 0,
++                                                  sizeof(constants), &constants);
++      deferred_command_buffer_.CmdVkBindDescriptorSets(
++          VK_PIPELINE_BIND_POINT_COMPUTE, resolve_downscale_pipeline_layout_, 0, 1,
++          &descriptor_set, 0, nullptr);
++      deferred_command_buffer_.CmdVkDispatch(job.tile_count, 1, 1);
++
++      VkBufferMemoryBarrier downscale_barrier = {};
++      downscale_barrier.sType = VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER;
++      downscale_barrier.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
++      downscale_barrier.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
++      downscale_barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      downscale_barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_IGNORED;
++      downscale_barrier.buffer = resolve_downscale_buffer_;
++      downscale_barrier.size = job.transfer_length;
++      deferred_command_buffer_.CmdVkPipelineBarrier(VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                                    VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 0, nullptr,
++                                                    1, &downscale_barrier, 0, nullptr);
++      VkBufferCopy copy = {};
++      copy.srcOffset = 0;
++      copy.dstOffset = job.readback_offset;
++      copy.size = job.transfer_length;
++      deferred_command_buffer_.CmdVkCopyBuffer(resolve_downscale_buffer_, readback_buffer, 1,
++                                              &copy);
++    }
++
++    if (ok) {
++      PushBufferMemoryBarrier(readback_buffer, 0, uint32_t(readback_size_64),
++                              VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
++                              VK_ACCESS_TRANSFER_WRITE_BIT, VK_ACCESS_HOST_READ_BIT);
++    }
++  }
++  if (submission_begun) {
++    ok = AwaitAllQueueOperationsCompletion() && ok;
++  }
++
++  if (ok) {
++    VkMappedMemoryRange range = {};
++    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++    range.memory = readback_memory;
++    range.size = VK_WHOLE_SIZE;
++    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
++    for (const ReadbackJob& job : jobs) {
++      uint8_t* destination = memory_->TranslatePhysical(job.address);
++      if (destination) {
++        std::memcpy(destination,
++                    static_cast<const uint8_t*>(mapping) + job.readback_offset +
++                        (job.address - job.transfer_address),
++                    job.length);
++      }
++    }
++  }
++
++  if (mapping) {
++    dfn.vkUnmapMemory(device, readback_memory);
++  }
++  dfn.vkDestroyBuffer(device, readback_buffer, nullptr);
++  dfn.vkFreeMemory(device, readback_memory, nullptr);
++  REXGPU_INFO("ReadbackGpuWrittenRange: scaled {:08X}: {} runs, {} KB{}",
++              runs.empty() ? 0 : runs.front().first,
++              runs.size(), uint32_t(readback_size_64) >> 10, ok ? "" : " (FAILED)");
++  return ok;
++}
++
++bool VulkanCommandProcessor::ReadbackGpuWrittenRange(uint32_t physical_address,
++                                                     uint32_t length) {
+   std::vector<std::pair<uint32_t, uint32_t>> runs;
+   shared_memory_->GetGpuWrittenRuns(physical_address, length, runs);
+   if (runs.empty()) {
+     return true;
+   }
++  if (texture_cache_->IsDrawResolutionScaled()) {
++    uint32_t readback_start = runs.front().first;
++    uint32_t readback_end = runs.back().first + runs.back().second;
++    std::vector<TextureCache::ScaledResolveRange> scaled_ranges;
++    texture_cache_->GetScaledResolveRanges(readback_start, readback_end - readback_start,
++                                           scaled_ranges);
++    std::vector<std::pair<uint32_t, uint32_t>> unscaled_ranges;
++    texture_cache_->GetUnscaledGpuWriteRanges(readback_start, readback_end - readback_start,
++                                              unscaled_ranges);
++    bool has_scaled_run = false;
++    for (const auto& run : runs) {
++      uint32_t run_end = run.first + run.second;
++      for (const TextureCache::ScaledResolveRange& scaled_range : scaled_ranges) {
++        uint32_t scaled_end = scaled_range.start + scaled_range.length;
++        if (scaled_range.start < run_end && scaled_end > run.first) {
++          has_scaled_run = true;
++          break;
++        }
++        if (scaled_range.start >= run_end) {
++          break;
++        }
++      }
++      if (has_scaled_run) {
++        break;
++      }
++    }
++    if (has_scaled_run) {
++      uint64_t request_end = std::min(uint64_t(SharedMemory::kBufferSize),
++                                      uint64_t(physical_address) + length);
++      std::vector<std::pair<uint32_t, uint32_t>> requested_runs;
++      requested_runs.reserve(runs.size());
++      for (const auto& run : runs) {
++        uint32_t run_end = run.first + run.second;
++        uint32_t request_start = std::max(physical_address, run.first);
++        uint32_t clipped_end = uint32_t(std::min<uint64_t>(request_end, run_end));
++        if (request_start < clipped_end) {
++          requested_runs.emplace_back(request_start, clipped_end - request_start);
++        }
++      }
++      if (requested_runs.empty()) {
++        return true;
++      }
++      return ReadbackScaledGpuWrittenRanges(requested_runs, scaled_ranges, unscaled_ranges);
++    }
++  }
+   uint32_t total = 0;
+   for (const auto& run : runs) {
+     total += run.second;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 26ec054..50d3509 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1491,7 +1491,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ 
+           // Invalidate textures and mark the range as scaled if needed.
+           texture_cache.MarkRangeAsResolved(resolve_info.copy_dest_extent_start,
+-                                            resolve_info.copy_dest_extent_length);
++                                            resolve_info.copy_dest_extent_length,
++                                            copy_shader_info.dest_pixel_size_log2,
++                                            draw_resolution_scaled);
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
+-- 
+2.43.0
+

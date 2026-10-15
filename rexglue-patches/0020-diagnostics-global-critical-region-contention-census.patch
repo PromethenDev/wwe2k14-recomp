@@ -1,0 +1,291 @@
+From c1e563fce5c2f12f00bd4cb294130fe791155467 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 13:05:39 -0700
+Subject: [PATCH 20/97] diagnostics: global critical region contention census
+ with owner sampling
+
+When WWE13_RATE_CENSUS=1, global_critical_region::Acquire/AcquireDirect try
+the lock first; on contention they read the owner tid from the glibc mutex
+and record the wait per (waiter, owner) pair, logged each second as
+[rate-census-lock]. With WWE13_LOCK_OWNER_SAMPLE=1 (and the game's thread
+profiler handler installed) the owner is sent SIGPROF, at most every 2 ms,
+so its backtrace is captured while it holds the lock. No change when the
+census is off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/rate_census.h |  7 ++
+ include/rex/thread/mutex.h            | 14 ++++
+ src/core/mutex.cpp                    | 25 +++++++
+ src/core/rate_census.cpp              | 99 +++++++++++++++++++++++++++
+ 4 files changed, 145 insertions(+)
+
+diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
+index ee1e984..8ad8d4b 100644
+--- a/include/rex/diagnostics/rate_census.h
++++ b/include/rex/diagnostics/rate_census.h
+@@ -71,6 +71,13 @@ void CpPhaseExit(uint64_t now_ns);
+ // Records one unsatisfied WAIT_REG_MEM: poll target (register index, or
+ // physical address with is_memory), and the total time it blocked.
+ void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns);
++// Global critical region contention (called by global_critical_region when the
++// census is on): owner is the host tid holding the lock (0 if unknown).
++// OnGlobalLockContended may send SIGPROF to the owner (WWE13_LOCK_OWNER_SAMPLE=1,
++// only when a SIGPROF handler is installed, i.e. WWE13_THREAD_PROFILE is set) so
++// the thread profiler records what the owner is doing.
++void OnGlobalLockContended(uint32_t owner_tid);
++void RecordGlobalLockWait(uint32_t owner_tid, uint64_t wait_ns);
+ 
+ // Times a command processor phase when the census is enabled; a no-op
+ // otherwise. Must be used on the GPU command thread only.
+diff --git a/include/rex/thread/mutex.h b/include/rex/thread/mutex.h
+index 6e5755a..27895a4 100644
+--- a/include/rex/thread/mutex.h
++++ b/include/rex/thread/mutex.h
+@@ -11,6 +11,7 @@
+ 
+ #pragma once
+ 
++#include <atomic>
+ #include <mutex>
+ 
+ namespace rex::thread {
+@@ -53,20 +54,33 @@ namespace rex::thread {
+ //   xe::global_critical_region global_critical_region_;
+ //   std::list<...> my_list_;
+ // };
++// Set by the rate census (WWE13_RATE_CENSUS=1) to measure global lock
++// contention; Acquire/AcquireDirect then take the lock via AcquireCensused.
++extern std::atomic<bool> g_global_lock_census;
++
+ class global_critical_region {
+  public:
+   static std::recursive_mutex& mutex();
+ 
++  // try_lock first; on contention records the owner thread and the wait.
++  static std::unique_lock<std::recursive_mutex> AcquireCensused();
++
+   // Acquires a lock on the global critical section.
+   // Use this when keeping an instance is not possible. Otherwise, prefer
+   // to keep an instance of global_critical_region near the members requiring
+   // it to keep things readable.
+   static std::unique_lock<std::recursive_mutex> AcquireDirect() {
++    if (g_global_lock_census.load(std::memory_order_relaxed)) {
++      return AcquireCensused();
++    }
+     return std::unique_lock<std::recursive_mutex>(mutex());
+   }
+ 
+   // Acquires a lock on the global critical section.
+   inline std::unique_lock<std::recursive_mutex> Acquire() {
++    if (g_global_lock_census.load(std::memory_order_relaxed)) {
++      return AcquireCensused();
++    }
+     return std::unique_lock<std::recursive_mutex>(mutex());
+   }
+ 
+diff --git a/src/core/mutex.cpp b/src/core/mutex.cpp
+index d639924..a18b48f 100644
+--- a/src/core/mutex.cpp
++++ b/src/core/mutex.cpp
+@@ -11,8 +11,33 @@
+ 
+ #include <rex/thread/mutex.h>
+ 
++#if defined(__linux__)
++#include <pthread.h>
++#endif
++
++#include <rex/diagnostics/rate_census.h>
++
+ namespace rex::thread {
+ 
++std::atomic<bool> g_global_lock_census{false};
++
++std::unique_lock<std::recursive_mutex> global_critical_region::AcquireCensused() {
++  std::recursive_mutex& m = mutex();
++  if (m.try_lock()) {
++    return std::unique_lock<std::recursive_mutex>(m, std::adopt_lock);
++  }
++  uint32_t owner = 0;
++#if defined(__GLIBC__)
++  // glibc records the owning thread id in the mutex (diagnostic read only).
++  owner = uint32_t(reinterpret_cast<pthread_mutex_t*>(m.native_handle())->__data.__owner);
++#endif
++  diagnostics::rate_census::OnGlobalLockContended(owner);
++  const uint64_t start = diagnostics::rate_census::NowNs();
++  m.lock();
++  diagnostics::rate_census::RecordGlobalLockWait(owner, diagnostics::rate_census::NowNs() - start);
++  return std::unique_lock<std::recursive_mutex>(m, std::adopt_lock);
++}
++
+ std::recursive_mutex& global_critical_region::mutex() {
+   static std::recursive_mutex global_mutex;
+   return global_mutex;
+diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
+index d97f221..0cb8648 100644
+--- a/src/core/rate_census.cpp
++++ b/src/core/rate_census.cpp
+@@ -25,8 +25,11 @@
+ #include <rex/logging.h>
+ #include <rex/platform.h>
+ #include <rex/thread.h>
++#include <rex/thread/mutex.h>
+ 
+ #if REX_PLATFORM_LINUX
++#include <signal.h>
++#include <sys/syscall.h>
+ #include <unistd.h>
+ #endif
+ 
+@@ -36,6 +39,25 @@ namespace {
+ constexpr size_t kCpPhaseCount = size_t(CpPhase::kCount);
+ static_assert(kCpPhaseCount == sizeof(Sample::cp_phase_ms) / sizeof(double));
+ 
++// Global lock waits in the current census second, per (waiter, owner) pair.
++struct LockWait {
++  uint32_t waiter = 0;
++  uint32_t owner = 0;
++  uint64_t ns = 0;
++  uint64_t count = 0;
++};
++
++std::string ThreadName(uint32_t tid) {
++#if REX_PLATFORM_LINUX
++  std::ifstream comm("/proc/self/task/" + std::to_string(tid) + "/comm");
++  std::string name;
++  if (comm && std::getline(comm, name)) {
++    return name;
++  }
++#endif
++  return "?";
++}
++
+ // WAIT_REG_MEM poll targets seen in the current census second.
+ struct WaitTarget {
+   uint32_t key = 0;  // Poll address; bit 31 set for memory polls.
+@@ -277,6 +299,13 @@ class RateCensus {
+ 
+     vblank_interval_ticks_ = vblank_interval_ticks;
+     refresh_rate_hz_ = refresh_rate_hz;
++    {
++      const char* sample = std::getenv("WWE13_LOCK_OWNER_SAMPLE");
++      const char* profile = std::getenv("WWE13_THREAD_PROFILE");
++      // SIGPROF is only safe to send when the thread profiler installed its handler.
++      owner_sampling_ = sample && std::string_view(sample) == "1" && profile && *profile;
++    }
++    rex::thread::g_global_lock_census.store(true, std::memory_order_relaxed);
+     enabled_.store(true, std::memory_order_release);
+     running_.store(true, std::memory_order_release);
+     logger_thread_ = std::thread(&RateCensus::Run, this);
+@@ -443,9 +472,67 @@ class RateCensus {
+     }
+   }
+ 
++  void OnGlobalLockContended(uint32_t owner_tid) {
++#if REX_PLATFORM_LINUX
++    if (!owner_sampling_ || owner_tid == 0) {
++      return;
++    }
++    // At most one owner sample per 2 ms.
++    const uint64_t now = QueryHostNanoseconds();
++    uint64_t last = last_owner_sample_ns_.load(std::memory_order_relaxed);
++    if (now - last < 2'000'000 ||
++        !last_owner_sample_ns_.compare_exchange_strong(last, now, std::memory_order_relaxed)) {
++      return;
++    }
++    syscall(SYS_tgkill, getpid(), pid_t(owner_tid), SIGPROF);
++#else
++    (void)owner_tid;
++#endif
++  }
++
++  void RecordGlobalLockWait(uint32_t owner_tid, uint64_t wait_ns) {
++    const uint32_t waiter = rex::thread::current_thread_system_id();
++    std::lock_guard<std::mutex> lock(lock_waits_mutex_);
++    for (LockWait& entry : lock_waits_) {
++      if (entry.waiter == waiter && entry.owner == owner_tid) {
++        entry.ns += wait_ns;
++        ++entry.count;
++        return;
++      }
++    }
++    if (lock_waits_.size() < 256) {
++      lock_waits_.push_back({waiter, owner_tid, wait_ns, 1});
++    }
++  }
++
+  private:
+   static constexpr uint32_t kMaxPhaseDepth = 8;
+ 
++  std::string TakeLockWaits(uint64_t elapsed_ms) {
++    std::vector<LockWait> waits;
++    {
++      std::lock_guard<std::mutex> lock(lock_waits_mutex_);
++      waits.swap(lock_waits_);
++    }
++    if (waits.empty()) {
++      return "none";
++    }
++    std::sort(waits.begin(), waits.end(),
++              [](const LockWait& a, const LockWait& b) { return a.ns > b.ns; });
++    if (waits.size() > 6) {
++      waits.resize(6);
++    }
++    std::string result;
++    for (const LockWait& w : waits) {
++      if (!result.empty()) {
++        result += '|';
++      }
++      result += fmt::format("{}<-{}({}):{:.3f}:{}", ThreadName(w.waiter), ThreadName(w.owner), w.owner,
++                            double(w.ns) / 1'000'000.0 * 1000.0 / double(elapsed_ms), w.count);
++    }
++    return result;
++  }
++
+   void ChargeTopPhase(uint64_t now_ns) {
+     if (cp_phase_depth_ == 0 || cp_phase_depth_ > kMaxPhaseDepth || now_ns <= cp_phase_start_ns_) {
+       return;
+@@ -576,6 +663,7 @@ class RateCensus {
+       }
+       sample.cp_wait_reg_mem_count = current.cp_wait_reg_mem_count - last.cp_wait_reg_mem_count;
+       const std::string wait_targets = TakeWaitTargets(elapsed_ms);
++      const std::string lock_waits = TakeLockWaits(elapsed_ms);
+       uint64_t phase_calls[kCpPhaseCount];
+       for (size_t i = 0; i < kCpPhaseCount; ++i) {
+         phase_calls[i] = current.cp_phase_calls[i] - last.cp_phase_calls[i];
+@@ -612,6 +700,7 @@ class RateCensus {
+           sample.cp_wait_reg_mem_count, phase_calls[size_t(CpPhase::kDraw)],
+           phase_calls[size_t(CpPhase::kCopy)], phase_calls[size_t(CpPhase::kSwap)],
+           phase_calls[size_t(CpPhase::kSubmit)], wait_targets);
++      REXLOG_INFO("[rate-census-lock] t_ms={} waits={}", sample.t_ms, lock_waits);
+ 
+       last_host_ms = host_ms;
+       last_guest_ticks = guest_ticks;
+@@ -640,6 +729,10 @@ class RateCensus {
+   CpPhase cp_phase_stack_[kMaxPhaseDepth] = {};
+   uint32_t cp_phase_depth_ = 0;
+   uint64_t cp_phase_start_ns_ = 0;
++  std::mutex lock_waits_mutex_;
++  std::vector<LockWait> lock_waits_;
++  bool owner_sampling_ = false;
++  std::atomic<uint64_t> last_owner_sample_ns_{0};
+   std::mutex wait_targets_mutex_;
+   std::vector<WaitTarget> wait_targets_;
+ };
+@@ -680,6 +773,12 @@ void CpPhaseEnter(CpPhase phase, uint64_t now_ns) { g_rate_census.CpPhaseEnter(p
+ 
+ void CpPhaseExit(uint64_t now_ns) { g_rate_census.CpPhaseExit(now_ns); }
+ 
++void OnGlobalLockContended(uint32_t owner_tid) { g_rate_census.OnGlobalLockContended(owner_tid); }
++
++void RecordGlobalLockWait(uint32_t owner_tid, uint64_t wait_ns) {
++  g_rate_census.RecordGlobalLockWait(owner_tid, wait_ns);
++}
++
+ void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns) {
+   g_rate_census.RecordWaitRegMem(is_memory, poll_addr, wait_ns);
+ }
+-- 
+2.43.0
+

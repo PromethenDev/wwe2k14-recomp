@@ -1,0 +1,42 @@
+From 59737a709ffb31691c07bed0b33f4a81e9b26cbb Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 16:24:48 -0700
+Subject: [PATCH 37/97] graphics(vulkan): seek storage streams to EOF before
+ appending
+
+C requires a positioning call between input and output on an update
+stream unless the input hit end-of-file. The pipeline loader reads exactly
+up to the last record (no EOF), then the writer thread appends; the MSVC
+runtime silently fails every such fwrite (glibc tolerates it). On Windows
+the pipeline storage therefore never grew after its first session (Wine:
+.xpso stuck at 175 records while ~105 new pipelines were created per run).
+
+After the fix (Wine): run 1 on the 175-record file appended to 286; run 2
+loaded 286 pipelines at startup (271 ms) and created 7 during play.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/pipeline_cache.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index e894a08..92eb966 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -706,6 +706,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+            pipeline_storage_file_);
+   }
+ 
++  // C requires a seek between reading and writing an update stream unless the
++  // read hit end-of-file. The pipeline loader stops exactly at the last record
++  // (no EOF), and the MSVC runtime then fails every later append silently;
++  // glibc tolerates it. Seek both streams to the end before the writer starts.
++  rex::filesystem::Seek(pipeline_storage_file_, 0, SEEK_END);
++  rex::filesystem::Seek(shader_storage_file_, 0, SEEK_END);
++
+   shader_storage_cache_root_ = cache_root;
+   shader_storage_title_id_ = title_id;
+ 
+-- 
+2.43.0
+

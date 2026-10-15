@@ -1,0 +1,60 @@
+From 1ecfa21bb0d0e8ba723e4ea226330e4591199b21 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 16:21:09 -0700
+Subject: [PATCH 24/97] graphics: bulk-write sequential type-0 register packets
+
+ExecutePacketType0 called the virtual WriteRegister once per dword, even for
+long sequential runs of shader constants. Sequential packets now go through
+WriteRegisterRangeFromRing (ring wrap via BeginRead/EndRead), whose Vulkan
+WriteRegistersFromMem bulk-copies whole float/bool-loop/fetch constant ranges
+with range-level invalidation and falls back to per-register writes for any
+other range. write_one_reg packets are unchanged. Kill switch:
+WWE13_TYPE0_BULK=0.
+
+WWE 13, 900 s single sessions: in-ring seconds missing the requested frame
+rate 28.2% -> 7.1%, GPU command thread busy 590 -> 502 ms/s at a comparable
+workload. Reviewer ACCEPT (static equivalence of every bulk range).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/command_processor.cpp | 17 +++++++++++++----
+ 1 file changed, 13 insertions(+), 4 deletions(-)
+
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 59d12fc..2749a56 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -13,6 +13,7 @@
+ #include <chrono>
+ #include <cinttypes>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ #include <string_view>
+ 
+@@ -828,10 +829,18 @@ bool CommandProcessor::ExecutePacketType0(memory::RingBuffer* reader, uint32_t p
+ 
+   uint32_t base_index = (packet & 0x7FFF);
+   uint32_t write_one_reg = (packet >> 15) & 0x1;
+-  for (uint32_t m = 0; m < count; m++) {
+-    uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
+-    uint32_t target_index = write_one_reg ? base_index : base_index + m;
+-    WriteRegister(target_index, reg_data);
++  static const bool type0_bulk_enabled = [] {
++    const char* value = std::getenv("WWE13_TYPE0_BULK");
++    return value == nullptr || std::strcmp(value, "0") != 0;
++  }();
++  if (!write_one_reg && type0_bulk_enabled) {
++    WriteRegisterRangeFromRing(reader, base_index, count);
++  } else {
++    for (uint32_t m = 0; m < count; m++) {
++      uint32_t reg_data = reader->ReadAndSwap<uint32_t>();
++      uint32_t target_index = write_one_reg ? base_index : base_index + m;
++      WriteRegister(target_index, reg_data);
++    }
+   }
+ 
+   trace_writer_.WritePacketEnd();
+-- 
+2.43.0
+

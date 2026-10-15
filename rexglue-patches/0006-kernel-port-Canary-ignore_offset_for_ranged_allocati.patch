@@ -1,0 +1,59 @@
+From 47d1b14ed553465f4307dac866263a696e6a0f31 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 13:44:22 -0700
+Subject: [PATCH 06/97] kernel: port Canary
+ ignore_offset_for_ranged_allocations for WWE '13
+
+WWE '13 (545108B4) compares MmAllocatePhysicalMemoryEx results with
+min_addr_range; the 4 KB heap's 0x1000 physical offset returns a
+bottom-of-range address 0x1000 below that minimum (c160 log: 6 returns of
+0xfa08f000 for min 0x1a090000). Port of xenia-canary 81aaf98e0; default off.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xboxkrnl/xboxkrnl_memory.cpp | 15 +++++++++++----
+ 1 file changed, 11 insertions(+), 4 deletions(-)
+
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index 149093b..37f23ba 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -15,6 +15,7 @@
+ #include <cstring>
+ 
+ #include <rex/assert.h>
++#include <rex/cvar.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+@@ -24,6 +25,10 @@
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
+ 
++REXCVAR_DEFINE_BOOL(ignore_offset_for_ranged_allocations, false, "Memory",
++                    "Allows to ignore 4k offset for physical allocations with provided range. "
++                    "Certain titles check if result matches provided lower range.");
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -469,10 +474,12 @@ ppc_u32_result_t MmAllocatePhysicalMemoryEx_entry(ppc_u32_t flags, ppc_u32_t reg
+   // min_addr_range/max_addr_range are bounds in physical memory, not virtual.
+   uint32_t heap_base = heap->heap_base();
+   uint32_t heap_physical_address_offset = heap->GetPhysicalAddress(heap_base);
+-  // NOTE: xenia-canary has a per-title workaround (ignore_offset_for_ranged_allocations cvar)
+-  // for title 545108B4 where min_addr_range comparison fails due to 0x1000 offset.
+-  // If needed, set heap_physical_address_offset = 0 when min_addr_range && max_addr_range.
+-  // Reference: xenia-canary 81aaf98e0.
++  // Title 545108B4 (WWE '13) compares the returned address with min_addr_range;
++  // the 0x1000 physical offset of the 4 KB heap puts a bottom-of-range result
++  // below that minimum. Port of xenia-canary 81aaf98e0.
++  if (min_addr_range && max_addr_range && REXCVAR_GET(ignore_offset_for_ranged_allocations)) {
++    heap_physical_address_offset = 0;
++  }
+   uint32_t heap_min_addr = rex::sat_sub(min_addr_range.value(), heap_physical_address_offset);
+   uint32_t heap_max_addr = rex::sat_sub(max_addr_range.value(), heap_physical_address_offset);
+   uint32_t heap_size = heap->heap_size();
+-- 
+2.43.0
+

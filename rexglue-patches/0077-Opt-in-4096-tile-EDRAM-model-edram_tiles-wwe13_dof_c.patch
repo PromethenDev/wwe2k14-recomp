@@ -1,0 +1,883 @@
+From ff203efa62ded6e4c03b296e4c27501682638365 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 22:57:48 -0700
+Subject: [PATCH 77/97] Opt-in 4096-tile EDRAM model (edram_tiles) +
+ wwe13_dof_composite_nop cvar for the 1080p scene path
+
+The 1920x1080 internal scene exceeds the 2048-tile Xenos EDRAM; edram_tiles=4096 (default 2048)
+models 20 MiB. The 1080 single-pass path never resolves/binds the scene depth texture, so the DOF
+composite (PS 1233F68C15FDF948) samples a stale slot 3 and blurs everything; the cvar skips that
+one draw (opt-in, set only by the game at 1080).
+---
+ include/rex/graphics/flags.h                  |   1 +
+ include/rex/graphics/trace_protocol.h         |  10 +-
+ include/rex/graphics/xenos.h                  |  14 ++-
+ src/graphics/command_processor.cpp            |  15 +++
+ src/graphics/d3d12/render_target_cache.cpp    |  33 ++---
+ src/graphics/flags.cpp                        |   6 +
+ src/graphics/pipeline/render_target/cache.cpp | 114 +++++++++---------
+ .../pipeline/shader/dxbc_translator_om.cpp    |   7 +-
+ .../pipeline/shader/spirv_translator_rb.cpp   |   4 +-
+ src/graphics/trace_player.cpp                 |  24 +++-
+ src/graphics/trace_writer.cpp                 |   6 +-
+ src/graphics/util/draw.cpp                    |   4 +-
+ src/graphics/vulkan/render_target_cache.cpp   |  39 +++---
+ src/graphics/xenos.cpp                        |  22 ++++
+ 14 files changed, 189 insertions(+), 110 deletions(-)
+
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 6a9a12b..49c065a 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -51,6 +51,7 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
+ // GPU Textures
+ REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
+ REXCVAR_DECLARE(bool, gpu_content_probe);
++REXCVAR_DECLARE(bool, wwe13_dof_composite_nop);
+ REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
+ REXCVAR_DECLARE(int32_t, anisotropic_override);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
+diff --git a/include/rex/graphics/trace_protocol.h b/include/rex/graphics/trace_protocol.h
+index c200d0c..8981b4d 100644
+--- a/include/rex/graphics/trace_protocol.h
++++ b/include/rex/graphics/trace_protocol.h
+@@ -113,10 +113,12 @@ struct MemoryCommand {
+   uint32_t decoded_length;
+ };
+ 
+-// Represents a full 10 MB snapshot of EDRAM contents, for trace initialization
+-// (since replaying the trace will reconstruct its state at any point later) as
+-// a sequence of tiles with row-major samples (2x multisampling as 1x2 samples,
+-// 4x as 2x2 samples).
++// Represents a full snapshot of the configured EDRAM contents (10 MiB by
++// default; up to 20 MiB for the explicit 4096-tile model), for trace
++// initialization (since replaying the trace will reconstruct its state at any
++// point later) as a sequence of tiles with row-major samples (2x multisampling
++// as 1x2 samples, 4x as 2x2 samples). encoded_length lets old 10 MiB traces be
++// distinguished from snapshots captured with the larger model.
+ struct EdramSnapshotCommand {
+   TraceCommandType type;
+   // Encoding format of the data in the trace file.
+diff --git a/include/rex/graphics/xenos.h b/include/rex/graphics/xenos.h
+index f7fd14e..bdb2dfe 100644
+--- a/include/rex/graphics/xenos.h
++++ b/include/rex/graphics/xenos.h
+@@ -283,6 +283,9 @@ enum class SurfaceNumberFormat : uint32_t {
+ //   buffer), and overwriting the tail of the previously filled depth buffer in
+ //   [0, 220).
+ // - The lower 1120x144 bin is drawn without the pregenerated depth buffer data.
++// ReXGlue also has an explicit, non-hardware-accurate 4096-tile emulation mode
++// for custom title resolutions whose simultaneously live surfaces exceed the
++// physical Xenos EDRAM capacity. It is disabled by default.
+ 
+ enum class MsaaSamples : uint32_t {
+   k1X = 0,
+@@ -410,9 +413,14 @@ constexpr uint32_t kRenderTargetFormatBits =
+ 
+ constexpr uint32_t kEdramTileWidthSamples = 80;
+ constexpr uint32_t kEdramTileHeightSamples = 16;
+-constexpr uint32_t kEdramTileCount = 2048;
+-constexpr uint32_t kEdramSizeBytes =
+-    kEdramTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
++constexpr uint32_t kEdramDefaultTileCount = 2048;
++constexpr uint32_t kEdramMaxTileCount = 4096;
++constexpr uint32_t kEdramDefaultSizeBytes =
++    kEdramDefaultTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
++constexpr uint32_t kEdramMaxSizeBytes =
++    kEdramMaxTileCount * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t);
++uint32_t GetEdramTileCount();
++uint32_t GetEdramSizeBytes();
+ 
+ // RB_SURFACE_INFO::surface_pitch width.
+ constexpr uint32_t kEdramPitchPixelsBits = 14;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 4b69858..0fdb7bc 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -28,6 +28,7 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/diagnostics/rate_census.h>
++#include <rex/graphics/pipeline/shader/shader.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/sampler_info.h>
+ #include <rex/graphics/xenos.h>
+@@ -1661,6 +1662,20 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   if (draw_succeeded) {
+     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+     if (!(viz_query.viz_query_ena && viz_query.kill_pix_post_hi_z)) {
++      const Shader* const pixel_shader = active_pixel_shader();
++      if (REXCVAR_GET(wwe13_dof_composite_nop) &&
++          register_file_->Get<reg::RB_MODECONTROL>().edram_mode == EdramMode::kColorDepth &&
++          pixel_shader != nullptr &&
++          pixel_shader->ucode_data_hash() == UINT64_C(0x1233F68C15FDF948)) {
++        static std::atomic_flag logged_dof_composite_skip = ATOMIC_FLAG_INIT;
++        if (!logged_dof_composite_skip.test_and_set(std::memory_order_relaxed)) {
++          REXGPU_INFO(
++              "[wwe13-dof] skipped depth-of-field composite PS hash={:016X} (explicit CVar)",
++              pixel_shader->ucode_data_hash());
++        }
++        return true;
++      }
++
+       // TODO(Triang3l): Don't drop the draw call completely if the vertex
+       // shader has memexport.
+       // TODO(Triang3l || JoelLinn): Handle this properly in the render
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 9a7acf5..13576d8 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -205,7 +205,7 @@ bool D3D12RenderTargetCache::Initialize() {
+ 
+   // Create the buffer for reinterpreting EDRAM contents.
+   uint32_t edram_buffer_size =
+-      xenos::kEdramSizeBytes * (draw_resolution_scale_x() * draw_resolution_scale_y());
++      xenos::GetEdramSizeBytes() * (draw_resolution_scale_x() * draw_resolution_scale_y());
+   D3D12_RESOURCE_DESC edram_buffer_desc;
+   ui::d3d12::util::FillBufferResourceDesc(edram_buffer_desc, edram_buffer_size,
+                                           D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS);
+@@ -575,7 +575,7 @@ bool D3D12RenderTargetCache::Initialize() {
+     transfer_vertex_buffer_pool_ = std::make_unique<ui::d3d12::D3D12UploadBufferPool>(
+         provider, std::max(ui::d3d12::D3D12UploadBufferPool::kDefaultPageSize,
+                            sizeof(float) * 2 * 6 * Transfer::kMaxCutoutBorderRectangles *
+-                               xenos::kEdramTileCount));
++                                xenos::GetEdramTileCount()));
+ 
+     // Transfer root signatures.
+     D3D12_DESCRIPTOR_RANGE transfer_root_color_srv_range;
+@@ -1434,7 +1434,8 @@ bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
+   if (!edram_snapshot_download_buffer_) {
+     D3D12_RESOURCE_DESC edram_snapshot_download_buffer_desc;
+     ui::d3d12::util::FillBufferResourceDesc(edram_snapshot_download_buffer_desc,
+-                                            xenos::kEdramSizeBytes, D3D12_RESOURCE_FLAG_NONE);
++                                            xenos::GetEdramSizeBytes(),
++                                            D3D12_RESOURCE_FLAG_NONE);
+     const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+     ID3D12Device* device = provider.GetDevice();
+     if (FAILED(device->CreateCommittedResource(
+@@ -1449,7 +1450,7 @@ bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
+   }
+   if (GetPath() == Path::kHostRenderTargets) {
+     // Dump all host render targets to edram_buffer_.
+-    if (!DumpRenderTargets(0, xenos::kEdramTileCount, 1, xenos::kEdramTileCount)) {
++    if (!DumpRenderTargets(0, xenos::GetEdramTileCount(), 1, xenos::GetEdramTileCount())) {
+       REXGPU_ERROR("D3D12RenderTargetCache: Failed to dump host render targets for trace");
+       return false;
+     }
+@@ -1457,7 +1458,7 @@ bool D3D12RenderTargetCache::InitializeTraceSubmitDownloads() {
+   TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_SOURCE);
+   command_processor_.SubmitBarriers();
+   command_processor_.GetDeferredCommandList().D3DCopyBufferRegion(
+-      edram_snapshot_download_buffer_, 0, edram_buffer_, 0, xenos::kEdramSizeBytes);
++      edram_snapshot_download_buffer_, 0, edram_buffer_, 0, xenos::GetEdramSizeBytes());
+   return true;
+ }
+ 
+@@ -1490,12 +1491,13 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+   if (!edram_snapshot_restore_pool_) {
+     edram_snapshot_restore_pool_ =
+-        std::make_unique<ui::d3d12::D3D12UploadBufferPool>(provider, xenos::kEdramSizeBytes);
++        std::make_unique<ui::d3d12::D3D12UploadBufferPool>(provider,
++                                                          xenos::GetEdramSizeBytes());
+   }
+   ID3D12Resource* upload_buffer;
+   size_t upload_buffer_offset;
+   void* upload_buffer_mapping = edram_snapshot_restore_pool_->Request(
+-      command_processor_.GetCurrentSubmission(), xenos::kEdramSizeBytes, 1, &upload_buffer,
++      command_processor_.GetCurrentSubmission(), xenos::GetEdramSizeBytes(), 1, &upload_buffer,
+       &upload_buffer_offset, nullptr);
+   if (!upload_buffer_mapping) {
+     REXGPU_ERROR(
+@@ -1527,11 +1529,11 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+                                                   nullptr, &copy_total_bytes);
+       // 1280 width * sizeof(uint32_t) is aligned to
+       // D3D12_TEXTURE_DATA_PITCH_ALIGNMENT (256).
+-      assert_true(copy_total_bytes <= xenos::kEdramSizeBytes);
++      assert_true(copy_total_bytes <= xenos::GetEdramSizeBytes());
+       assert_false(full_edram_render_target->key().Is64bpp());
+       uint32_t pitch_tiles = full_edram_render_target->key().pitch_tiles_at_32bpp;
+-      uint32_t tile_rows = xenos::kEdramTileCount / pitch_tiles;
+-      assert_true(pitch_tiles * tile_rows == xenos::kEdramTileCount);
++      uint32_t tile_rows = xenos::GetEdramTileCount() / pitch_tiles;
++      assert_true(pitch_tiles * tile_rows == xenos::GetEdramTileCount());
+       const uint8_t* snapshot_sample_row = reinterpret_cast<const uint8_t*>(snapshot);
+       for (uint32_t y_tile = 0; y_tile < tile_rows; ++y_tile) {
+         uint8_t* upload_buffer_tile_row_origin =
+@@ -1565,11 +1567,12 @@ void D3D12RenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+     } break;
+ 
+     case Path::kPixelShaderInterlock: {
+-      std::memcpy(upload_buffer_mapping, snapshot, xenos::kEdramSizeBytes);
++      std::memcpy(upload_buffer_mapping, snapshot, xenos::GetEdramSizeBytes());
+       TransitionEdramBuffer(D3D12_RESOURCE_STATE_COPY_DEST);
+       command_processor_.SubmitBarriers();
+       command_list.D3DCopyBufferRegion(edram_buffer_, 0, upload_buffer,
+-                                       UINT64(upload_buffer_offset), xenos::kEdramSizeBytes);
++                                        UINT64(upload_buffer_offset),
++                                        xenos::GetEdramSizeBytes());
+     } break;
+ 
+     default:
+@@ -2932,7 +2935,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
+            dxbc::Src::R(1, dxbc::Src::kWWWW));
+   // r1.w = 32bpp tile index within the source
+   a.OpAnd(dxbc::Dest::R(1, 0b1000), dxbc::Src::R(1, dxbc::Src::kWWWW),
+-          dxbc::Src::LU(xenos::kEdramTileCount - 1));
++           dxbc::Src::LU(xenos::GetEdramTileCount() - 1));
+   // r2.x = source pitch in 32bpp tiles
+   a.OpUBFE(dxbc::Dest::R(2, 0b0001), dxbc::Src::LU(xenos::kEdramPitchTilesBits),
+            dxbc::Src::LU(xenos::kEdramPitchTilesBits),
+@@ -3520,7 +3523,7 @@ ID3D12PipelineState* const* D3D12RenderTargetCache::GetOrCreateTransferPipelines
+                        dxbc::Src::R(0, dxbc::Src::kWWWW));
+               // r0.z = tile index relative to the host depth source base
+               a.OpAnd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kZZZZ),
+-                      dxbc::Src::LU(xenos::kEdramTileCount - 1));
++                       dxbc::Src::LU(xenos::GetEdramTileCount() - 1));
+               // Convert position and sample index from within the destination
+               // tile to within the host depth source tile, like for the guest
+               // render target, but for 32bpp -> 32bpp only.
+@@ -5295,7 +5298,7 @@ ID3D12PipelineState* D3D12RenderTargetCache::GetOrCreateDumpPipeline(DumpPipelin
+   // r0.z = wrapped tile index in the EDRAM
+   // r0.w = non-wrapped tile index in the EDRAM
+   a.OpAnd(dxbc::Dest::R(0, 0b0100), dxbc::Src::R(0, dxbc::Src::kWWWW),
+-          dxbc::Src::LU(xenos::kEdramTileCount - 1));
++          dxbc::Src::LU(xenos::GetEdramTileCount() - 1));
+   // Convert the tile index to samples and add the X sample index to it to r0.z.
+   // r0.x = X sample position within the tile
+   // r0.y = Y sample position within the tile
+diff --git a/src/graphics/flags.cpp b/src/graphics/flags.cpp
+index 6c33960..bf1ec43 100644
+--- a/src/graphics/flags.cpp
++++ b/src/graphics/flags.cpp
+@@ -17,6 +17,12 @@ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
+                     "Allow invalid fetch constants");
+ REXCVAR_DEFINE_BOOL(gpu_content_probe, false, "GPU",
+                     "Per-second content probe for H-a/H-b/H-c diagnostics");
++REXCVAR_DEFINE_BOOL(wwe13_dof_composite_nop, false, "GPU",
++                    "Skip WWE '13's depth-of-field composite draw when explicitly selected");
++REXCVAR_DEFINE_INT32(edram_tiles, 2048, "GPU",
++                     "Emulated EDRAM tile count (2048 default; 4096 opt-in 20 MiB mode)")
++    .allowed({"2048", "4096"})
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
+ REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
+ REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index cf0477c..525b4e7 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -199,8 +199,8 @@ uint32_t RenderTargetCache::Transfer::GetRangeRectangles(uint32_t start_tiles, u
+   // EDRAM addressing wrapping must be handled by doing GetRangeRectangles for
+   // two clamped ranges, in this case start_tiles == end_tiles will also
+   // unambiguously mean an empty range rather than the entire EDRAM.
+-  assert_true(start_tiles < xenos::kEdramTileCount);
+-  assert_true(end_tiles <= xenos::kEdramTileCount);
++  assert_true(start_tiles < xenos::GetEdramTileCount());
++  assert_true(end_tiles <= xenos::GetEdramTileCount());
+   assert_true(start_tiles <= end_tiles);
+   // If start_tiles < base_tiles, this is the tail after EDRAM addressing
+   // wrapping.
+@@ -218,7 +218,7 @@ uint32_t RenderTargetCache::Transfer::GetRangeRectangles(uint32_t start_tiles, u
+   uint32_t rectangle_count = 0;
+   // If start_tiles < base_tiles, this is the tail after EDRAM addressing
+   // wrapping.
+-  uint32_t local_offset = start_tiles < base_tiles ? xenos::kEdramTileCount : 0;
++  uint32_t local_offset = start_tiles < base_tiles ? xenos::GetEdramTileCount() : 0;
+   uint32_t local_start = local_offset + start_tiles - base_tiles;
+   uint32_t local_end = local_offset + end_tiles - base_tiles;
+   // Inclusive.
+@@ -358,7 +358,7 @@ RenderTargetCache::~RenderTargetCache() {
+ void RenderTargetCache::InitializeCommon() {
+   assert_true(ownership_ranges_.empty());
+   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+-                            std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
++                            std::forward_as_tuple(xenos::GetEdramTileCount(), RenderTargetKey(),
+                                                   RenderTargetKey(), RenderTargetKey()));
+ }
+ 
+@@ -367,7 +367,7 @@ void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
+   ownership_ranges_.clear();
+   if (!shutting_down) {
+     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+-                              std::forward_as_tuple(xenos::kEdramTileCount, RenderTargetKey(),
++                              std::forward_as_tuple(xenos::GetEdramTileCount(), RenderTargetKey(),
+                                                     RenderTargetKey(), RenderTargetKey()));
+   }
+ 
+@@ -647,7 +647,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+   // after rounding to tiles, with a 32bpp depth buffer at 0 requiring 675
+   // tiles, and a 64bpp color buffer at 675 requiring 1350 tiles, but the
+   // smallest distance between two render target bases is 675 tiles).
+-  uint32_t rt_max_distance_tiles_at_64bpp = xenos::kEdramTileCount * 2;
++  uint32_t rt_max_distance_tiles_at_64bpp = xenos::GetEdramTileCount() * 2;
+   if (REXCVAR_GET(mrt_edram_used_range_clamp_to_min) && edram_bases_sorted_count >= 2) {
+     for (uint32_t i = 1; i < edram_bases_sorted_count; ++i) {
+       const std::pair<uint32_t, uint32_t>& rt_base_prev = edram_bases_sorted[i - 1];
+@@ -662,7 +662,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+         edram_bases_sorted[edram_bases_sorted_count - 1];
+     rt_max_distance_tiles_at_64bpp =
+         std::min(rt_max_distance_tiles_at_64bpp,
+-                 (xenos::kEdramTileCount + edram_bases_sorted[0].first - rt_base_last.first)
++                 (xenos::GetEdramTileCount() + edram_bases_sorted[0].first - rt_base_last.first)
+                      << (((rts_are_64bpp >> rt_base_last.second) & 1) ^ 1));
+   }
+ 
+@@ -700,7 +700,7 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                             rt_max_distance_tiles_at_64bpp >> (rt_is_64bpp ^ 1)),
+                                    ((i + 1 < edram_bases_sorted_count)
+                                         ? edram_bases_sorted[i + 1].first
+-                                        : (xenos::kEdramTileCount + edram_bases_sorted[0].first)) -
++                                        : (xenos::GetEdramTileCount() + edram_bases_sorted[0].first)) -
+                                        rt_base);
+   }
+ 
+@@ -847,9 +847,10 @@ uint32_t RenderTargetCache::GetRenderTargetHeight(uint32_t pitch_tiles_at_32bpp,
+   if (!pitch_tiles_at_32bpp) {
+     return 0;
+   }
+-  // Down to the beginning of the render target in the next 11-bit EDRAM
++  // Down to the beginning of the render target in the next configured EDRAM
+   // addressing period.
+-  uint32_t tile_rows = (xenos::kEdramTileCount + (pitch_tiles_at_32bpp - 1)) / pitch_tiles_at_32bpp;
++  uint32_t tile_rows =
++      (xenos::GetEdramTileCount() + (pitch_tiles_at_32bpp - 1)) / pitch_tiles_at_32bpp;
+   // Clamp to the guest limit (tile padding should exceed it) and to the host
+   // limit (tile padding mustn't exceed it).
+   static_assert(!(xenos::kTexture2DCubeMaxWidthHeight % xenos::kEdramTileHeightSamples),
+@@ -963,11 +964,12 @@ void RenderTargetCache::GetResolveCopyRectanglesToDump(
+     }
+   };
+   uint32_t resolve_area_end = base + (rows - 1) * pitch + row_length;
+-  get_rectangles_in_extent(base, std::min(resolve_area_end, xenos::kEdramTileCount), 0);
+-  if (resolve_area_end > xenos::kEdramTileCount) {
++  get_rectangles_in_extent(base, std::min(resolve_area_end, xenos::GetEdramTileCount()), 0);
++  if (resolve_area_end > xenos::GetEdramTileCount()) {
+     // The resolve area goes to the next EDRAM addressing period.
+-    get_rectangles_in_extent(0, std::min(resolve_area_end & (xenos::kEdramTileCount - 1), base),
+-                             xenos::kEdramTileCount);
++    get_rectangles_in_extent(
++        0, std::min(resolve_area_end & (xenos::GetEdramTileCount() - 1), base),
++        xenos::GetEdramTileCount());
+   }
+ }
+ 
+@@ -1082,15 +1084,16 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+       ((clear_rectangle.x_pixels + clear_rectangle.width_pixels - 1) << msaa_samples_x_log2) /
+           xenos::kEdramTileWidthSamples +
+       1 - clear_start_tiles_at_32bpp;
+-  // Up to the range from the base in the current 11 tile index bits to the base
+-  // in the next 11 tile index bits after wrapping can be cleared.
++  // Up to the range from the base in the current EDRAM period to the base in
++  // the next period after wrapping can be cleared.
+   uint32_t depth_clear_start_tiles_base_relative = 0;
+   uint32_t depth_clear_length_tiles = 0;
+   if (resolve_info.IsClearingDepth()) {
+     depth_clear_start_tiles_base_relative =
+-        std::min(clear_start_tiles_at_32bpp, xenos::kEdramTileCount);
++        std::min(clear_start_tiles_at_32bpp, xenos::GetEdramTileCount());
+     depth_clear_length_tiles =
+-        std::min(clear_start_tiles_at_32bpp + clear_length_tiles_at_32bpp, xenos::kEdramTileCount) -
++        std::min(clear_start_tiles_at_32bpp + clear_length_tiles_at_32bpp,
++                 xenos::GetEdramTileCount()) -
+         depth_clear_start_tiles_base_relative;
+   }
+   uint32_t color_clear_start_tiles_base_relative = 0;
+@@ -1098,31 +1101,31 @@ bool RenderTargetCache::PrepareHostRenderTargetsResolveClear(
+   if (resolve_info.IsClearingColor()) {
+     color_clear_start_tiles_base_relative =
+         std::min(clear_start_tiles_at_32bpp << resolve_info.color_edram_info.format_is_64bpp,
+-                 xenos::kEdramTileCount);
++                 xenos::GetEdramTileCount());
+     color_clear_length_tiles = std::min((clear_start_tiles_at_32bpp + clear_length_tiles_at_32bpp)
+                                             << resolve_info.color_edram_info.format_is_64bpp,
+-                                        xenos::kEdramTileCount) -
++                                        xenos::GetEdramTileCount()) -
+                                color_clear_start_tiles_base_relative;
+   }
+   if (depth_clear_length_tiles && color_clear_length_tiles) {
+     // Prevent overlap - clear the depth only until the color, the color only
+-    // until the depth, in the current or the next 11 bits of the tile index.
++    // until the depth, in the current or the next EDRAM period.
+     uint32_t depth_clear_start_tiles_wrapped =
+         (resolve_info.depth_original_base + depth_clear_start_tiles_base_relative) &
+-        (xenos::kEdramTileCount - 1);
++        (xenos::GetEdramTileCount() - 1);
+     uint32_t color_clear_start_tiles_wrapped =
+         (resolve_info.color_original_base + color_clear_start_tiles_base_relative) &
+-        (xenos::kEdramTileCount - 1);
++        (xenos::GetEdramTileCount() - 1);
+     depth_clear_length_tiles =
+         std::min(depth_clear_length_tiles,
+                  ((color_clear_start_tiles_wrapped < depth_clear_start_tiles_wrapped)
+-                      ? xenos::kEdramTileCount
++                      ? xenos::GetEdramTileCount()
+                       : 0) +
+                      color_clear_start_tiles_wrapped - depth_clear_start_tiles_wrapped);
+     color_clear_length_tiles =
+         std::min(color_clear_length_tiles,
+                  ((depth_clear_start_tiles_wrapped < color_clear_start_tiles_wrapped)
+-                      ? xenos::kEdramTileCount
++                      ? xenos::GetEdramTileCount()
+                       : 0) +
+                      depth_clear_start_tiles_wrapped - color_clear_start_tiles_wrapped);
+   }
+@@ -1189,16 +1192,11 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+     return nullptr;
+   }
+   // Same render target height is used for 32bpp and 64bpp to allow mixing them.
+-  constexpr uint32_t kHeightTileRows = xenos::kEdramTileCount / kPitchTilesAt32bpp;
+-  static_assert(kPitchTilesAt32bpp * kHeightTileRows == xenos::kEdramTileCount,
+-                "Using width of the render target for EDRAM snapshot restoration that is "
+-                "expected to result in the last row being fully utilized.");
+-  constexpr uint32_t kHeight = kHeightTileRows * xenos::kEdramTileHeightSamples;
+-  static_assert(kHeight <= xenos::kTexture2DCubeMaxWidthHeight,
+-                "Using width of the render target for EDRAM snapshot restoration that is "
+-                "expect to fully cover the EDRAM without exceeding the maximum guest "
+-                "render target height.");
+-  if (kHeight * draw_resolution_scale_y() > GetMaxRenderTargetHeight()) {
++  const uint32_t height_tile_rows = xenos::GetEdramTileCount() / kPitchTilesAt32bpp;
++  assert_true(kPitchTilesAt32bpp * height_tile_rows == xenos::GetEdramTileCount());
++  const uint32_t height = height_tile_rows * xenos::kEdramTileHeightSamples;
++  assert_true(height <= xenos::kTexture2DCubeMaxWidthHeight);
++  if (height * draw_resolution_scale_y() > GetMaxRenderTargetHeight()) {
+     return nullptr;
+   }
+   RenderTargetKey render_target_key;
+@@ -1212,7 +1210,7 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+   // anyway.
+   ownership_ranges_.clear();
+   ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+-                            std::forward_as_tuple(xenos::kEdramTileCount, render_target_key,
++                            std::forward_as_tuple(xenos::GetEdramTileCount(), render_target_key,
+                                                   RenderTargetKey(), RenderTargetKey()));
+   return render_target;
+ }
+@@ -1220,7 +1218,7 @@ RenderTargetCache::PrepareFullEdram1280xRenderTargetForSnapshotRestoration(
+ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
+   assert_true(GetPath() == Path::kPixelShaderInterlock);
+   // Clear ownership - any overlap of data written before the barrier is safe.
+-  OwnershipRange empty_range(xenos::kEdramTileCount, RenderTargetKey(), RenderTargetKey(),
++  OwnershipRange empty_range(xenos::GetEdramTileCount(), RenderTargetKey(), RenderTargetKey(),
+                              RenderTargetKey());
+   if (ownership_ranges_.size() == 1) {
+     // Do not reallocate map elements if not needed (either nothing drawn since
+@@ -1229,7 +1227,7 @@ void RenderTargetCache::PixelShaderInterlockFullEdramBarrierPlaced() {
+     // at 0.
+     assert_true(!ownership_ranges_.begin()->first);
+     OwnershipRange& all_edram_range = ownership_ranges_.begin()->second;
+-    assert_true(all_edram_range.end_tiles == xenos::kEdramTileCount);
++    assert_true(all_edram_range.end_tiles == xenos::GetEdramTileCount());
+     all_edram_range = empty_range;
+     return;
+   }
+@@ -1283,10 +1281,11 @@ std::string RenderTargetCache::DebugRenderTargetKeyString(RenderTargetKey key) c
+ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
+                                                              uint32_t start_tiles_base_relative,
+                                                              uint32_t length_tiles) const {
+-  // xenos::kEdramTileCount with length 0 is fine if both the start and the end
+-  // are clamped to xenos::kEdramTileCount.
+-  assert_true(start_tiles_base_relative <= (xenos::kEdramTileCount - uint32_t(length_tiles != 0)));
+-  assert_true(length_tiles <= xenos::kEdramTileCount);
++  // GetEdramTileCount() with length 0 is fine if both the start and the end
++  // are clamped to GetEdramTileCount().
++  assert_true(start_tiles_base_relative <=
++              (xenos::GetEdramTileCount() - uint32_t(length_tiles != 0)));
++  assert_true(length_tiles <= xenos::GetEdramTileCount());
+   if (length_tiles == 0) {
+     return false;
+   }
+@@ -1324,18 +1323,19 @@ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey des
+     }
+     return false;
+   };
+-  // start_tiles_base_relative may already be in the next 11 bits - wrap the
++  // start_tiles_base_relative may already be in the next EDRAM period - wrap the
+   // start tile index to use the same code as if that was not the case.
+   uint32_t start_tiles =
+-      (dest.base_tiles + start_tiles_base_relative) & (xenos::kEdramTileCount - 1);
++      (dest.base_tiles + start_tiles_base_relative) & (xenos::GetEdramTileCount() - 1);
+   uint32_t end_tiles = start_tiles + length_tiles;
+-  if (would_require_transfers_in_extent(start_tiles, std::min(end_tiles, xenos::kEdramTileCount))) {
++  if (would_require_transfers_in_extent(start_tiles,
++                                        std::min(end_tiles, xenos::GetEdramTileCount()))) {
+     return true;
+   }
+-  if (end_tiles > xenos::kEdramTileCount) {
++  if (end_tiles > xenos::GetEdramTileCount()) {
+     // The check extent goes to the next EDRAM addressing period.
+     if (would_require_transfers_in_extent(
+-            0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles))) {
++            0, std::min(end_tiles & (xenos::GetEdramTileCount() - 1), start_tiles))) {
+       return true;
+     }
+   }
+@@ -1346,10 +1346,11 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+                                         uint32_t length_tiles,
+                                         std::vector<Transfer>* transfers_append_out,
+                                         const Transfer::Rectangle* resolve_clear_cutout) {
+-  // xenos::kEdramTileCount with length 0 is fine if both the start and the end
+-  // are clamped to xenos::kEdramTileCount.
+-  assert_true(start_tiles_base_relative <= (xenos::kEdramTileCount - uint32_t(length_tiles != 0)));
+-  assert_true(length_tiles <= xenos::kEdramTileCount);
++  // GetEdramTileCount() with length 0 is fine if both the start and the end
++  // are clamped to GetEdramTileCount().
++  assert_true(start_tiles_base_relative <=
++              (xenos::GetEdramTileCount() - uint32_t(length_tiles != 0)));
++  assert_true(length_tiles <= xenos::GetEdramTileCount());
+   if (length_tiles == 0) {
+     return;
+   }
+@@ -1483,15 +1484,16 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+       it = it_next;
+     }
+   };
+-  // start_tiles_base_relative may already be in the next 11 bits - wrap the
++  // start_tiles_base_relative may already be in the next EDRAM period - wrap the
+   // start tile index to use the same code as if that was not the case.
+   uint32_t start_tiles =
+-      (dest.base_tiles + start_tiles_base_relative) & (xenos::kEdramTileCount - 1);
++      (dest.base_tiles + start_tiles_base_relative) & (xenos::GetEdramTileCount() - 1);
+   uint32_t end_tiles = start_tiles + length_tiles;
+-  change_ownership_in_extent(start_tiles, std::min(end_tiles, xenos::kEdramTileCount));
+-  if (end_tiles > xenos::kEdramTileCount) {
++  change_ownership_in_extent(start_tiles, std::min(end_tiles, xenos::GetEdramTileCount()));
++  if (end_tiles > xenos::GetEdramTileCount()) {
+     // The ownership change extent goes to the next EDRAM addressing period.
+-    change_ownership_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
++    change_ownership_in_extent(0,
++                               std::min(end_tiles & (xenos::GetEdramTileCount() - 1), start_tiles));
+   }
+   if (debug_rt_cache_ownership && transfers_append_out) {
+     for (const Transfer& transfer : *transfers_append_out) {
+diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+index a7d508a..d39ce92 100644
+--- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
++++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
+@@ -322,7 +322,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
+   //                             needed
+   a_.OpUDiv(dxbc::Dest::Null(), dxbc::Dest::R(system_temp_rov_params_, 0b0010),
+             dxbc::Src::R(system_temp_rov_params_, dxbc::Src::kYYYY),
+-            dxbc::Src::LU(tile_size * xenos::kEdramTileCount));
++             dxbc::Src::LU(tile_size * xenos::GetEdramTileCount()));
+ 
+   // ***************************************************************************
+   // Sample coverage to system_temp_rov_params_.x.
+@@ -1881,8 +1881,9 @@ void DxbcShaderTranslator::CompletePixelShader_WriteToROV() {
+ 
+   // Write color values.
+   uint32_t shader_writes_color_targets = current_shader().writes_color_targets();
+-  uint32_t edram_size_32bpp_samples = (xenos::kEdramTileHeightSamples * draw_resolution_scale_y_) *
+-                                      tile_width * xenos::kEdramTileCount;
++  uint32_t edram_size_32bpp_samples =
++      (xenos::kEdramTileHeightSamples * draw_resolution_scale_y_) * tile_width *
++      xenos::GetEdramTileCount();
+   for (uint32_t i = 0; i < 4; ++i) {
+     if (!(shader_writes_color_targets & (1 << i))) {
+       continue;
+diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+index 43144ba..42541e5 100644
+--- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
++++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
+@@ -906,7 +906,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
+       uint32_t tile_width = xenos::kEdramTileWidthSamples * draw_resolution_scale_x_;
+       uint32_t tile_height = xenos::kEdramTileHeightSamples * draw_resolution_scale_y_;
+       fsi_const_edram_size_dwords =
+-          builder_->makeUintConstant(tile_width * tile_height * xenos::kEdramTileCount);
++          builder_->makeUintConstant(tile_width * tile_height * xenos::GetEdramTileCount());
+       for (uint32_t i = 0; i < 4; ++i) {
+         fsi_samples_covered[i] = builder_->createBinOp(
+             spv::OpINotEqual, type_bool_,
+@@ -1629,7 +1629,7 @@ void SpirvShaderTranslator::FSI_LoadEdramOffsets(spv::Id msaa_samples) {
+               spv::OpIAdd, type_uint_, offset_in_first_tile_half_at_32bpp,
+               builder_->createTriOp(spv::OpSelect, type_uint_, is_second_tile_half, const_uint_0_,
+                                     const_tile_half_width))),
+-      builder_->makeUintConstant(tile_size * xenos::kEdramTileCount));
++       builder_->makeUintConstant(tile_size * xenos::GetEdramTileCount()));
+ 
+   if (current_shader().writes_color_targets()) {
+     // Get the offset of the sample 0 within a 32bpp surface, with samples
+diff --git a/src/graphics/trace_player.cpp b/src/graphics/trace_player.cpp
+index 2517601..f2edbdd 100644
+--- a/src/graphics/trace_player.cpp
++++ b/src/graphics/trace_player.cpp
+@@ -9,8 +9,13 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
++#include <cstring>
+ #include <memory>
+ 
++#include "snappy.h"
++
++#include <rex/assert.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/registers.h>
+@@ -183,9 +188,22 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
+       case TraceCommandType::kEdramSnapshot: {
+         auto cmd = reinterpret_cast<const EdramSnapshotCommand*>(trace_ptr);
+         trace_ptr += sizeof(*cmd);
+-        std::unique_ptr<uint8_t[]> edram_snapshot(new uint8_t[xenos::kEdramSizeBytes]);
+-        DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length, edram_snapshot.get(),
+-                         xenos::kEdramSizeBytes);
++        size_t snapshot_size = cmd->encoded_length;
++        if (cmd->encoding_format == MemoryEncodingFormat::kSnappy) {
++          assert_true(snappy::GetUncompressedLength(reinterpret_cast<const char*>(trace_ptr),
++                                                    cmd->encoded_length, &snapshot_size));
++        } else {
++          assert_true(cmd->encoding_format == MemoryEncodingFormat::kNone);
++        }
++        assert_true(snapshot_size == xenos::kEdramDefaultSizeBytes ||
++                    snapshot_size == xenos::kEdramMaxSizeBytes);
++        std::unique_ptr<uint8_t[]> captured_snapshot(new uint8_t[snapshot_size]);
++        assert_true(DecompressMemory(cmd->encoding_format, trace_ptr, cmd->encoded_length,
++                                     captured_snapshot.get(), snapshot_size));
++        const size_t runtime_snapshot_size = xenos::GetEdramSizeBytes();
++        std::unique_ptr<uint8_t[]> edram_snapshot(new uint8_t[runtime_snapshot_size]());
++        std::memcpy(edram_snapshot.get(), captured_snapshot.get(),
++                    std::min(snapshot_size, runtime_snapshot_size));
+         trace_ptr += cmd->encoded_length;
+         command_processor->RestoreEdramSnapshot(edram_snapshot.get());
+         break;
+diff --git a/src/graphics/trace_writer.cpp b/src/graphics/trace_writer.cpp
+index 2a35689..63181fc 100644
+--- a/src/graphics/trace_writer.cpp
++++ b/src/graphics/trace_writer.cpp
+@@ -255,7 +255,7 @@ void TraceWriter::WriteEdramSnapshot(const void* snapshot) {
+ 
+     // Stream the content right to the buffer.
+     snappy::ByteArraySource snappy_source(reinterpret_cast<const char*>(snapshot),
+-                                          xenos::kEdramSizeBytes);
++                                          xenos::GetEdramSizeBytes());
+     SnappySink snappy_sink(file_);
+     cmd.encoded_length = static_cast<uint32_t>(snappy::Compress(&snappy_source, &snappy_sink));
+ 
+@@ -268,9 +268,9 @@ void TraceWriter::WriteEdramSnapshot(const void* snapshot) {
+   {
+     // Uncompressed - write buffer directly to the file.
+     cmd.encoding_format = MemoryEncodingFormat::kNone;
+-    cmd.encoded_length = xenos::kEdramSizeBytes;
++    cmd.encoded_length = xenos::GetEdramSizeBytes();
+     fwrite(&cmd, 1, sizeof(cmd), file_);
+-    fwrite(snapshot, 1, xenos::kEdramSizeBytes, file_);
++    fwrite(snapshot, 1, xenos::GetEdramSizeBytes(), file_);
+   }
+ }
+ 
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 70c8a7e..db2eaeb 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -1247,7 +1247,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+     depth_edram_info.msaa_samples = rb_surface_info.msaa_samples;
+     depth_edram_info.is_depth = 1;
+     // If wrapping happens, it's fine, it doesn't matter how many times and
+-    // where modulo xenos::kEdramTileCount is applied in this context.
++    // where modulo GetEdramTileCount() is applied in this context.
+     depth_edram_info.base_tiles = rb_depth_info.depth_base + edram_base_offset_tiles;
+     depth_edram_info.format = uint32_t(rb_depth_info.depth_format);
+     depth_edram_info.format_is_64bpp = 0;
+@@ -1268,7 +1268,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+     color_edram_info.msaa_samples = rb_surface_info.msaa_samples;
+     color_edram_info.is_depth = 0;
+     // If wrapping happens, it's fine, it doesn't matter how many times and
+-    // where modulo xenos::kEdramTileCount is applied in this context.
++    // where modulo GetEdramTileCount() is applied in this context.
+     color_edram_info.base_tiles = color_info.color_base + (edram_base_offset_tiles << is_64bpp);
+     color_edram_info.format = uint32_t(color_info.color_format);
+     color_edram_info.format_is_64bpp = is_64bpp;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 6414d1c..443e528 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -488,7 +488,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+   // maxStorageBufferRange.
+   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+           vulkan_device,
+-          VkDeviceSize(xenos::kEdramSizeBytes *
++           VkDeviceSize(xenos::GetEdramSizeBytes() *
+                        (draw_resolution_scale_x() * draw_resolution_scale_y())),
+           VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT |
+               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT,
+@@ -716,7 +716,8 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+         vulkan_device, VK_BUFFER_USAGE_VERTEX_BUFFER_BIT,
+         std::max(
+             ui::vulkan::VulkanUploadBufferPool::kDefaultPageSize,
+-            sizeof(float) * 2 * 6 * Transfer::kMaxCutoutBorderRectangles * xenos::kEdramTileCount));
++            sizeof(float) * 2 * 6 * Transfer::kMaxCutoutBorderRectangles *
++                xenos::GetEdramTileCount()));
+ 
+     // Transfer vertex shader.
+     transfer_passthrough_vertex_shader_ =
+@@ -1167,7 +1168,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
+   }
+ 
+   if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
+-          command_processor_.GetVulkanDevice(), xenos::kEdramSizeBytes,
++          command_processor_.GetVulkanDevice(), xenos::GetEdramSizeBytes(),
+           VK_BUFFER_USAGE_TRANSFER_DST_BIT, ui::vulkan::util::MemoryPurpose::kReadback,
+           edram_snapshot_download_buffer_, edram_snapshot_download_buffer_memory_,
+           &edram_snapshot_download_buffer_memory_type_,
+@@ -1181,7 +1182,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
+ 
+   if (GetPath() == Path::kHostRenderTargets) {
+     // Dump all host render targets to edram_buffer_.
+-    if (!DumpRenderTargets(0, xenos::kEdramTileCount, 1, xenos::kEdramTileCount)) {
++    if (!DumpRenderTargets(0, xenos::GetEdramTileCount(), 1, xenos::GetEdramTileCount())) {
+       REXGPU_ERROR("VulkanRenderTargetCache: Failed to dump host render targets for trace");
+       ResetTraceDownload();
+       return false;
+@@ -1194,7 +1195,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
+   VkBufferCopy edram_download_copy;
+   edram_download_copy.srcOffset = 0;
+   edram_download_copy.dstOffset = 0;
+-  edram_download_copy.size = xenos::kEdramSizeBytes;
++  edram_download_copy.size = xenos::GetEdramSizeBytes();
+   command_buffer.CmdVkCopyBuffer(edram_buffer_, edram_snapshot_download_buffer_, 1,
+                                  &edram_download_copy);
+   command_processor_.PushBufferMemoryBarrier(
+@@ -1222,7 +1223,7 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
+       edram_snapshot_download_memory_range.memory = edram_snapshot_download_buffer_memory_;
+       edram_snapshot_download_memory_range.offset = 0;
+       edram_snapshot_download_memory_range.size =
+-          std::min(rex::round_up(VkDeviceSize(xenos::kEdramSizeBytes),
++          std::min(rex::round_up(VkDeviceSize(xenos::GetEdramSizeBytes()),
+                                  vulkan_device->properties().nonCoherentAtomSize),
+                    edram_snapshot_download_buffer_memory_size_);
+       dfn.vkInvalidateMappedMemoryRanges(device, 1, &edram_snapshot_download_memory_range);
+@@ -1249,12 +1250,12 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   if (!edram_snapshot_restore_pool_) {
+     edram_snapshot_restore_pool_ = std::make_unique<ui::vulkan::VulkanUploadBufferPool>(
+-        vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, xenos::kEdramSizeBytes);
++        vulkan_device, VK_BUFFER_USAGE_TRANSFER_SRC_BIT, xenos::GetEdramSizeBytes());
+   }
+   VkBuffer upload_buffer;
+   VkDeviceSize upload_buffer_offset;
+   uint8_t* upload_buffer_mapping = edram_snapshot_restore_pool_->Request(
+-      command_processor_.GetCurrentSubmission(), xenos::kEdramSizeBytes, 1, upload_buffer,
++      command_processor_.GetCurrentSubmission(), xenos::GetEdramSizeBytes(), 1, upload_buffer,
+       upload_buffer_offset);
+   if (!upload_buffer_mapping) {
+     REXGPU_ERROR(
+@@ -1277,8 +1278,8 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+       assert_false(full_edram_render_target->key().is_depth);
+       assert_false(full_edram_render_target->key().Is64bpp());
+       uint32_t pitch_tiles = full_edram_render_target->key().pitch_tiles_at_32bpp;
+-      uint32_t tile_rows = xenos::kEdramTileCount / pitch_tiles;
+-      assert_true(pitch_tiles * tile_rows == xenos::kEdramTileCount);
++      uint32_t tile_rows = xenos::GetEdramTileCount() / pitch_tiles;
++      assert_true(pitch_tiles * tile_rows == xenos::GetEdramTileCount());
+       uint32_t row_pitch_samples = pitch_tiles * xenos::kEdramTileWidthSamples;
+       VkDeviceSize row_pitch_bytes = VkDeviceSize(row_pitch_samples) * sizeof(uint32_t);
+       const uint8_t* snapshot_sample_row = reinterpret_cast<const uint8_t*>(snapshot);
+@@ -1326,13 +1327,13 @@ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+     } break;
+ 
+     case Path::kPixelShaderInterlock: {
+-      std::memcpy(upload_buffer_mapping, snapshot, xenos::kEdramSizeBytes);
++      std::memcpy(upload_buffer_mapping, snapshot, xenos::GetEdramSizeBytes());
+       UseEdramBuffer(EdramBufferUsage::kTransferWrite);
+       command_processor_.SubmitBarriers(true);
+       VkBufferCopy copy_region = {};
+       copy_region.srcOffset = upload_buffer_offset;
+       copy_region.dstOffset = 0;
+-      copy_region.size = xenos::kEdramSizeBytes;
++      copy_region.size = xenos::GetEdramSizeBytes();
+       command_buffer.CmdVkCopyBuffer(upload_buffer, edram_buffer_, 1, &copy_region);
+     } break;
+ 
+@@ -3261,8 +3262,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+ 
+   // Transform the destination 32bpp tile index into the source. After the
+   // addition, it may be negative - in which case, the transfer is done across
+-  // EDRAM addressing wrapping, and xenos::kEdramTileCount must be added to it,
+-  // but `& (xenos::kEdramTileCount - 1)` handles that regardless of the sign.
++  // EDRAM addressing wrapping, and GetEdramTileCount() must be added to it,
++  // but the mask by GetEdramTileCount() - 1 handles that regardless of the sign.
+   spv::Id source_tile_index = builder.createBinOp(
+       spv::OpBitwiseAnd, type_uint,
+       builder.createUnaryOp(
+@@ -3274,7 +3275,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+                                   builder.createUnaryOp(spv::OpBitcast, type_int, address_constant),
+                                   builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2),
+                                   builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1)))),
+-      builder.makeUintConstant(xenos::kEdramTileCount - 1));
++      builder.makeUintConstant(xenos::GetEdramTileCount() - 1));
+   // Split the source 32bpp tile index into X and Y tile index within the source
+   // image.
+   spv::Id source_pitch_tiles =
+@@ -4263,8 +4264,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+             // Transform the destination tile index into the host depth source.
+             // After the addition, it may be negative - in which case, the
+             // transfer is done across EDRAM addressing wrapping, and
+-            // xenos::kEdramTileCount must be added to it, but
+-            // `& (xenos::kEdramTileCount - 1)` handles that regardless of the
++            // GetEdramTileCount() must be added to it, but
++            // masking by GetEdramTileCount() - 1 handles that regardless of the
+             // sign.
+             spv::Id host_depth_source_tile_index = builder.createBinOp(
+                 spv::OpBitwiseAnd, type_uint,
+@@ -4279,7 +4280,7 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+                                                   host_depth_address_constant),
+                             builder.makeUintConstant(xenos::kEdramPitchTilesBits * 2),
+                             builder.makeUintConstant(xenos::kEdramBaseTilesBits + 1)))),
+-                builder.makeUintConstant(xenos::kEdramTileCount - 1));
++                builder.makeUintConstant(xenos::GetEdramTileCount() - 1));
+             // Split the host depth source tile index into X and Y tile index
+             // within the source image.
+             spv::Id host_depth_source_pitch_tiles =
+@@ -5858,7 +5859,7 @@ VkPipeline VulkanRenderTargetCache::GetDumpPipeline(DumpPipelineKey key) {
+       builder.createBinOp(
+           spv::OpIMul, type_uint, builder.makeUintConstant(tile_width * tile_height),
+           builder.createBinOp(spv::OpBitwiseAnd, type_uint, edram_tile_index_non_wrapped,
+-                              builder.makeUintConstant(xenos::kEdramTileCount - 1))),
++                              builder.makeUintConstant(xenos::GetEdramTileCount() - 1))),
+       builder.createBinOp(
+           spv::OpIAdd, type_uint,
+           builder.createBinOp(spv::OpIMul, type_uint, const_tile_width, tile_sample_y),
+diff --git a/src/graphics/xenos.cpp b/src/graphics/xenos.cpp
+index 4140de7..3133e18 100644
+--- a/src/graphics/xenos.cpp
++++ b/src/graphics/xenos.cpp
+@@ -11,13 +11,35 @@
+ 
+ #include <cmath>
+ 
++#include <rex/cvar.h>
+ #include <rex/graphics/xenos.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+ 
++REXCVAR_DECLARE(int32_t, edram_tiles);
++
+ namespace rex::graphics {
+ namespace xenos {
+ 
++uint32_t GetEdramTileCount() {
++  static const uint32_t tile_count = [] {
++    const int32_t configured = REXCVAR_GET(edram_tiles);
++    const uint32_t selected = configured == int32_t(kEdramMaxTileCount)
++                                  ? kEdramMaxTileCount
++                                  : kEdramDefaultTileCount;
++    REXLOG_INFO("[rex-edram] edram_tiles={} buffer_bytes={} (emulated EDRAM model)", selected,
++                selected * kEdramTileHeightSamples * kEdramTileWidthSamples * sizeof(uint32_t));
++    return selected;
++  }();
++  return tile_count;
++}
++
++uint32_t GetEdramSizeBytes() {
++  return GetEdramTileCount() * kEdramTileHeightSamples * kEdramTileWidthSamples *
++         sizeof(uint32_t);
++}
++
+ // Based on X360GammaToLinear and X360LinearToGamma from the Source Engine, with
+ // additional logic from Direct3D 9 code in game executable disassembly, located
+ // via the floating-point constants involved.
+-- 
+2.43.0
+

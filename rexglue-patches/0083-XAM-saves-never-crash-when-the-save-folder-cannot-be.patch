@@ -1,0 +1,111 @@
+From 5df1281a1e8ceb01086ba9b7e6410c24afd890ec Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 21:44:17 -0700
+Subject: [PATCH 83/97] XAM saves: never crash when the save folder cannot be
+ written
+
+Unchecked OpenFile results (fseek/fwrite on a null FILE*) and the throwing std::filesystem::create_directories
+overloads in content thumbnails, content creation/header writes and title profile settings turned a read-only or
+permission-denied save folder into a crash. Now the call fails with an error code (or the setting is skipped
+with a warning). Release bug hunt 2026-10-02, review logs/bughunt-20261002/r2-hooks.md F17.
+---
+ src/system/xam/content_manager.cpp | 19 +++++++++++++++----
+ src/system/xam/user_profile.cpp    |  9 ++++++++-
+ 2 files changed, 23 insertions(+), 5 deletions(-)
+
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index 6fd8baf..ea5b9bf 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -12,6 +12,7 @@
+ #include <array>
+ #include <cstring>
+ #include <string>
++#include <system_error>
+ 
+ #include <fmt/format.h>
+ 
+@@ -199,7 +200,8 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
+   auto parent_path = header_path.parent_path();
+ 
+   if (!std::filesystem::exists(parent_path)) {
+-    if (!std::filesystem::create_directories(parent_path)) {
++    std::error_code ec;  // Non-throwing: a read-only save folder fails the call instead of terminating.
++    if (!std::filesystem::create_directories(parent_path, ec)) {
+       return X_ERROR_ACCESS_DENIED;
+     }
+   }
+@@ -261,7 +263,8 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+   if (std::filesystem::exists(package_path)) {
+     return X_ERROR_ALREADY_EXISTS;
+   }
+-  if (!std::filesystem::create_directories(package_path)) {
++  std::error_code create_error;  // Non-throwing: see WriteContentHeaderFile.
++  if (!std::filesystem::create_directories(package_path, create_error)) {
+     return X_ERROR_ACCESS_DENIED;
+   }
+   auto package = ResolvePackage(root_name, xuid, data);
+@@ -331,6 +334,9 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+   auto thumb_path = package_path / kThumbnailFileName;
+   if (std::filesystem::exists(thumb_path)) {
+     auto file = rex::filesystem::OpenFile(thumb_path, "rb");
++    if (!file) {
++      return X_ERROR_FILE_NOT_FOUND;
++    }
+     fseek(file, 0, SEEK_END);
+     size_t file_len = ftell(file);
+     fseek(file, 0, SEEK_SET);
+@@ -347,10 +353,15 @@ X_RESULT ContentManager::SetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+                                              std::vector<uint8_t> buffer) {
+   auto global_lock = global_critical_region_.Acquire();
+   auto package_path = ResolvePackagePath(xuid, data);
+-  std::filesystem::create_directories(package_path);
+-  if (std::filesystem::exists(package_path)) {
++  // Non-throwing overloads: a read-only or missing save folder must fail the call, not terminate the game.
++  std::error_code ec;
++  std::filesystem::create_directories(package_path, ec);
++  if (std::filesystem::exists(package_path, ec)) {
+     auto thumb_path = package_path / kThumbnailFileName;
+     auto file = rex::filesystem::OpenFile(thumb_path, "wb");
++    if (!file) {
++      return X_ERROR_ACCESS_DENIED;
++    }
+     fwrite(buffer.data(), 1, buffer.size(), file);
+     fclose(file);
+     return X_ERROR_SUCCESS;
+diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
+index a77f5e6..02c133d 100644
+--- a/src/system/xam/user_profile.cpp
++++ b/src/system/xam/user_profile.cpp
+@@ -10,9 +10,11 @@
+  */
+ 
+ #include <sstream>
++#include <system_error>
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xam/user_profile.h>
+@@ -159,10 +161,15 @@ void UserProfile::SaveSetting(UserProfile::Setting* setting) {
+   if (setting->is_title_specific()) {
+     auto serialized_setting = setting->Serialize();
+     auto content_dir = kernel_state_->content_manager()->ResolveGameUserContentPath();
+-    std::filesystem::create_directories(content_dir);
++    std::error_code ec;  // Non-throwing: a read-only save folder loses the setting, never the game.
++    std::filesystem::create_directories(content_dir, ec);
+     auto setting_id = fmt::format("{:08X}", setting->setting_id);
+     auto file_path = content_dir / setting_id;
+     auto file = rex::filesystem::OpenFile(file_path, "wb");
++    if (!file) {
++      REXSYS_WARN("UserProfile::SaveSetting: cannot write {}", rex::path_to_utf8(file_path));
++      return;
++    }
+     fwrite(serialized_setting.data(), 1, serialized_setting.size(), file);
+     fclose(file);
+   } else {
+-- 
+2.43.0
+

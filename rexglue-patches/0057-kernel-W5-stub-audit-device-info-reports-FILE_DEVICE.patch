@@ -1,0 +1,368 @@
+From 415a408af1ec6b8a02127af9cfabfcbf4a830896 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 15:35:54 -0700
+Subject: [PATCH 57/97] kernel: W5 stub audit - device info reports
+ FILE_DEVICE_DISK; XCTD keeps INVALID_PARAMETER with caller diagnostics;
+ XNetLogonGetTitleID and XAM message dispatch log caller once
+
+- NtQueryVolumeInformationFile(XFileFsDeviceInformation): FILE_DEVICE_DISK (only caller, the title's utility-drive
+  mount, tests == 0x46 EHSTOR: same branch as before); unit test pins 0x7.
+- NtQueryInformationFile(XFileXctdCompressionInformation): stays X_STATUS_INVALID_PARAMETER (= Xenia Canary); the
+  caller (sub_82B8AB00 via sub_82B8AA98) then checks the file's own XCTD magic 0x0FF512ED. Once-per-session WARN with
+  guest LR and path (path built inside call_once).
+- IoDismountVolumeByFileHandle: documented intentional no-op (return ignored by the caller).
+- XNetLogonGetTitleID: behaves exactly like the stub (r3 preserved) but logs each (caller LR, selector) once; XAM
+  message dispatch logs each (app, message, result, LR) once. Runtime (build 3ce91bfa): only caller is the Live
+  sign-in-gated sub_82CB78F0; no app 0xFC message offline.
+Evidence: docs/KERNEL-STUBS-W5.md (game repo). Reviewer: XCTD/device/dismount accepted; final round found no defect
+(procedural INSUFFICIENT_EVIDENCE: its gate ran on ace1524b, which contains this code - PASS); unit tests [kernel]
+74/74 assertions, [system] 28/28 run by the coordinator.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xam/xam_misc.cpp                   | 52 ++++++++++++++++++-
+ src/kernel/xam/xam_msg.cpp                    | 50 ++++++++++++++++++
+ src/kernel/xboxkrnl/xboxkrnl_io.cpp           | 11 +++-
+ src/kernel/xboxkrnl/xboxkrnl_io_info.cpp      | 42 ++++++++++-----
+ .../xboxkrnl/xboxkrnl_io_info_helpers.h       | 20 +++++++
+ tests/unit/CMakeLists.txt                     |  1 +
+ tests/unit/kernel/xboxkrnl_io_info_test.cpp   | 13 +++++
+ 7 files changed, 174 insertions(+), 15 deletions(-)
+ create mode 100644 src/kernel/xboxkrnl/xboxkrnl_io_info_helpers.h
+ create mode 100644 tests/unit/kernel/xboxkrnl_io_info_test.cpp
+
+diff --git a/src/kernel/xam/xam_misc.cpp b/src/kernel/xam/xam_misc.cpp
+index d163fb1..be59a94 100644
+--- a/src/kernel/xam/xam_misc.cpp
++++ b/src/kernel/xam/xam_misc.cpp
+@@ -11,6 +11,56 @@
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+ #include <rex/ppc/function.h>
++#include <rex/ppc/types.h>
++#include <rex/system/thread_state.h>
++
++#include <cstdint>
++#include <mutex>
++#include <unordered_set>
++
++namespace rex {
++namespace kernel {
++namespace xam {
++namespace {
++
++bool ShouldLogXNetLogonGetTitleID(uint32_t guest_lr, uint32_t selector) {
++  static std::mutex mutex;
++  static std::unordered_set<uint64_t> seen;
++  const uint64_t key = (static_cast<uint64_t>(guest_lr) << 32) | selector;
++  std::lock_guard<std::mutex> lock(mutex);
++  return seen.insert(key).second;
++}
++
++}  // namespace
++
++ppc_u32_result_t XNetLogonGetTitleID_entry(ppc_u32_t selector) {
++  const auto* thread_state = rex::runtime::ThreadState::Get();
++  const auto* context = thread_state ? thread_state->context() : nullptr;
++  const bool has_guest_context = context != nullptr;
++  const uint32_t guest_lr = has_guest_context ? static_cast<uint32_t>(context->lr) : 0;
++
++  if (ShouldLogXNetLogonGetTitleID(guest_lr, static_cast<uint32_t>(selector))) {
++    if (has_guest_context) {
++      REXKRNL_WARN(
++          "XNetLogonGetTitleID stub (guest caller LR/return={:#010x}, r3 selector={:#010x}); "
++          "preserving r3",
++          guest_lr, static_cast<uint32_t>(selector));
++    } else {
++      REXKRNL_WARN(
++          "XNetLogonGetTitleID stub (guest caller LR unavailable: no bound guest PPCContext, "
++          "r3 selector={:#010x}); preserving r3",
++          static_cast<uint32_t>(selector));
++    }
++  }
++
++  // PPC_STUB leaves r3 untouched, so the incoming selector is also the value
++  // returned to the guest by this explicit diagnostic entry.
++  return selector;
++}
++
++}  // namespace xam
++}  // namespace kernel
++}  // namespace rex
+ 
+ // kinda gross but oh well
+ XAM_EXPORT_STUB(__imp__CancelWaitableTimer);
+@@ -243,7 +293,7 @@ XAM_EXPORT_STUB(__imp__XNetLogonGetServiceInfo);
+ XAM_EXPORT_STUB(__imp__XNetLogonGetServiceNetworkID);
+ XAM_EXPORT_STUB(__imp__XNetLogonGetState);
+ XAM_EXPORT_STUB(__imp__XNetLogonGetTicketOpt);
+-XAM_EXPORT_STUB(__imp__XNetLogonGetTitleID);
++XAM_EXPORT(__imp__XNetLogonGetTitleID, rex::kernel::xam::XNetLogonGetTitleID_entry)
+ XAM_EXPORT_STUB(__imp__XNetLogonGetTitleVersion);
+ XAM_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
+ XAM_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
+diff --git a/src/kernel/xam/xam_msg.cpp b/src/kernel/xam/xam_msg.cpp
+index d15d5a7..9428422 100644
+--- a/src/kernel/xam/xam_msg.cpp
++++ b/src/kernel/xam/xam_msg.cpp
+@@ -20,31 +20,79 @@
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xevent.h>
+ #include <rex/system/xio.h>
++#include <rex/system/thread_state.h>
+ #include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
+ 
++#include <mutex>
++#include <unordered_set>
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+ using namespace rex::system;
+ using namespace rex::system::xam;
+ 
++namespace {
++
++struct GuestCaller {
++  bool available;
++  uint32_t lr;
++};
++
++GuestCaller CaptureGuestCaller() {
++  const auto* thread_state = rex::runtime::ThreadState::Get();
++  const auto* context = thread_state ? thread_state->context() : nullptr;
++  return {context != nullptr, context ? static_cast<uint32_t>(context->lr) : 0};
++}
++
++void LogAppMessageDispatchOnce(uint32_t app, uint32_t message, uint32_t buffer_length,
++                               X_HRESULT result, GuestCaller caller) {
++  static std::mutex mutex;
++  static std::unordered_set<uint64_t> seen;
++  const uint64_t key = (static_cast<uint64_t>(app) << 32) | message;
++  {
++    std::lock_guard<std::mutex> lock(mutex);
++    if (!seen.insert(key).second) {
++      return;
++    }
++  }
++
++  if (caller.available) {
++    REXKRNL_INFO(
++        "XAM message dispatch app={:08X}, message={:08X}, buffer_length={}, result={:08X}, "
++        "guest caller LR={:08X}",
++        app, message, buffer_length, static_cast<uint32_t>(result), caller.lr);
++  } else {
++    REXKRNL_INFO(
++        "XAM message dispatch app={:08X}, message={:08X}, buffer_length={}, result={:08X}, "
++        "guest caller LR unavailable (no bound guest PPCContext)",
++        app, message, buffer_length, static_cast<uint32_t>(result));
++  }
++}
++
++}  // namespace
++
+ ppc_u32_result_t XMsgInProcessCall_entry(ppc_u32_t app, ppc_u32_t message, ppc_u32_t arg1,
+                                          ppc_u32_t arg2) {
++  const auto caller = CaptureGuestCaller();
+   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageSync(app, message, arg1, arg2);
+   if (result == X_ERROR_NOT_FOUND) {
+     REXKRNL_ERROR("XMsgInProcessCall: app {:08X} undefined", app);
+   }
++  LogAppMessageDispatchOnce(app, message, arg2, result, caller);
+   return result;
+ }
+ 
+ ppc_u32_result_t XMsgSystemProcessCall_entry(ppc_u32_t app, ppc_u32_t message, ppc_u32_t buffer,
+                                              ppc_u32_t buffer_length) {
++  const auto caller = CaptureGuestCaller();
+   auto result =
+       REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer, buffer_length);
+   if (result == X_ERROR_NOT_FOUND) {
+     REXKRNL_ERROR("XMsgSystemProcessCall: app {:08X} undefined", app);
+   }
++  LogAppMessageDispatchOnce(app, message, buffer_length, result, caller);
+   return result;
+ }
+ 
+@@ -56,6 +104,7 @@ struct XMSGSTARTIOREQUEST_UNKNOWNARG {
+ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overlapped_ptr,
+                                  uint32_t buffer_ptr, uint32_t buffer_length,
+                                  XMSGSTARTIOREQUEST_UNKNOWNARG* unknown) {
++  const auto caller = CaptureGuestCaller();
+   auto result = REX_KERNEL_STATE()->app_manager()->DispatchMessageAsync(app, message, buffer_ptr,
+                                                                         buffer_length);
+   if (result == X_E_NOTFOUND) {
+@@ -70,6 +119,7 @@ X_HRESULT xeXMsgStartIORequestEx(uint32_t app, uint32_t message, uint32_t overla
+   if (result == X_ERROR_SUCCESS || result == X_ERROR_IO_PENDING) {
+     XThread::SetLastError(0);
+   }
++  LogAppMessageDispatchOnce(app, message, buffer_length, result, caller);
+   return result;
+ }
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index d73269d..487c587 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -12,6 +12,8 @@
+ // Disable warnings about unused parameters for kernel functions
+ #pragma GCC diagnostic ignored "-Wunused-parameter"
+ 
++#include <mutex>
++
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
+@@ -808,7 +810,14 @@ ppc_u32_result_t IoCreateDevice_entry(ppc_u32_t device_struct, ppc_u32_t r4, ppc
+ }
+ 
+ ppc_u32_result_t IoDismountVolumeByFileHandle_entry(ppc_u32_t handle) {
+-  REXKRNL_WARN("IoDismountVolumeByFileHandle({:#x}) - stub", (uint32_t)handle);
++  // The VFS exposes shared host-backed devices rather than per-file guest
++  // volume mounts, so dismounting this handle must not unmount the host device.
++  // WWE 13 treats this call as cleanup and ignores its return value.
++  static std::once_flag dismount_logged;
++  std::call_once(dismount_logged, [handle] {
++    REXKRNL_DEBUG("IoDismountVolumeByFileHandle({:#x}): no host VFS dismount (logged once)",
++                  (uint32_t)handle);
++  });
+   return X_STATUS_SUCCESS;
+ }
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+index 80e430c..17e01c4 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
+@@ -23,6 +23,7 @@
+ #include <rex/system/info/file.h>
+ #include <rex/system/info/volume.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/thread_state.h>
+ #include <rex/system/util/string_utils.h>
+ #include <rex/system/xevent.h>
+ #include <rex/system/xfile.h>
+@@ -32,6 +33,8 @@
+ #include <rex/system/xtypes.h>
+ #include <rex/thread/mutex.h>
+ 
++#include "xboxkrnl_io_info_helpers.h"
++
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
+@@ -153,17 +156,28 @@ ppc_u32_result_t NtQueryInformationFile_entry(ppc_u32_t file_handle,
+       break;
+     }
+     case XFileXctdCompressionInformation: {
+-      // WWE 13 asks this for thousands of files (log-miner: 7,446 lines, bursts aligned with slow seconds, and
+-      // every error line forces a disk flush). The answer is always the same; say so once per session.
++      // Xenia Canary also returns INVALID_PARAMETER for this query. Keep the
++      // once-per-session warning useful for identifying the indirect guest
++      // caller without changing that reference behavior.
+       static std::once_flag xctd_logged;
+-      std::call_once(xctd_logged, [] {
+-        REXKRNL_ERROR(
+-            "NtQueryInformationFile(XFileXctdCompressionInformation) "
+-            "unimplemented (logged once; returns X_STATUS_INVALID_PARAMETER)");
++      const auto* thread_state = rex::runtime::ThreadState::Get();
++      const auto* context = thread_state ? thread_state->context() : nullptr;
++      const bool has_guest_context = context != nullptr;
++      const uint32_t guest_lr = has_guest_context ? static_cast<uint32_t>(context->lr) : 0;
++      std::call_once(xctd_logged, [has_guest_context, guest_lr, file] {
++        if (has_guest_context) {
++          REXKRNL_WARN(
++              "NtQueryInformationFile(XFileXctdCompressionInformation) returns "
++              "INVALID_PARAMETER (logged once; guest caller LR/return={:#010x}, path='{}')",
++              guest_lr, file->path());
++        } else {
++          REXKRNL_WARN(
++              "NtQueryInformationFile(XFileXctdCompressionInformation) returns "
++              "INVALID_PARAMETER (logged once; guest caller LR unavailable: no bound "
++              "guest PPCContext; path='{}')",
++              file->path());
++        }
+       });
+-      // Files that are XCTD compressed begin with the magic 0x0FF512ED but we
+-      // shouldn't detect this that way. There's probably a flag somewhere
+-      // (attributes?) that defines if it's compressed or not.
+       status = X_STATUS_INVALID_PARAMETER;
+       out_length = 0;
+       break;
+@@ -442,10 +456,12 @@ ppc_u32_result_t NtQueryVolumeInformationFile_entry(
+     }
+     case XFileFsDeviceInformation: {
+       auto info = info_ptr.as<X_FILE_FS_DEVICE_INFORMATION*>();
+-      REXKRNL_WARN("Stub XFileFsDeviceInformation!");
+-      info->device_type = FILE_DEVICE_UNKNOWN;
+-      info->characteristics = 0;
+-      out_length = sizeof(X_FILE_FS_DEVICE_INFORMATION);
++      static std::once_flag device_info_logged;
++      std::call_once(device_info_logged, [] {
++        REXKRNL_DEBUG("XFileFsDeviceInformation: reporting host disk device (logged once)");
++      });
++      internal::PopulateHostDiskFsDeviceInformation(*info);
++      out_length = sizeof(*info);
+       break;
+     }
+     default: {
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info_helpers.h b/src/kernel/xboxkrnl/xboxkrnl_io_info_helpers.h
+new file mode 100644
+index 0000000..5780959
+--- /dev/null
++++ b/src/kernel/xboxkrnl/xboxkrnl_io_info_helpers.h
+@@ -0,0 +1,20 @@
++#pragma once
++
++#include <rex/system/info/volume.h>
++#include <rex/system/xtypes.h>
++
++namespace rex::kernel::xboxkrnl::internal {
++
++inline constexpr rex::system::X_FILE_DEVICE_TYPE kFileDeviceDisk =
++    static_cast<rex::system::X_FILE_DEVICE_TYPE>(0x00000007);
++
++inline void PopulateHostDiskFsDeviceInformation(
++    rex::system::X_FILE_FS_DEVICE_INFORMATION& info) {
++  // XMountUtilityDrive probes \\Device\\Harddisk0 NullDevice while checking
++  // Partition0/Cache0/Cache1. Its caller only distinguishes EHSTOR (0x46) from
++  // the generic path, so report disk type (0x7) for this synthetic device.
++  info.device_type = kFileDeviceDisk;
++  info.characteristics = 0;
++}
++
++}  // namespace rex::kernel::xboxkrnl::internal
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index a5b9fa9..79dc730 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -7,6 +7,7 @@ add_executable(unit_tests
+     system/missing_function_test.cpp
+     system/cache_drive_test.cpp
+     kernel/object_table_test.cpp
++    kernel/xboxkrnl_io_info_test.cpp
+     core/cvar_test.cpp
+     core/fiber_test.cpp
+     core/sha256_test.cpp
+diff --git a/tests/unit/kernel/xboxkrnl_io_info_test.cpp b/tests/unit/kernel/xboxkrnl_io_info_test.cpp
+new file mode 100644
+index 0000000..2563109
+--- /dev/null
++++ b/tests/unit/kernel/xboxkrnl_io_info_test.cpp
+@@ -0,0 +1,13 @@
++#include <catch2/catch_test_macros.hpp>
++
++#include <kernel/xboxkrnl/xboxkrnl_io_info_helpers.h>
++
++TEST_CASE("host disk volume information reports disk type with no characteristics",
++          "[kernel][io_info]") {
++  rex::system::X_FILE_FS_DEVICE_INFORMATION info{};
++
++  rex::kernel::xboxkrnl::internal::PopulateHostDiskFsDeviceInformation(info);
++
++  CHECK(static_cast<uint32_t>(info.device_type) == 0x7);
++  CHECK(static_cast<uint32_t>(info.characteristics) == 0);
++}
+-- 
+2.43.0
+

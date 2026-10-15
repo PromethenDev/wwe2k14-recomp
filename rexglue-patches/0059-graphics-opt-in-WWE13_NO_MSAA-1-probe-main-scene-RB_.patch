@@ -1,0 +1,64 @@
+From 0c291154c66d9eecc73576c1569df14803ea2a49 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 22:40:24 -0700
+Subject: [PATCH 59/97] graphics: opt-in WWE13_NO_MSAA=1 probe - main-scene
+ RB_SURFACE_INFO 0x05020140 written without its 4x MSAA bits (default off,
+ logged once)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/command_processor.cpp | 24 ++++++++++++++++++++++++
+ 1 file changed, 24 insertions(+)
+
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index d21aa64..4b69858 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+@@ -89,6 +90,16 @@ using namespace rex::graphics::xenos;
+ 
+ namespace {
+ 
++bool Wwe13NoMsaaProbeEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("WWE13_NO_MSAA");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
++std::atomic_flag wwe13_no_msaa_probe_logged = ATOMIC_FLAG_INIT;
++
+ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+   if (value == "fast") {
+     return ReadbackResolveMode::kFast;
+@@ -481,6 +492,19 @@ uint32_t CommandProcessor::ReadRegisterValue(uint32_t index) const {
+ }
+ 
+ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
++  // Diagnostic-only probe requested by WWE '13's AA/tiling study. This late
++  // register change does not rewrite the title's PM4 bin selections or resolve
++  // layout; it only tests the host's handling of this exact surface value.
++  if (index == XE_GPU_REG_RB_SURFACE_INFO && value == UINT32_C(0x05020140) &&
++      Wwe13NoMsaaProbeEnabled()) {
++    const uint32_t original = value;
++    value &= ~UINT32_C(0x00030000);
++    if (!wwe13_no_msaa_probe_logged.test_and_set(std::memory_order_relaxed)) {
++      REXLOG_INFO("[wwe13-no-msaa] RB_SURFACE_INFO 0x{:08X} -> 0x{:08X}", original,
++                  value);
++    }
++  }
++
+   RegisterFile& regs = *register_file_;
+   if (index >= RegisterFile::kRegisterCount) {
+     auto [it, inserted] = extended_register_values_.insert_or_assign(index, value);
+-- 
+2.43.0
+

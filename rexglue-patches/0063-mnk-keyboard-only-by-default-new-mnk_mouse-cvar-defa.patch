@@ -1,0 +1,133 @@
+From aded2273ef9e281b8c258ec7be0b23b32ebe59d3 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 18:56:04 -0700
+Subject: [PATCH 63/97] mnk: keyboard-only by default - new mnk_mouse cvar
+ (default off) gates cursor capture/hide/re-centre and mouse input; right
+ stick on I/J/K/L, LT=Z, RT=Control, RS press=M (no mouse defaults)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/input/mnk/mnk_input_driver.h |  1 +
+ src/input/mnk/mnk_input_driver.cpp       | 45 ++++++++++++++++++------
+ 2 files changed, 36 insertions(+), 10 deletions(-)
+
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index 2483b99..13fca03 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -69,6 +69,7 @@ class MnkInputDriver final : public InputDriver,
+   int32_t prev_mouse_x_ = 0;
+   int32_t prev_mouse_y_ = 0;
+   bool mouse_captured_ = false;
++  bool mouse_enabled_ = false;
+   bool has_focus_ = true;
+ 
+   // Keystroke queue
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index b005782..3410a0c 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -27,6 +27,7 @@
+ #endif
+ 
+ REXCVAR_DEFINE_BOOL(mnk_mode, false, "Input", "Enable keyboard/mouse controller emulation");
++REXCVAR_DEFINE_BOOL(mnk_mouse, false, "Input", "Mouse drives the right stick (captures the cursor)");
+ REXCVAR_DEFINE_INT32(mnk_user_index, 0, "Input", "Controller slot (0-3) for MnK").range(0, 3);
+ REXCVAR_DEFINE_DOUBLE(mnk_sensitivity, 1.0, "Input", "Mouse sensitivity for right stick")
+     .range(0.01, 10.0);
+@@ -35,8 +36,8 @@ REXCVAR_DEFINE_STRING(keybind_a, "Space", "Input/Keybinds/Controller", "A button
+ REXCVAR_DEFINE_STRING(keybind_b, "Shift", "Input/Keybinds/Controller", "B button");
+ REXCVAR_DEFINE_STRING(keybind_x, "R", "Input/Keybinds/Controller", "X button");
+ REXCVAR_DEFINE_STRING(keybind_y, "E", "Input/Keybinds/Controller", "Y button");
+-REXCVAR_DEFINE_STRING(keybind_left_trigger, "RMB", "Input/Keybinds/Controller", "Left trigger");
+-REXCVAR_DEFINE_STRING(keybind_right_trigger, "LMB", "Input/Keybinds/Controller", "Right trigger");
++REXCVAR_DEFINE_STRING(keybind_left_trigger, "Z", "Input/Keybinds/Controller", "Left trigger");
++REXCVAR_DEFINE_STRING(keybind_right_trigger, "Control", "Input/Keybinds/Controller", "Right trigger");
+ REXCVAR_DEFINE_STRING(keybind_left_shoulder, "Q", "Input/Keybinds/Controller", "Left shoulder");
+ REXCVAR_DEFINE_STRING(keybind_right_shoulder, "F", "Input/Keybinds/Controller", "Right shoulder");
+ REXCVAR_DEFINE_STRING(keybind_lstick_up, "W", "Input/Keybinds/Controller", "Left stick up");
+@@ -44,8 +45,11 @@ REXCVAR_DEFINE_STRING(keybind_lstick_down, "S", "Input/Keybinds/Controller", "Le
+ REXCVAR_DEFINE_STRING(keybind_lstick_left, "A", "Input/Keybinds/Controller", "Left stick left");
+ REXCVAR_DEFINE_STRING(keybind_lstick_right, "D", "Input/Keybinds/Controller", "Left stick right");
+ REXCVAR_DEFINE_STRING(keybind_lstick_press, "C", "Input/Keybinds/Controller", "Left stick press");
+-REXCVAR_DEFINE_STRING(keybind_rstick_press, "MMB", "Input/Keybinds/Controller",
+-                      "Right stick press");
++REXCVAR_DEFINE_STRING(keybind_rstick_up, "I", "Input/Keybinds/Controller", "Right stick up");
++REXCVAR_DEFINE_STRING(keybind_rstick_down, "K", "Input/Keybinds/Controller", "Right stick down");
++REXCVAR_DEFINE_STRING(keybind_rstick_left, "J", "Input/Keybinds/Controller", "Right stick left");
++REXCVAR_DEFINE_STRING(keybind_rstick_right, "L", "Input/Keybinds/Controller", "Right stick right");
++REXCVAR_DEFINE_STRING(keybind_rstick_press, "M", "Input/Keybinds/Controller", "Right stick press");
+ REXCVAR_DEFINE_STRING(keybind_dpad_up, "Up", "Input/Keybinds/Controller", "D-pad up");
+ REXCVAR_DEFINE_STRING(keybind_dpad_down, "Down", "Input/Keybinds/Controller", "D-pad down");
+ REXCVAR_DEFINE_STRING(keybind_dpad_left, "Left", "Input/Keybinds/Controller", "D-pad left");
+@@ -224,8 +228,18 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+ 
+   double sensitivity = REXCVAR_GET(mnk_sensitivity);
+   constexpr double kBaseScale = 200.0;
+-  int32_t rx = static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
+-  int32_t ry = static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale);
++  int32_t rx = 0;
++  int32_t ry = 0;
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
++    rx -= INT16_MAX;
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
++    rx += INT16_MAX;
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
++    ry += INT16_MAX;
++  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
++    ry -= INT16_MAX;
++  rx += static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
++  ry += static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale);
+   mouse_dx_ = 0;
+   mouse_dy_ = 0;
+ 
+@@ -302,7 +316,18 @@ void MnkInputDriver::UpdateMouseCapture() {
+   if (!attached_window_)
+     return;
+ 
+-  bool should_capture = IsEnabled() && has_focus_ && is_active();
++  const bool mouse_enabled = REXCVAR_GET(mnk_mouse);
++  bool should_capture = IsEnabled() && mouse_enabled && has_focus_ && is_active();
++
++  if (!mouse_enabled && mouse_enabled_) {
++    std::lock_guard lock(state_mutex_);
++    mouse_dx_ = 0;
++    mouse_dy_ = 0;
++    SetKeyState(static_cast<uint16_t>(VirtualKey::kLButton), false);
++    SetKeyState(static_cast<uint16_t>(VirtualKey::kRButton), false);
++    SetKeyState(static_cast<uint16_t>(VirtualKey::kMButton), false);
++  }
++  mouse_enabled_ = mouse_enabled;
+ 
+   if (should_capture && !mouse_captured_) {
+     mouse_captured_ = true;
+@@ -352,7 +377,7 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !REXCVAR_GET(mnk_mouse) || !has_focus_)
+     return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+@@ -371,7 +396,7 @@ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled())
++  if (!IsEnabled() || !REXCVAR_GET(mnk_mouse))
+     return;
+   std::lock_guard lock(state_mutex_);
+   switch (e.button()) {
+@@ -390,7 +415,7 @@ void MnkInputDriver::OnMouseUp(rex::ui::MouseEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+-  if (!IsEnabled() || !has_focus_)
++  if (!IsEnabled() || !REXCVAR_GET(mnk_mouse) || !has_focus_)
+     return;
+   std::lock_guard lock(state_mutex_);
+   int32_t x = e.x();
+-- 
+2.43.0
+

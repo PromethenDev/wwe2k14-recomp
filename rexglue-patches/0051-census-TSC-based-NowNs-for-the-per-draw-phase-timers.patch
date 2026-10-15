@@ -1,0 +1,115 @@
+From 198c76acefa44ef1749d11e494b993f222973e05 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:47:01 -0700
+Subject: [PATCH 51/97] census: TSC-based NowNs for the per-draw phase timers;
+ display pacing samples mid-period
+
+- NowNs (two calls per draw with the census on, as in every laptop launcher) read steady_clock =
+  QueryPerformanceCounter on Windows. Now the time stamp counter scaled by a ratio calibrated once (20 ms at
+  census start) against steady_clock; same epoch/units; non-x86 keeps steady_clock.
+- [display-pacing] read the consumed-frame count right at the display vblank, racing with the display-locked
+  guest frame consumed just after it (laptop log 192914: 5-10 'repeats'/s in light scenes with no late frames).
+  It now reads at mid-period.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/rate_census.cpp         | 46 +++++++++++++++++++++++++++++++-
+ src/graphics/graphics_system.cpp |  4 +++
+ 2 files changed, 49 insertions(+), 1 deletion(-)
+
+diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
+index c20e43a..09e1334 100644
+--- a/src/core/rate_census.cpp
++++ b/src/core/rate_census.cpp
+@@ -8,6 +8,11 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <chrono>
++#if defined(_MSC_VER)
++#include <intrin.h>
++#elif defined(__x86_64__)
++#include <x86intrin.h>
++#endif
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
+@@ -119,6 +124,42 @@ uint64_t QueryHostNanoseconds() {
+                                   .count());
+ }
+ 
++// Cheap nanosecond clock for the per-draw phase timers (two reads per draw): the time stamp counter scaled by a
++// ratio calibrated once against steady_clock. steady_clock is QueryPerformanceCounter on Windows, noticeably more
++// expensive per call. Same epoch and units as QueryHostNanoseconds, to within the calibration error.
++#if defined(__x86_64__) || defined(_M_X64)
++struct TscClock {
++  uint64_t tsc0 = 0;
++  uint64_t ns0 = 0;
++  double ns_per_tick = 0.0;
++  TscClock() {
++    const uint64_t start_ns = QueryHostNanoseconds();
++    const uint64_t start_tsc = __rdtsc();
++    std::this_thread::sleep_for(std::chrono::milliseconds(20));
++    const uint64_t end_ns = QueryHostNanoseconds();
++    const uint64_t end_tsc = __rdtsc();
++    if (end_tsc > start_tsc && end_ns > start_ns) {
++      tsc0 = end_tsc;
++      ns0 = end_ns;
++      ns_per_tick = double(end_ns - start_ns) / double(end_tsc - start_tsc);
++    }
++  }
++  uint64_t Now() const {
++    if (ns_per_tick <= 0.0) {
++      return QueryHostNanoseconds();
++    }
++    return ns0 + uint64_t(double(__rdtsc() - tsc0) * ns_per_tick);
++  }
++};
++const TscClock& GetTscClock() {
++  static const TscClock clock;
++  return clock;
++}
++uint64_t QueryFastNanoseconds() { return GetTscClock().Now(); }
++#else
++uint64_t QueryFastNanoseconds() { return QueryHostNanoseconds(); }
++#endif
++
+ struct ThreadTicks {
+   std::string name;
+   uint64_t utime = 0;
+@@ -892,6 +933,9 @@ RateCensus g_rate_census;
+ }  // namespace
+ 
+ void Start(uint64_t vblank_interval_ticks, double refresh_rate_hz) {
++#if defined(__x86_64__) || defined(_M_X64)
++  GetTscClock();  // One-time 20 ms calibration here rather than on the first draw.
++#endif
+   g_rate_census.Start(vblank_interval_ticks, refresh_rate_hz);
+ }
+ 
+@@ -929,7 +973,7 @@ void RecordDescriptorSetUpdate(bool is_vertex, bool reused) {
+ 
+ bool IsEnabled() { return g_rate_census.IsEnabled(); }
+ 
+-uint64_t NowNs() { return QueryHostNanoseconds(); }
++uint64_t NowNs() { return QueryFastNanoseconds(); }
+ 
+ void CpPhaseEnter(CpPhase phase, uint64_t now_ns) { g_rate_census.CpPhaseEnter(phase, now_ns); }
+ 
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 20c9dd3..7dfa05d 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -423,6 +423,10 @@ void GraphicsSystem::DisplayPacingThread() {
+       last_vblank = Clock::time_point();
+       continue;
+     }
++    // Count at mid-period: the guest frame for this vblank is consumed right after the vblank (display-locked
++    // guest vblank), so sampling at the vblank itself races with it and misattributes frames.
++    const uint32_t mid_hz = std::max(1u, last_host_refresh_hz_.load(std::memory_order_relaxed));
++    std::this_thread::sleep_for(std::chrono::microseconds(500000 / mid_hz));
+     const auto now = Clock::now();
+     const uint64_t frames = presenter()->guest_frames_consumed();
+     const uint64_t new_frames = frames - last_frames;
+-- 
+2.43.0
+

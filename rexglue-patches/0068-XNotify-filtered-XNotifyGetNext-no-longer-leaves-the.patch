@@ -1,0 +1,441 @@
+From 47f09e8f61d2583eef9a92dae6015d95917159ff Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 17:50:27 -0700
+Subject: [PATCH 68/97] XNotify: filtered XNotifyGetNext no longer leaves the
+ listener signalled for notifications it did not ask for
+
+WWE '13's XMP listener only dequeues 0x0A000003. A custom song start broadcasts 0x0A000001/2 to it; the
+manual-reset wait handle was only reset when the whole queue emptied, so the title's notification worker
+busy-spun (sub_83240C38: 2 calls before the play request, 43.7 million after) and starved the game's audio -
+all game audio silent after a custom entrance song. The filtered dequeue now resets the handle when the
+requested id is absent or exhausted; non-matching notifications stay queued for an unfiltered GetNext.
+
+Also opt-in, rate-limited diagnostics (default off): REX_XMP_STATE_PROBE=1 (XMP answers/notifications),
+REX_AUDIO_FRAME_PROBE=1 (per-second guest/output audio levels).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/audio/audio_system.cpp         |  44 +++++++++++
+ src/audio/sdl/sdl_audio_driver.cpp | 118 +++++++++++++++++++++++++++++
+ src/kernel/xam/apps/xmp_app.cpp    |  51 +++++++++++++
+ src/system/xnotifylistener.cpp     |  17 ++++-
+ 4 files changed, 229 insertions(+), 1 deletion(-)
+
+diff --git a/src/audio/audio_system.cpp b/src/audio/audio_system.cpp
+index 9ffe830..6a8de96 100644
+--- a/src/audio/audio_system.cpp
++++ b/src/audio/audio_system.cpp
+@@ -24,10 +24,50 @@
+ #include <rex/thread.h>
+ #include <rex/cvar.h>
+ 
++#include <chrono>
++#include <cstdlib>
++#include <cstring>
++
+ REXCVAR_DEFINE_INT32(
+     audio_maxqframes, 8, "Audio",
+     "Max buffered audio frames (range 4-64). Lower reduces latency but may cause stuttering.");
+ 
++namespace {
++
++bool AudioFrameProbeEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("REX_AUDIO_FRAME_PROBE");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
++void CountAudioSystemSubmitFrame() {
++  using Clock = std::chrono::steady_clock;
++  static std::atomic<uint64_t> submissions{0};
++  static std::atomic<int64_t> window_start_ns{0};
++  submissions.fetch_add(1, std::memory_order_relaxed);
++
++  const int64_t now_ns =
++      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
++  int64_t start_ns = window_start_ns.load(std::memory_order_relaxed);
++  if (!start_ns) {
++    window_start_ns.compare_exchange_strong(start_ns, now_ns, std::memory_order_relaxed);
++    return;
++  }
++  if (now_ns - start_ns < 1000000000LL ||
++      !window_start_ns.compare_exchange_strong(start_ns, now_ns, std::memory_order_relaxed)) {
++    return;
++  }
++
++  const uint64_t count = submissions.exchange(0, std::memory_order_relaxed);
++  const double seconds = static_cast<double>(now_ns - start_ns) / 1.0e9;
++  REXAPU_INFO("[audio-frame-probe] AudioSystem::SubmitFrame calls={} rate={:.1f}/s interval={:.0f}ms",
++              count, count / seconds, seconds * 1000.0);
++}
++
++}  // namespace
++
+ // As with normal Microsoft, there are like twelve different ways to access
+ // the audio APIs. Early games use XMA*() methods almost exclusively to touch
+ // decoders. Later games use XAudio*() and direct memory writes to the XMA
+@@ -251,6 +291,10 @@ X_STATUS AudioSystem::RegisterClient(uint32_t callback, uint32_t callback_arg, s
+ void AudioSystem::SubmitFrame(size_t index, uint32_t samples_ptr) {
+   SCOPE_profile_cpu_f("apu");
+ 
++  if (AudioFrameProbeEnabled()) {
++    CountAudioSystemSubmitFrame();
++  }
++
+   static uint32_t submit_count = 0;
+   if (submit_count < 10) {
+     REXAPU_DEBUG("AudioSystem::SubmitFrame called: index={} samples_ptr={:08X}", index,
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index d2c9d05..6c299e3 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -11,6 +11,10 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <atomic>
++#include <chrono>
++#include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <rex/assert.h>
+@@ -28,6 +32,48 @@ REXCVAR_DEFINE_BOOL(audio_mute, false, "Audio", "Mute audio output");
+ 
+ namespace rex::audio::sdl {
+ 
++namespace {
++
++bool AudioFrameProbeEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("REX_AUDIO_FRAME_PROBE");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
++void CountDriverSubmitFrame(bool all_zero) {
++  using Clock = std::chrono::steady_clock;
++  static std::atomic<uint64_t> submissions{0};
++  static std::atomic<uint64_t> zero_submissions{0};
++  static std::atomic<int64_t> window_start_ns{0};
++  submissions.fetch_add(1, std::memory_order_relaxed);
++  if (all_zero) {
++    zero_submissions.fetch_add(1, std::memory_order_relaxed);
++  }
++
++  const int64_t now_ns =
++      std::chrono::duration_cast<std::chrono::nanoseconds>(Clock::now().time_since_epoch()).count();
++  int64_t start_ns = window_start_ns.load(std::memory_order_relaxed);
++  if (!start_ns) {
++    window_start_ns.compare_exchange_strong(start_ns, now_ns, std::memory_order_relaxed);
++    return;
++  }
++  if (now_ns - start_ns < 1000000000LL ||
++      !window_start_ns.compare_exchange_strong(start_ns, now_ns, std::memory_order_relaxed)) {
++    return;
++  }
++
++  const uint64_t count = submissions.exchange(0, std::memory_order_relaxed);
++  const uint64_t zero_count = zero_submissions.exchange(0, std::memory_order_relaxed);
++  const double seconds = static_cast<double>(now_ns - start_ns) / 1.0e9;
++  REXAPU_INFO(
++      "[audio-frame-probe] SDLAudioDriver::SubmitFrame calls={} rate={:.1f}/s zero={} nonzero={} interval={:.0f}ms",
++      count, count / seconds, zero_count, count - zero_count, seconds * 1000.0);
++}
++
++}  // namespace
++
+ SDLAudioDriver::SDLAudioDriver(memory::Memory* memory, rex::thread::Semaphore* semaphore)
+     : AudioDriver(memory), semaphore_(semaphore) {}
+ 
+@@ -104,6 +150,16 @@ bool SDLAudioDriver::Initialize() {
+ 
+ void SDLAudioDriver::SubmitFrame(uint32_t frame_ptr) {
+   const auto input_frame = memory_->TranslateVirtual<float*>(frame_ptr);
++  if (AudioFrameProbeEnabled()) {
++    bool all_zero = true;
++    for (uint32_t sample = 0; sample < frame_samples_; ++sample) {
++      if (rex::byte_swap(input_frame[sample]) != 0.0f) {
++        all_zero = false;
++        break;
++      }
++    }
++    CountDriverSubmitFrame(all_zero);
++  }
+   float* output_frame;
+   {
+     std::unique_lock<std::mutex> guard(frames_mutex_);
+@@ -164,6 +220,17 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+     REXAPU_ERROR("SDLAudioDriver::SDLCallback called with nullptr.");
+     return;
+   }
++  const bool probe_enabled = AudioFrameProbeEnabled();
++  using ProbeClock = std::chrono::steady_clock;
++  static auto probe_window_start = ProbeClock::now();
++  static uint64_t probe_chunks = 0;
++  static uint64_t probe_queued_chunks = 0;
++  static uint64_t probe_empty_chunks = 0;
++  static uint64_t probe_nonzero_guest_chunks = 0;
++  static uint64_t probe_nonzero_output_chunks = 0;
++  static uint64_t probe_output_samples = 0;
++  static double probe_output_squares = 0.0;
++  static float probe_output_peak = 0.0f;
+   const auto driver = static_cast<SDLAudioDriver*>(userdata);
+   const int sample_count =
+       static_cast<int>(channel_samples_ * std::max<uint8_t>(driver->sdl_device_channels_, 1));
+@@ -176,6 +243,8 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+   while (additional_amount > 0) {
+     static uint32_t sdl_callback_count = 0;
+     std::unique_lock<std::mutex> guard(driver->frames_mutex_);
++    bool had_guest_frame = false;
++    bool guest_frame_nonzero = false;
+     if (driver->frames_queued_.empty()) {
+       if (sdl_callback_count < 10) {
+         REXAPU_DEBUG("SDLCallback: no frames queued (silence)");
+@@ -184,6 +253,9 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       std::memset(data, 0, len);
+       // Guest silence does not mean silence: a custom song keeps playing.
+       driver->MixCustomMusic(data, channel_samples_, frame_frequency_);
++      if (probe_enabled) {
++        ++probe_empty_chunks;
++      }
+       if (!SDL_PutAudioStreamData(stream, data, len)) {
+         REXAPU_ERROR("SDL_PutAudioStreamData() failed while filling silence: {}", SDL_GetError());
+         break;
+@@ -192,6 +264,7 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+     } else {
+       auto buffer = driver->frames_queued_.front();
+       driver->frames_queued_.pop();
++      had_guest_frame = true;
+       if (REXCVAR_GET(audio_mute)) {
+         std::memset(data, 0, len);
+       } else {
+@@ -207,6 +280,10 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+             break;
+         }
+       }
++      if (probe_enabled) {
++        guest_frame_nonzero = std::any_of(data, data + sample_count,
++                                         [](float sample) { return sample != 0.0f; });
++      }
+       // Mixed on top of the guest frame so the entrance music plays with it
+       // instead of replacing it (the game mutes its own music when the user
+       // picks a custom song, but does not always do so immediately).
+@@ -222,6 +299,47 @@ void SDLAudioDriver::SDLCallback(void* userdata, SDL_AudioStream* stream, int ad
+       assert_true(ret);
+       additional_amount -= len;
+     }
++    if (probe_enabled) {
++      ++probe_chunks;
++      if (had_guest_frame) {
++        ++probe_queued_chunks;
++        if (guest_frame_nonzero) {
++          ++probe_nonzero_guest_chunks;
++        }
++      }
++      bool output_nonzero = false;
++      for (int sample_index = 0; sample_index < sample_count; ++sample_index) {
++        const float value = data[sample_index];
++        output_nonzero |= value != 0.0f;
++        probe_output_squares += static_cast<double>(value) * value;
++        probe_output_peak = std::max(probe_output_peak, std::abs(value));
++      }
++      probe_output_samples += static_cast<uint64_t>(sample_count);
++      if (output_nonzero) {
++        ++probe_nonzero_output_chunks;
++      }
++      const auto now = ProbeClock::now();
++      const double seconds = std::chrono::duration<double>(now - probe_window_start).count();
++      if (seconds >= 1.0) {
++        const double output_rms = probe_output_samples
++                                      ? std::sqrt(probe_output_squares / probe_output_samples)
++                                      : 0.0;
++        REXAPU_INFO(
++            "[audio-frame-probe] SDLCallback chunks={} rate={:.1f}/s queued={} empty={} guest_nonzero={} output_nonzero={} output_rms={:.6f} peak={:.6f} interval={:.0f}ms",
++            probe_chunks, probe_chunks / seconds, probe_queued_chunks, probe_empty_chunks,
++            probe_nonzero_guest_chunks, probe_nonzero_output_chunks, output_rms, probe_output_peak,
++            seconds * 1000.0);
++        probe_window_start = now;
++        probe_chunks = 0;
++        probe_queued_chunks = 0;
++        probe_empty_chunks = 0;
++        probe_nonzero_guest_chunks = 0;
++        probe_nonzero_output_chunks = 0;
++        probe_output_samples = 0;
++        probe_output_squares = 0.0;
++        probe_output_peak = 0.0f;
++      }
++    }
+   }
+   SDL_stack_free(data);
+ }
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index 8055d49..87514b0 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -25,6 +25,7 @@
+ #include <algorithm>
+ #include <cctype>
+ #include <chrono>
++#include <cstdlib>
+ #include <cstring>
+ #include <system_error>
+ 
+@@ -52,6 +53,14 @@ rex::audio::CustomMusicPlayer& Player() {
+   return rex::audio::CustomMusicPlayer::instance();
+ }
+ 
++bool XmpStateProbeEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("REX_XMP_STATE_PROBE");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
+ }  // namespace
+ 
+ XmpApp::XmpApp(KernelState* kernel_state)
+@@ -84,6 +93,13 @@ X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
+   }
+   memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(state_ptr),
+                                    static_cast<uint32_t>(state_));
++  if (XmpStateProbeEnabled()) {
++    const uint64_t count = get_status_log_count_.load(std::memory_order_relaxed);
++    if (count <= 3 || count % 1000 == 0) {
++      REXKRNL_INFO("[xmp-state-probe] XMPGetStatus state={} custom_active={}",
++                   static_cast<uint32_t>(state_), active_custom_song_.song != nullptr);
++    }
++  }
+   return X_E_SUCCESS;
+ }
+ 
+@@ -179,6 +195,9 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
+   active_song_index_ = 0;
+   state_ = State::kPlaying;
+   OnStateChanged();
++  if (XmpStateProbeEnabled()) {
++    REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=1 (playlist play)");
++  }
+   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+   return X_E_SUCCESS;
+ }
+@@ -237,6 +256,9 @@ X_HRESULT XmpApp::XMPPlayCustomSong(const CustomMusicSong* song) {
+   }
+   state_ = State::kPlaying;
+   OnStateChanged();
++  if (XmpStateProbeEnabled()) {
++    REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=1 (custom play)");
++  }
+   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+   return X_E_SUCCESS;
+ }
+@@ -268,6 +290,10 @@ X_HRESULT XmpApp::XMPPrevious() {
+ }
+ 
+ void XmpApp::OnStateChanged() {
++  if (XmpStateProbeEnabled()) {
++    REXKRNL_INFO("[xmp-state-probe] notify 0x0a000001 param={}",
++                 static_cast<uint32_t>(state_));
++  }
+   kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
+ }
+ 
+@@ -468,6 +494,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       playback_mode_ = static_cast<PlaybackMode>(uint32_t(args->playback_mode));
+       repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
+       unknown_flags_ = args->flags;
++      if (XmpStateProbeEnabled()) {
++        REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=0 (playback behavior set)");
++      }
+       kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 0);
+       return X_E_SUCCESS;
+     }
+@@ -489,6 +518,13 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       assert_true(args->xmp_client == 0x00000002);
+       REXKRNL_DEBUG("XMPGetVolume({:08X})", uint32_t(args->volume_ptr));
+       memory::store_and_swap<float>(memory_->TranslateVirtual(args->volume_ptr), volume_);
++      if (XmpStateProbeEnabled()) {
++        static std::atomic<uint64_t> get_volume_probe_count{0};
++        const auto count = get_volume_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
++        if (count <= 3 || count % 1000 == 0) {
++          REXKRNL_INFO("[xmp-state-probe] XMPGetVolume value={:g}", volume_);
++        }
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x0007000C: {
+@@ -605,6 +641,12 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                     uint32_t(args->playback_client));
+ 
+       playback_client_ = PlaybackClient(uint32_t(args->playback_client));
++      if (XmpStateProbeEnabled()) {
++        REXKRNL_INFO(
++            "[xmp-state-probe] XMPSetPlaybackController controller={} client={} -> notify 0x0a000003 param={}",
++            uint32_t(args->controller), uint32_t(args->playback_client),
++            static_cast<uint32_t>(!args->playback_client));
++      }
+       kernel_state_->BroadcastNotification(kMsgPlaybackControllerChanged, !args->playback_client);
+       return X_E_SUCCESS;
+     }
+@@ -629,6 +671,15 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
+       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr),
+                                        static_cast<uint32_t>(playback_client_));
++      if (XmpStateProbeEnabled()) {
++        const uint64_t count =
++            get_playback_controller_log_count_.load(std::memory_order_relaxed);
++        if (count <= 3 || count % 1000 == 0) {
++          REXKRNL_INFO(
++              "[xmp-state-probe] XMPGetPlaybackController controller={} locked={} client={}", 0,
++              static_cast<uint32_t>(playback_client_), static_cast<uint32_t>(playback_client_));
++        }
++      }
+ 
+       if (!XThread::GetCurrentThread()->main_thread()) {
+         // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
+diff --git a/src/system/xnotifylistener.cpp b/src/system/xnotifylistener.cpp
+index eae1014..05a5ac3 100644
+--- a/src/system/xnotifylistener.cpp
++++ b/src/system/xnotifylistener.cpp
+@@ -66,6 +66,7 @@ bool XNotifyListener::DequeueNotification(XNotificationID* out_id, uint32_t* out
+ bool XNotifyListener::DequeueNotification(XNotificationID id, uint32_t* out_data) {
+   auto global_lock = global_critical_region_.Acquire();
+   if (!notifications_.size()) {
++    wait_handle_->Reset();
+     return false;
+   }
+   bool dequeued = false;
+@@ -76,11 +77,25 @@ bool XNotifyListener::DequeueNotification(XNotificationID id, uint32_t* out_data
+     dequeued = true;
+     *out_data = it->second;
+     notifications_.erase(it);
+-    if (!notifications_.size()) {
++
++    // A filtered title waiter must not spin on queued notifications it did not request.
++    // Keep those notifications queued for a later unfiltered XNotifyGetNext.
++    bool requested_notification_remains = false;
++    for (const auto& notification : notifications_) {
++      if (notification.first == id) {
++        requested_notification_remains = true;
++        break;
++      }
++    }
++    if (!requested_notification_remains) {
+       wait_handle_->Reset();
+     }
+     break;
+   }
++  if (!dequeued) {
++    // Non-matching entries remain available, but no longer keep this filtered wait signalled.
++    wait_handle_->Reset();
++  }
+   return dequeued;
+ }
+ 
+-- 
+2.43.0
+

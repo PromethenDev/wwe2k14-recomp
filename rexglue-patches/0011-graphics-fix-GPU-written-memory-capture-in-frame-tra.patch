@@ -1,0 +1,44 @@
+From 3e94a81a2dc66086e19c30da812e20a8505fdb3d Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 19:32:59 -0700
+Subject: [PATCH 11/97] graphics: fix GPU-written memory capture in frame
+ traces
+
+InitializeTraceCompleteDownloads never advanced download_buffer_offset, so
+every GPU-written range recorded at trace start carried the first range's
+bytes. Replays therefore used wrong data for anything the GPU produced in
+earlier frames (resolve targets, render-to-texture). Vulkan and D3D12.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/d3d12/shared_memory.cpp  | 1 +
+ src/graphics/vulkan/shared_memory.cpp | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/src/graphics/d3d12/shared_memory.cpp b/src/graphics/d3d12/shared_memory.cpp
+index 8637a62..3a652f6 100644
+--- a/src/graphics/d3d12/shared_memory.cpp
++++ b/src/graphics/d3d12/shared_memory.cpp
+@@ -308,6 +308,7 @@ void D3D12SharedMemory::InitializeTraceCompleteDownloads() {
+       trace_writer_.WriteMemoryRead(
+           download_range.first, download_range.second,
+           reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset);
++      download_buffer_offset += download_range.second;
+     }
+     D3D12_RANGE download_write_range = {};
+     trace_download_buffer_->Unmap(0, &download_write_range);
+diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
+index b52ae15..7264215 100644
+--- a/src/graphics/vulkan/shared_memory.cpp
++++ b/src/graphics/vulkan/shared_memory.cpp
+@@ -289,6 +289,7 @@ void VulkanSharedMemory::InitializeTraceCompleteDownloads() {
+       trace_writer_.WriteMemoryRead(
+           download_range.first, download_range.second,
+           reinterpret_cast<const uint8_t*>(download_mapping) + download_buffer_offset);
++      download_buffer_offset += download_range.second;
+     }
+     dfn.vkUnmapMemory(device, trace_download_buffer_memory_);
+   } else {
+-- 
+2.43.0
+

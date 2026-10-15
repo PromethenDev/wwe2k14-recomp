@@ -1,0 +1,68 @@
+From 08622cb831267d5064ec55a44619efa51e8bc5e4 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 13 Oct 2026 05:23:10 -0700
+Subject: [PATCH 99/99] close: hard exit via TerminateProcess on Windows (+ 2 s
+ lock-free backstop) when shutdown is still running 3 s after the window
+ closed
+
+Owner laptop 2026-10-13 (rc8): 'Window closing' + 'Execution complete' logged, no 'exiting now', process kept running in the background. _Exit/ExitProcess runs DLL_PROCESS_DETACH under the loader lock (a GPU driver DLL waiting on a thread frozen by TerminateTitle can block forever); the log call before it can also block on a lock held by a suspended guest thread. Wine: exits 3 s after WM_CLOSE.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/rex_app.cpp | 24 +++++++++++++++++++++++-
+ 1 file changed, 23 insertions(+), 1 deletion(-)
+
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index c13d462..ea655c1 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -14,6 +14,9 @@
+ #include <chrono>
+ #include <cstdlib>
+ #include <thread>
++#ifdef _WIN32
++#include <windows.h>
++#endif
+ 
+ #include <rex/cvar.h>
+ #include <rex/diagnostics/freeze_logger.h>
+@@ -372,6 +375,19 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+   rex::ui::ProcessKeyEvent(e);
+ }
+ 
++namespace {
++// Ends the process immediately. On Windows _Exit/ExitProcess still run every DLL's
++// DLL_PROCESS_DETACH under the loader lock; a GPU driver DLL that waits on a thread
++// frozen by TerminateTitle then keeps the process alive in the background forever
++// (owner laptop 2026-10-13: 'Window closing' logged, no exit). TerminateProcess skips that.
++[[noreturn]] void HardExitProcess() {
++#ifdef _WIN32
++  TerminateProcess(GetCurrentProcess(), 0);
++#endif
++  std::_Exit(0);
++}
++}  // namespace
++
+ void ReXApp::OnClosing(ui::UIEvent& e) {
+   (void)e;
+   REXLOG_INFO("Window closing, shutting down...");
+@@ -391,9 +407,15 @@ void ReXApp::OnClosing(ui::UIEvent& e) {
+   if (const int timeout_s = REXCVAR_GET(close_exit_timeout_seconds); timeout_s > 0) {
+     std::thread([timeout_s] {
+       std::this_thread::sleep_for(std::chrono::seconds(timeout_s));
++      // Backstop: logging can block (a suspended guest thread may hold a logger lock), so a second
++      // thread ends the process 2 s later without touching any lock.
++      std::thread([] {
++        std::this_thread::sleep_for(std::chrono::seconds(2));
++        HardExitProcess();
++      }).detach();
+       REXLOG_WARN("Shutdown still running {} s after the window closed; exiting now", timeout_s);
+       rex::FlushLogging();
+-      std::_Exit(0);
++      HardExitProcess();
+     }).detach();
+   }
+   shutting_down_.store(true, std::memory_order_release);
+-- 
+2.43.0
+

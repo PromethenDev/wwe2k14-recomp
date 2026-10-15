@@ -1,0 +1,654 @@
+From 163e46d1fe7e5bea93e711804c2d362d21f4fa55 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 12:48:58 -0700
+Subject: [PATCH 02/97] memory: physical mapping extent, access-violation
+ recovery, MMIO handler fixes
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xboxkrnl/xboxkrnl_memory.cpp |  79 +++++++
+ src/system/mmio_handler.cpp             | 302 +++++++++++++++++++-----
+ src/system/xmemory.cpp                  | 116 ++++++++-
+ 3 files changed, 441 insertions(+), 56 deletions(-)
+
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+index e9809a6..149093b 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
+@@ -21,11 +21,32 @@
+ #include <rex/ppc/function.h>
+ #include <rex/ppc/types.h>
+ #include <rex/system/kernel_state.h>
++#include <rex/system/xthread.h>
+ #include <rex/system/xtypes.h>
+ 
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ 
++namespace {
++// Cycle-22 diagnostic: bounded trace of 1264-class (1200..1300 byte) virtual
++// allocations/frees. Phase 2 (logs/cycle22-static.txt) shows the 1264-byte
++// movie-player struct is allocated by the guest CRT heap (sub_822047A0), whose
++// SDK bottom is NtAllocateVirtualMemory/NtFreeVirtualMemory; a match here means
++// the request crosses the SDK boundary. Bounded: 32 logged lines + one
++// suppression notice per path; no behavior change.
++constexpr uint32_t kSizeClassMin = 1200;
++constexpr uint32_t kSizeClassMax = 1300;
++constexpr unsigned kSizeClassCap = 32;
++uint32_t g_size_class_alloc_addr[kSizeClassCap] = {};
++uint32_t g_size_class_alloc_size[kSizeClassCap] = {};
++unsigned g_size_class_alloc_count = 0;
++
++uint32_t CurrentGuestLr() {
++  auto* thread_state = rex::runtime::ThreadState::Get();
++  return (thread_state && thread_state->context()) ? (uint32_t)thread_state->context()->lr : 0;
++}
++}  // namespace
++
+ uint32_t ToXdkProtectFlags(uint32_t protect) {
+   uint32_t result = 0;
+   if (!(protect & memory::kMemoryProtectRead) && !(protect & memory::kMemoryProtectWrite)) {
+@@ -196,6 +217,28 @@ ppc_u32_result_t NtAllocateVirtualMemory_entry(ppc_pu32_t base_addr_ptr, ppc_pu3
+   // Maybe set X_STATUS_ALREADY_COMMITTED if MEM_COMMIT?
+   *base_addr_ptr = address;
+   *region_size_ptr = adjusted_size;
++  // Cycle-22 diagnostic: bounded 1264-class allocation trace (see the
++  // anonymous-namespace note above). Logged after the final address/size are
++  // known; the requested size is logged too, since the guest heap's request
++  // may be rounded before it reaches this entry.
++  if ((input_size >= kSizeClassMin && input_size <= kSizeClassMax) ||
++      (adjusted_size >= kSizeClassMin && adjusted_size <= kSizeClassMax)) {
++    if (g_size_class_alloc_count < kSizeClassCap) {
++      g_size_class_alloc_addr[g_size_class_alloc_count] = address;
++      g_size_class_alloc_size[g_size_class_alloc_count] = adjusted_size;
++      ++g_size_class_alloc_count;
++      REXKRNL_IMPORT_TRACE(
++          "NtAllocateVirtualMemory",
++          "SIZE-1264-CLASS alloc base={:#x} req={:#x} size={:#x} type={:#x} lr={:#010x} count={}",
++          address, input_size, adjusted_size, (uint32_t)alloc_type, CurrentGuestLr(),
++          g_size_class_alloc_count);
++    } else if (g_size_class_alloc_count == kSizeClassCap) {
++      ++g_size_class_alloc_count;
++      REXKRNL_IMPORT_TRACE(
++          "NtAllocateVirtualMemory",
++          "SIZE-1264-CLASS further 1200..1300 allocations suppressed (cap=32)");
++    }
++  }
+   REXKRNL_IMPORT_RESULT("NtAllocateVirtualMemory", "0x0 addr={:#x} size={:#x}", address,
+                         adjusted_size);
+   return X_STATUS_SUCCESS;
+@@ -254,6 +297,42 @@ ppc_u32_result_t NtFreeVirtualMemory_entry(ppc_pu32_t base_addr_ptr, ppc_pu32_t
+   REXKRNL_IMPORT_TRACE("NtFreeVirtualMemory", "base={:#x} size={:#x} type={:#x} debug={}",
+                        base_addr_value, region_size_value, (uint32_t)free_type,
+                        (uint32_t)debug_memory);
++  // Cycle-22 diagnostic: bounded 1264-class free trace. The freed block's size
++  // is taken from the caller's region size; if that is not in the 1200..1300
++  // range the base address is matched against the addresses logged by
++  // NtAllocateVirtualMemory (the allocator records no per-block size here, so
++  // the logged alloc ranges are the fallback). Bounded: 32 lines + suppression.
++  {
++    static unsigned free_size_class_count = 0;
++    bool size_class_hit =
++        (region_size_value >= kSizeClassMin && region_size_value <= kSizeClassMax);
++    if (!size_class_hit) {
++      unsigned logged = g_size_class_alloc_count < kSizeClassCap ? g_size_class_alloc_count
++                                                                 : kSizeClassCap;
++      for (unsigned i = 0; i < logged; ++i) {
++        if (base_addr_value >= g_size_class_alloc_addr[i] &&
++            base_addr_value < g_size_class_alloc_addr[i] + g_size_class_alloc_size[i]) {
++          size_class_hit = true;
++          break;
++        }
++      }
++    }
++    if (size_class_hit) {
++      if (free_size_class_count < kSizeClassCap) {
++        ++free_size_class_count;
++        REXKRNL_IMPORT_TRACE(
++            "NtFreeVirtualMemory",
++            "SIZE-1264-CLASS free base={:#x} size={:#x} type={:#x} lr={:#010x} count={}",
++            base_addr_value, region_size_value, (uint32_t)free_type, CurrentGuestLr(),
++            free_size_class_count);
++      } else if (free_size_class_count == kSizeClassCap) {
++        ++free_size_class_count;
++        REXKRNL_IMPORT_TRACE(
++            "NtFreeVirtualMemory",
++            "SIZE-1264-CLASS further 1200..1300 frees suppressed (cap=32)");
++      }
++    }
++  }
+   // X_MEM_DECOMMIT | X_MEM_RELEASE
+ 
+   // NTSTATUS
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index ce4f32a..cf03f1f 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <algorithm>
+ #include <cstring>
++#include <mutex>
++#include <unordered_set>
+ #include <utility>
+ 
+ #include <rex/assert.h>
+@@ -27,6 +29,44 @@ namespace rex::runtime {
+ 
+ MMIOHandler* MMIOHandler::global_handler_ = nullptr;
+ 
++namespace {
++
++// Bounded diagnostics for undecodable MMIO instructions.
++//
++// A guest thread whose fault is not handled re-executes the faulting
++// instruction indefinitely, so logging once per fault produced ~1M identical
++// lines for a single RIP (cycle 10 Phase A, thid 9 / Bink). Log at most one
++// line per distinct faulting RIP, and report the running failure total in that
++// line as the summary counter.
++struct DecodeFailureLog {
++  std::mutex mutex;
++  std::unordered_set<uint64_t> logged_rips;
++  uint64_t total = 0;
++};
++
++DecodeFailureLog& GetDecodeFailureLog() {
++  static DecodeFailureLog log;
++  return log;
++}
++
++// Logs at most one bounded diagnostic per distinct faulting RIP for an MMIO
++// instruction the handler declines, with the running failure total. A declined
++// instruction is re-executed by the guest thread, so this must not log once
++// per fault. `what` names the failure (the message shape is shared by the
++// decode-failure and the unsupported-store paths).
++void LogMmioDecline(const uint8_t* rip, uint32_t guest_ea, const char* what) {
++  auto& failure_log = GetDecodeFailureLog();
++  std::lock_guard<std::mutex> failure_lock(failure_log.mutex);
++  ++failure_log.total;
++  if (failure_log.logged_rips.insert(uint64_t(rip)).second) {
++    REXLOG_ERROR(
++        "{} at {:p} (guest EA {:08X}, failure #{}; further failures at this RIP are suppressed)",
++        what, static_cast<const void*>(rip), guest_ea, failure_log.total);
++  }
++}
++
++}  // namespace
++
+ std::unique_ptr<MMIOHandler> MMIOHandler::Install(uint8_t* virtual_membase,
+                                                   uint8_t* physical_membase, uint8_t* membase_end,
+                                                   HostToGuestVirtual host_to_guest_virtual,
+@@ -119,16 +159,90 @@ bool MMIOHandler::CheckStore(uint32_t virtual_address, uint32_t value) {
+   return false;
+ }
+ 
++#if REX_ARCH_AMD64
++
++namespace {
++
++// Scans the optional legacy operand-size prefix (0x66) and the optional REX
++// prefix (they precede the opcode in this order in x86-64) and returns the
++// offset of the first opcode byte. `operand_size_66_out` reports whether the
++// 0x66 prefix was present.
++uint8_t ScanX64Prefixes(const uint8_t* p, bool* operand_size_66_out) {
++  uint8_t i = 0;
++  *operand_size_66_out = false;
++  if (p[i] == 0x66) {
++    *operand_size_66_out = true;
++    ++i;
++  }
++  if ((p[i] & 0xF0) == 0x40) {
++    ++i;
++  }
++  return i;
++}
++
++// True for the 66 [REX] 0F 6F /r form - MOVDQA xmm, xmm/m128, the aligned
++// 16-byte load. TryDecodeLoadStore accepts exactly this form; the execution
++// path in ExceptionCallback uses this predicate to select the four-read
++// 128-bit load handling. Only with the 0x66 operand-size prefix is 0F 6F a
++// 128-bit XMM load; the F2/F3-prefixed (MOVDQU) forms are intentionally
++// declined.
++bool IsMovdqaLoad(const uint8_t* p) {
++  bool operand_size_66 = false;
++  uint8_t i = ScanX64Prefixes(p, &operand_size_66);
++  return operand_size_66 && p[i] == 0x0F && p[i + 1] == 0x6F;
++}
++
++// True for the 66 [REX] 0F 7F /r form - MOVDQA xmm/m128, xmm, the aligned
++// 16-byte store. TryDecodeLoadStore accepts exactly this form; the execution
++// path in ExceptionCallback uses this predicate to select the four-write
++// 128-bit store handling. Only with the 0x66 operand-size prefix is 0F 7F a
++// 128-bit XMM store; the F2/F3-prefixed (MOVDQU) forms are intentionally
++// declined.
++bool IsMovdqaStore(const uint8_t* p) {
++  bool operand_size_66 = false;
++  uint8_t i = ScanX64Prefixes(p, &operand_size_66);
++  return operand_size_66 && p[i] == 0x0F && p[i + 1] == 0x7F;
++}
++
++}  // namespace
++
++#endif  // REX_ARCH_AMD64
++
+ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded_out) {
+   std::memset(&decoded_out, 0, sizeof(decoded_out));
+ #if REX_ARCH_AMD64
+-  uint8_t i = 0;  // Current byte decode index.
++  bool operand_size_66 = false;
++  uint8_t i = ScanX64Prefixes(p, &operand_size_66);
+   uint8_t rex = 0;
+-  if ((p[i] & 0xF0) == 0x40) {
+-    rex = p[0];
+-    ++i;
++  if (i > 0 && (p[i - 1] & 0xF0) == 0x40) {
++    rex = p[i - 1];
+   }
+-  if (p[i] == 0x0F && p[i + 1] == 0x38 && p[i + 2] == 0xF1) {
++  if (operand_size_66) {
++    if (p[i] == 0x0F && p[i + 1] == 0x6F) {
++      // 66 [REX] 0F 6F /r: MOVDQA xmm, xmm/m128 (aligned 16-byte load).
++      // Decoded with the generic ModRM/SIB machinery below; `value_reg` is the
++      // XMM destination index and the execution path performs four ordered
++      // 32-bit MMIO reads for it (see ExceptionCallback).
++      decoded_out.is_load = true;
++      decoded_out.byte_swap = false;
++      i += 2;
++    } else if (p[i] == 0x0F && p[i + 1] == 0x7F) {
++      // 66 [REX] 0F 7F /r: MOVDQA xmm/m128, xmm (aligned 16-byte store).
++      // Decoded with the generic ModRM/SIB machinery below; `value_reg` is the
++      // source XMM index and the execution path performs four ordered 32-bit
++      // MMIO writes for it (see ExceptionCallback). The length comes from the
++      // consumed bytes, so encodings that carry a displacement count it (for
++      // example mod 10 / SIB base 100 is 10 bytes) while the captured
++      // `66 41 0F 7F 04 04` (mod 00, SIB base 100 -> r12) has no displacement
++      // and is 6 bytes.
++      decoded_out.is_load = false;
++      decoded_out.byte_swap = false;
++      i += 2;
++    } else {
++      // No other 0x66-prefixed form is supported.
++      return false;
++    }
++  } else if (p[i] == 0x0F && p[i + 1] == 0x38 && p[i + 2] == 0xF1) {
+     // MOVBE m32, r32 (store)
+     // https://web.archive.org/web/20170629091435/https://www.tptp.cc/mirrors/siyobik.info/instruction/MOVBE.html
+     // 44 0f 38 f1 a4 02 00     movbe  DWORD PTR [rdx+rax*1+0x0],r12d
+@@ -197,6 +311,12 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
+   decoded_out.mem_index_reg = 0;
+   decoded_out.mem_scale = 1;
+   decoded_out.mem_displacement = 0;
++  // The decoded EA fields (base/index/scale/displacement) are informational on
++  // x86-64: ExceptionCallback uses the real fault address and consumes only
++  // `length` (for the resume PC), the direction, the value register and the
++  // byte-swap flag. They are still decoded exactly because the AArch64 path
++  // and future forms rely on the contract, and `length` must count every
++  // consumed byte for the resume PC to be correct.
+   bool has_sib = false;
+   switch (rm) {
+     case 0b100:  // SIB
+@@ -215,9 +335,14 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
+       decoded_out.mem_base_reg = rm + (rex_b ? 8 : 0);
+       break;
+   }
++  // SIB base 101 means "no base" only when mod == 00 (the absolute
++  // [index * scale + disp32] form, which always carries a 32-bit
++  // displacement). With mod != 00 it is a real base register: rbp, or r13
++  // with REX.B=1.
++  bool sib_no_base_disp32 = false;
+   if (has_sib) {
+     uint8_t sib = p[i++];
+-    decoded_out.mem_scale = 1 << ((sib & 0b11000000) >> 8);
++    decoded_out.mem_scale = 1 << ((sib & 0b11000000) >> 6);
+     uint8_t sib_index = (sib & 0b00111000) >> 3;
+     uint8_t sib_base = (sib & 0b00000111);
+     switch (sib_index) {
+@@ -230,20 +355,23 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
+         decoded_out.mem_index_size = sizeof(uint64_t);
+         break;
+     }
+-    switch (sib_base) {
+-      case 0b101:
+-        // Alternate rbp-relative addressing not supported.
+-        assert_zero(mod);
+-        return false;
+-      default:
+-        decoded_out.mem_has_base = true;
+-        decoded_out.mem_base_reg = sib_base + (rex_b ? 8 : 0);
+-        break;
++    if (sib_base == 0b101 && mod == 0b00) {
++      // [index * scale + disp32]: no base register, disp32 follows.
++      sib_no_base_disp32 = true;
++    } else {
++      decoded_out.mem_has_base = true;
++      decoded_out.mem_base_reg = sib_base + (rex_b ? 8 : 0);
+     }
+   }
+   switch (mod) {
+     case 0b00: {
+-      decoded_out.mem_displacement += 0;
++      if (sib_no_base_disp32) {
++        // The no-base SIB form always carries a 32-bit displacement.
++        decoded_out.mem_displacement += memory::load<int32_t>(p + i);
++        i += 4;
++      } else {
++        decoded_out.mem_displacement += 0;
++      }
+     } break;
+     case 0b01: {
+       decoded_out.mem_displacement += int8_t(p[i++]);
+@@ -423,8 +551,11 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+   auto p = reinterpret_cast<const uint8_t*>(rip);
+   DecodedLoadStore decoded_load_store;
+   if (!TryDecodeLoadStore(p, decoded_load_store)) {
+-    REXLOG_ERROR("Unable to decode MMIO load or store instruction at {:p}",
+-                 static_cast<const void*>(p));
++    // Bounded logging: an undecodable instruction is re-executed forever by
++    // the guest thread, so this path must not log once per fault (cycle 10
++    // Phase A: ~1M lines). One line per distinct RIP, with the running total.
++    LogMmioDecline(p, fault_guest_virtual_address,
++                   "Unable to decode MMIO load or store instruction");
+     assert_always("Unknown MMIO instruction type");
+     return false;
+   }
+@@ -450,57 +581,120 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+ 
+   uint8_t value_reg = decoded_load_store.value_reg;
+   if (decoded_load_store.is_load) {
+-    // Load of a memory value - read from range, swap, and store in the
+-    // register.
+-    uint32_t value = range->read(nullptr, range->callback_context, fault_guest_virtual_address);
+-    if (!decoded_load_store.byte_swap) {
+-      // We swap only if it's not a movbe, as otherwise we are swapping twice.
+-      value = rex::byte_swap(value);
+-    }
+ #if REX_ARCH_AMD64
+-    ex->ModifyIntRegister(value_reg) = value;
+-#elif REX_ARCH_ARM64
+-    if (value_reg >= DecodedLoadStore::kArm64ValueRegX0 &&
+-        value_reg <= (DecodedLoadStore::kArm64ValueRegX0 + 30)) {
+-      ex->ModifyXRegister(value_reg - DecodedLoadStore::kArm64ValueRegX0) = value;
+-    } else if (value_reg >= DecodedLoadStore::kArm64ValueRegV0 &&
+-               value_reg <= (DecodedLoadStore::kArm64ValueRegV0 + 31)) {
+-      ex->ModifyVRegister(value_reg - DecodedLoadStore::kArm64ValueRegV0).u32[0] = value;
+-    } else {
+-      assert_true(value_reg == DecodedLoadStore::kArm64ValueRegZero);
+-      // Register write is ignored for X31.
+-    }
+-#else
+-#error Register value writing not implemented for the target CPU architecture.
+-#endif  // REX_ARCH
+-  } else {
+-    // Store of a register value - read register, swap, write to range.
+-    uint32_t value;
+-    if (decoded_load_store.is_constant) {
+-      value = uint32_t(decoded_load_store.constant);
+-    } else {
++    if (IsMovdqaLoad(p)) {
++      // 66 [REX] 0F 6F /r (MOVDQA xmm, m128): a 16-byte aligned load that
++      // cannot be served by a single 32-bit MMIO register read. Perform four
++      // ordered 32-bit reads at EA+0/4/8/12 and assemble them into the
++      // destination XMM register.
++      //
++      // Byte order: the MMIO range stores guest (big-endian) 32-bit register
++      // values, so the raw host-memory bytes the faulting movdqa would have
++      // loaded are the big-endian encoding of each callback value. Each lane
++      // is therefore byte-swapped exactly like the existing 32-bit MOV load
++      // path (byte_swap == false). Lane i, which is u32[i] (the low to high
++      // 32-bit words of the XMM register), receives the swapped value of the
++      // read at EA+4*i, so u8[0] holds the byte at EA+0 - the memory-order
++      // bytes the generated lvlx128 pshufb consumes after resumption.
++      vec128_t vector_value;
++      for (uint32_t lane = 0; lane < 4; ++lane) {
++        uint32_t lane_value = range->read(nullptr, range->callback_context,
++                                          fault_guest_virtual_address + lane * sizeof(uint32_t));
++        if (!decoded_load_store.byte_swap) {
++          lane_value = rex::byte_swap(lane_value);
++        }
++        vector_value.u32[lane] = lane_value;
++      }
++      ex->ModifyXmmRegister(value_reg) = vector_value;
++    } else
++#endif  // REX_ARCH_AMD64
++    {
++      // Load of a memory value - read from range, swap, and store in the
++      // register.
++      uint32_t value = range->read(nullptr, range->callback_context, fault_guest_virtual_address);
++      if (!decoded_load_store.byte_swap) {
++        // We swap only if it's not a movbe, as otherwise we are swapping twice.
++        value = rex::byte_swap(value);
++      }
+ #if REX_ARCH_AMD64
+-      value = uint32_t(thread_context.int_registers[value_reg]);
++      ex->ModifyIntRegister(value_reg) = value;
+ #elif REX_ARCH_ARM64
+       if (value_reg >= DecodedLoadStore::kArm64ValueRegX0 &&
+           value_reg <= (DecodedLoadStore::kArm64ValueRegX0 + 30)) {
+-        value = uint32_t(thread_context.x[value_reg - DecodedLoadStore::kArm64ValueRegX0]);
++        ex->ModifyXRegister(value_reg - DecodedLoadStore::kArm64ValueRegX0) = value;
+       } else if (value_reg >= DecodedLoadStore::kArm64ValueRegV0 &&
+                  value_reg <= (DecodedLoadStore::kArm64ValueRegV0 + 31)) {
+-        value = thread_context.v[value_reg - DecodedLoadStore::kArm64ValueRegV0].u32[0];
++        ex->ModifyVRegister(value_reg - DecodedLoadStore::kArm64ValueRegV0).u32[0] = value;
+       } else {
+         assert_true(value_reg == DecodedLoadStore::kArm64ValueRegZero);
+-        value = 0;
++        // Register write is ignored for X31.
++      }
++#else
++#error Register value writing not implemented for the target CPU architecture.
++#endif  // REX_ARCH
++    }
++  } else {
++#if REX_ARCH_AMD64
++    if (IsMovdqaStore(p)) {
++      // 66 [REX] 0F 7F /r (MOVDQA m128, xmm): a 16-byte aligned store that
++      // cannot be served by a single 32-bit MMIO register write. Perform four
++      // ordered 32-bit writes at EA+0/4/8/12, reading the source lanes from
++      // the faulting thread's XMM register.
++      //
++      // Byte order: the MMIO range stores guest (big-endian) 32-bit register
++      // values, so the raw host-memory bytes the faulting movdqa would have
++      // stored are the big-endian encoding of each callback value. Each lane
++      // is therefore byte-swapped exactly like the existing 32-bit MOV store
++      // path (byte_swap == false) - the exact inverse of the 16-byte load
++      // path: u8[0] of lane i is the byte at EA+4*i.
++      if (!range->write) {
++        // The matched range cannot accept a store: do not silently discard it
++        // and do not invent write semantics - decline it with the same bounded
++        // one-shot-per-RIP logging used for undecodable instructions.
++        LogMmioDecline(p, fault_guest_virtual_address,
++                       "MMIO range has no write callback for MOVDQA store instruction");
++        return false;
++      }
++      const vec128_t& source = ex->ModifyXmmRegister(value_reg);
++      for (uint32_t lane = 0; lane < 4; ++lane) {
++        uint32_t lane_value = source.u32[lane];
++        if (!decoded_load_store.byte_swap) {
++          lane_value = rex::byte_swap(lane_value);
++        }
++        range->write(nullptr, range->callback_context,
++                     fault_guest_virtual_address + lane * sizeof(uint32_t), lane_value);
+       }
++    } else
++#endif  // REX_ARCH_AMD64
++    {
++      // Store of a register value - read register, swap, write to range.
++      uint32_t value;
++      if (decoded_load_store.is_constant) {
++        value = uint32_t(decoded_load_store.constant);
++      } else {
++#if REX_ARCH_AMD64
++        value = uint32_t(thread_context.int_registers[value_reg]);
++#elif REX_ARCH_ARM64
++        if (value_reg >= DecodedLoadStore::kArm64ValueRegX0 &&
++            value_reg <= (DecodedLoadStore::kArm64ValueRegX0 + 30)) {
++          value = uint32_t(thread_context.x[value_reg - DecodedLoadStore::kArm64ValueRegX0]);
++        } else if (value_reg >= DecodedLoadStore::kArm64ValueRegV0 &&
++                   value_reg <= (DecodedLoadStore::kArm64ValueRegV0 + 31)) {
++          value = thread_context.v[value_reg - DecodedLoadStore::kArm64ValueRegV0].u32[0];
++        } else {
++          assert_true(value_reg == DecodedLoadStore::kArm64ValueRegZero);
++          value = 0;
++        }
+ #else
+ #error Register value reading not implemented for the target CPU architecture.
+ #endif  // REX_ARCH
+-      if (!decoded_load_store.byte_swap) {
+-        // We swap only if it's not a movbe, as otherwise we are swapping twice.
+-        value = rex::byte_swap(value);
++        if (!decoded_load_store.byte_swap) {
++          // We swap only if it's not a movbe, as otherwise we are swapping twice.
++          value = rex::byte_swap(value);
++        }
+       }
++      range->write(nullptr, range->callback_context, fault_guest_virtual_address, value);
+     }
+-    range->write(nullptr, range->callback_context, fault_guest_virtual_address, value);
+   }
+ 
+ #if REX_ARCH_ARM64
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index aa0b088..dceec3c 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -133,8 +133,12 @@ bool Memory::Initialize() {
+   // uncommitted (so it shouldn't expand page file).
+   mapping_ =
+       rex::memory::CreateFileMappingHandle(file_name_,
+-                                           // entire 4gb space + 512mb physical:
+-                                           0x11FFFFFFF, rex::memory::PageAccess::kReadWrite, false);
++                                           // entire 4gb space + 512mb physical + 4kb:
++                                           // covers the vE view's last file offset
++                                           // 0x120000FFF (view end 0x120001000) and the
++                                           // raw physical view end 0x120000000; the added
++                                           // pages are zero-filled sparse pages:
++                                           0x120001000, rex::memory::PageAccess::kReadWrite, false);
+   if (mapping_ == rex::memory::kFileMappingHandleInvalid) {
+     REXSYS_ERROR("Unable to reserve the 4gb guest address space.");
+     assert_always();
+@@ -464,6 +468,65 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+     return false;
+   }
+   if (heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    // Recovery path for stale host protection state in guest-virtual memory:
++    // if guest metadata says the page is committed and writable but host
++    // protection is still no-access, restore host access and resume execution.
++    // This happens for stack guard pages: XThread::AllocateStack commits the
++    // whole stack read/write and only then Protect(NoAccess)s the two 64 KB
++    // guard regions (xthread.cpp), which updates current_protect but leaves
++    // allocation_protect RW. Without this branch the callback returns false
++    // forever and the faulting guest instruction re-executes in an eternal
++    // silent SIGSEGV storm.
++    constexpr uint32_t kWriteProtectMask =
++        memory::kMemoryProtectWrite | memory::kMemoryProtectWriteCombine;
++    constexpr uint32_t kReadProtectMask =
++        memory::kMemoryProtectRead | memory::kMemoryProtectWrite;
++    uint32_t guest_protect = 0;
++    bool allow = false;
++    HeapAllocationInfo guest_info{};
++    if (heap->QueryRegionInfo(virtual_address, &guest_info) &&
++        (guest_info.state & memory::kMemoryAllocationCommit)) {
++      if (is_write) {
++        allow = (guest_info.allocation_protect & kWriteProtectMask) != 0;
++      } else {
++        allow = (guest_info.allocation_protect & kReadProtectMask) == kReadProtectMask;
++      }
++      guest_protect = guest_info.allocation_protect;
++    }
++    if (allow) {
++      size_t host_page_size = rex::memory::page_size();
++      uintptr_t page_base =
++          reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
++      if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
++                               rex::memory::PageAccess::kReadWrite, nullptr)) {
++        // Bounded logging: at most 32 distinct host pages are logged verbosely;
++        // after that a single summary line is emitted so a recovery storm
++        // cannot flood the log.
++        static uintptr_t logged_pages[32];
++        static uint32_t logged_page_count = 0;
++        bool already_logged = false;
++        uint32_t scan_count = logged_page_count < 32 ? logged_page_count : 32;
++        for (uint32_t i = 0; i < scan_count; ++i) {
++          if (logged_pages[i] == page_base) {
++            already_logged = true;
++            break;
++          }
++        }
++        if (!already_logged && logged_page_count < 32) {
++          logged_pages[logged_page_count++] = page_base;
++          REXSYS_WARN(
++              "Recovered stale guest-virtual page protection for guest {:08X} (host {:016X}, "
++              "allocation_protect {:08X})",
++              virtual_address, static_cast<uint64_t>(page_base), guest_protect);
++        } else if (!already_logged && logged_page_count == 32) {
++          logged_page_count = 33;
++          REXSYS_WARN(
++              "Recovered stale guest-virtual page protection: more than 32 distinct pages, "
++              "further recoveries logged silently");
++        }
++        return true;
++      }
++    }
+     return false;
+   }
+ 
+@@ -478,6 +541,55 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+     return true;
+   }
+ 
++  // Recovery path for released guest-physical pages:
++  // MmFreePhysicalMemory releases the backing block (BaseHeap::Release clears
++  // the page table entry back to free) while host protection may remain
++  // no-access. Real hardware keeps released physical RAM readable/writable
++  // until it is reused, and the Bink movie decoder reads a released 64 KB
++  // block (16-byte movdqa loads); without this branch the read fault repeats
++  // forever. If the owning heap reports the page as exactly free, restore host
++  // read/write access for the containing host page and resume execution.
++  // Reserve-only and committed pages (any state != 0) are never recovered
++  // here; committed-writable writes still use the stale-write path below.
++  {
++    HeapAllocationInfo released_info{};
++    if (heap->QueryRegionInfo(virtual_address, &released_info) && released_info.state == 0) {
++      size_t host_page_size = rex::memory::page_size();
++      uintptr_t page_base =
++          reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
++      if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
++                               rex::memory::PageAccess::kReadWrite, nullptr)) {
++        // Bounded logging: at most 32 distinct host pages are logged verbosely;
++        // after that a single summary line is emitted so a recovery storm
++        // cannot flood the log.
++        static uintptr_t logged_released_pages[32];
++        static uint32_t logged_released_page_count = 0;
++        bool already_logged = false;
++        uint32_t scan_count =
++            logged_released_page_count < 32 ? logged_released_page_count : 32;
++        for (uint32_t i = 0; i < scan_count; ++i) {
++          if (logged_released_pages[i] == page_base) {
++            already_logged = true;
++            break;
++          }
++        }
++        if (!already_logged && logged_released_page_count < 32) {
++          logged_released_pages[logged_released_page_count++] = page_base;
++          REXSYS_WARN(
++              "Recovered released guest-physical page for guest {:08X} (host {:016X}, "
++              "state free)",
++              virtual_address, static_cast<uint64_t>(page_base));
++        } else if (!already_logged && logged_released_page_count == 32) {
++          logged_released_page_count = 33;
++          REXSYS_WARN(
++              "Recovered released guest-physical page: more than 32 distinct pages, "
++              "further recoveries logged silently");
++        }
++        return true;
++      }
++    }
++  }
++
+   // Recovery path for stale host protection state in physical memory:
+   // if guest metadata says the page is writable but host protection is still
+   // read-only / no-access, restore write access and resume execution.
+-- 
+2.43.0
+

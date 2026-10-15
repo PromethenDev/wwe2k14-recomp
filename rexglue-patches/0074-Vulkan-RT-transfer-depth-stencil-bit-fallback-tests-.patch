@@ -1,0 +1,49 @@
+From 96aa05b9d1856617230e235b3f9445a42ce5209d Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 19:22:17 -0700
+Subject: [PATCH 74/97] Vulkan RT transfer: depth->stencil-bit fallback tests
+ the real stencil sample (C2 mat 'black squares')
+
+Without VK_EXT_shader_stencil_export (e.g. NVIDIA) the 4x->2x depth/stencil ownership transfer writes stencil
+one bit per pass, discarding samples whose bit is clear. For depth sources the shader never builds 'packed', so
+no discard was emitted and all 8 passes set the bit: every transferred sample became 0xFF (raw EDRAM readback:
+source 0x00 -> dest 0xFF). Use the loaded source stencil sample when present. Replay: mat frame equals the
+skip-fallback reference; 4x and Triple H replays byte-identical; Linux gates 720p 2x/4x + 480p 2x PASS.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/render_target_cache.cpp | 11 +++++++++--
+ 1 file changed, 9 insertions(+), 2 deletions(-)
+
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index ca70c46..6414d1c 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -4483,7 +4483,13 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+         }
+       } break;
+       case TransferOutput::kStencilBit: {
+-        if (packed) {
++        // Depth-to-stencil-bit transfers only need the stencil aspect, so the
++        // depth image and the combined depth/stencil `packed` value are not
++        // created for this mode. Use the separately loaded stencil sample in
++        // that case; color-to-stencil-bit transfers continue to use `packed`.
++        spv::Id stencil_bit_value =
++            source_stencil[0] != spv::NoResult ? source_stencil[0] : packed;
++        if (stencil_bit_value != spv::NoResult) {
+           // Kill the sample if the needed stencil bit is not set.
+           assert_true(push_constants_member_stencil_mask != UINT32_MAX);
+           id_vector_temp.clear();
+@@ -4496,7 +4502,8 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)
+           SpirvBuilder::IfBuilder stencil_kill_if(
+               builder.createBinOp(
+                   spv::OpIEqual, type_bool,
+-                  builder.createBinOp(spv::OpBitwiseAnd, type_uint, packed, stencil_mask_constant),
++                  builder.createBinOp(spv::OpBitwiseAnd, type_uint, stencil_bit_value,
++                                      stencil_mask_constant),
+                   builder.makeUintConstant(0)),
+               spv::SelectionControlMaskNone, builder);
+           builder.createNoResultOp(spv::OpKill);
+-- 
+2.43.0
+

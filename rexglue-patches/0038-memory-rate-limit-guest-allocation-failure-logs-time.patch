@@ -1,0 +1,141 @@
+From be5187b2867bbf81734e6710f623f65a451deb4d Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 18:31:14 -0700
+Subject: [PATCH 38/97] memory: rate-limit guest allocation-failure logs; time
+ failed searches
+
+Owner laptop: the game probes for physical memory in bursts (~1000 failed
+requests/s, same on Linux); each failure logged 2-3 error lines, each
+flushed to disk. 17:45:48 had 4483 such lines and that second ran at 11
+fps. First 32 failures are logged in full, then a per-second summary with
+the count and time spent in failed page-table searches. Measured (Wine
+gate af1): 15k failures cost 1.9 ms of search time in total - the cost was
+the logging. Error lines per session 13943 -> 325.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xmemory.cpp | 62 ++++++++++++++++++++++++++++++++++++++----
+ 1 file changed, 57 insertions(+), 5 deletions(-)
+
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index dceec3c..75f8a94 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
++#include <chrono>
+ #include <cstring>
+ #include <utility>
+ 
+@@ -1253,6 +1255,54 @@ bool BaseHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t alignme
+   return true;
+ }
+ 
++namespace {
++
++// Guest allocation failures come in bursts of ~1000/s when the game probes for memory with
++// requests that cannot fit (same counts on Linux and Windows); logging every one cost ~3 log
++// lines per failure during those bursts. Log the first few in full, then one summary per
++// second with the count and the time spent in failed page-table searches.
++struct AllocFailureLog {
++  std::atomic<uint64_t> failures{0};
++  std::atomic<uint64_t> failed_search_ns{0};
++  std::atomic<uint64_t> window_start_ns{0};
++  std::atomic<uint32_t> logged_in_full{0};
++};
++AllocFailureLog g_alloc_failure_log;
++constexpr uint32_t kAllocFailuresLoggedInFull = 32;
++
++uint64_t AllocFailureNowNs() {
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                      std::chrono::steady_clock::now().time_since_epoch())
++                      .count());
++}
++
++void NoteAllocFailure(const char* message, uint64_t search_ns) {
++  auto& log = g_alloc_failure_log;
++  const uint64_t now = AllocFailureNowNs();
++  uint64_t window_start = log.window_start_ns.load(std::memory_order_relaxed);
++  if (window_start == 0) {
++    log.window_start_ns.compare_exchange_strong(window_start, now);
++  } else if (now - window_start >= 1000000000ull &&
++             log.window_start_ns.compare_exchange_strong(window_start, now)) {
++    const uint64_t failures = log.failures.exchange(0);
++    const uint64_t failed_ns = log.failed_search_ns.exchange(0);
++    if (failures) {
++      REXSYS_WARN(
++          "[alloc-fail] {} guest allocation failures in the last {:.1f} s, {:.1f} ms in failed "
++          "page-table searches (only the first {} are logged in full)",
++          failures, double(now - window_start) / 1e9, double(failed_ns) / 1e6,
++          kAllocFailuresLoggedInFull);
++    }
++  }
++  log.failures.fetch_add(1, std::memory_order_relaxed);
++  log.failed_search_ns.fetch_add(search_ns, std::memory_order_relaxed);
++  if (log.logged_in_full.fetch_add(1, std::memory_order_relaxed) < kAllocFailuresLoggedInFull) {
++    REXSYS_ERROR("{}", message);
++  }
++}
++
++}  // namespace
++
+ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t size,
+                           uint32_t alignment, uint32_t allocation_type, uint32_t protect,
+                           bool top_down, uint32_t* out_address) {
+@@ -1277,11 +1327,12 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+ 
+   uint32_t available_page_count = high_page_number - low_page_number + 1;
+   if (!page_count || page_count > available_page_count) {
+-    REXSYS_ERROR("BaseHeap::Alloc page count too big for requested range");
++    NoteAllocFailure("BaseHeap::Alloc page count too big for requested range", 0);
+     return false;
+   }
+ 
+   std::lock_guard<std::recursive_mutex> heap_lock(heap_mutex_);
++  const uint64_t search_start_ns = AllocFailureNowNs();
+ 
+   // Find a free page range.
+   // The base page must match the requested alignment, so we first scan for
+@@ -1363,7 +1414,8 @@ bool BaseHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint32_t
+   }
+   if (start_page_number == UINT_MAX || end_page_number == UINT_MAX) {
+     // Out of memory.
+-    REXSYS_ERROR("BaseHeap::Alloc failed to find contiguous range");
++    NoteAllocFailure("BaseHeap::Alloc failed to find contiguous range",
++                     AllocFailureNowNs() - search_start_ns);
+     assert_always("Heap exhausted!");
+     return false;
+   }
+@@ -1748,7 +1800,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
+   uint32_t parent_address;
+   if (!parent_heap_->AllocRange(parent_heap_start, parent_heap_end, size, alignment,
+                                 allocation_type, protect, top_down, &parent_address)) {
+-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
++    NoteAllocFailure("PhysicalHeap::Alloc unable to alloc physical memory in parent heap", 0);
+     return false;
+   }
+ 
+@@ -1778,7 +1830,7 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
+   // TODO(benvanik): flag for ensure-not-committed?
+   uint32_t parent_base_address = GetPhysicalAddress(base_address);
+   if (!parent_heap_->AllocFixed(parent_base_address, size, alignment, allocation_type, protect)) {
+-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
++    NoteAllocFailure("PhysicalHeap::Alloc unable to alloc physical memory in parent heap", 0);
+     return false;
+   }
+ 
+@@ -1813,7 +1865,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
+   uint32_t parent_address;
+   if (!parent_heap_->AllocRange(parent_low_address, parent_high_address, size, alignment,
+                                 allocation_type, protect, top_down, &parent_address)) {
+-    REXSYS_ERROR("PhysicalHeap::Alloc unable to alloc physical memory in parent heap");
++    NoteAllocFailure("PhysicalHeap::Alloc unable to alloc physical memory in parent heap", 0);
+     return false;
+   }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,159 @@
+From abf13330cc42c3e33553330b93511580b0683200 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 22:55:25 -0700
+Subject: [PATCH 41/97] vulkan: copy float-constant runs in one memcpy in
+ UpdateBindings
+
+Live in-ring profile (Linux, 4-man tag match): 37% of UpdateBindings samples
+were the per-constant bit-scan + 16-byte memcpy loops. Consecutive set bits are
+now copied as one run; output bytes and order are identical (debug-build
+self-check against the per-bit copy on 1,024 pseudo-random maps + edge cases).
+
+Deterministic A/B (same F9 trace replayed 400x, binaries alternated, 3 rounds):
+25.907 -> 25.659 ms/frame (-1.0%; before spread 0.03 ms); ~half of replay time
+is trace decompression, so ~2% of real GPU-thread work. Live in-ring runs were
+too content-dependent to resolve it (287k-416k draws/s between runs).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/command_processor.cpp | 103 +++++++++++++++++-----
+ 1 file changed, 83 insertions(+), 20 deletions(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 21890d1..cc366fa 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -122,6 +122,75 @@ bool DescriptorImageInfosEqual(const std::vector<VkDescriptorImageInfo>& left,
+   return true;
+ }
+ 
++constexpr size_t kFloatConstantBytes = sizeof(float) * 4;
++
++void CopyFloatConstantMapEntry(uint8_t*& mapping, const uint32_t* regs,
++                               uint64_t float_constant_map_entry) {
++  uint32_t float_constant_index;
++  while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
++    const uint64_t run_start_bits = float_constant_map_entry >> float_constant_index;
++    uint32_t run_length;
++    if (!rex::bit_scan_forward(~run_start_bits, &run_length)) {
++      run_length = 64 - float_constant_index;
++    }
++
++    const size_t run_bytes = size_t(run_length) * kFloatConstantBytes;
++    std::memcpy(mapping, &regs[float_constant_index * 4], run_bytes);
++    mapping += run_bytes;
++
++    const uint64_t run_mask =
++        run_length == 64 ? ~uint64_t(0) : (UINT64_C(1) << run_length) - 1;
++    float_constant_map_entry &= ~(run_mask << float_constant_index);
++  }
++}
++
++#if !defined(NDEBUG)
++void CheckFloatConstantMapEntryCopy() {
++  constexpr size_t kFloatConstantCount = 64;
++  constexpr size_t kMaximumOutputBytes = kFloatConstantCount * kFloatConstantBytes;
++  std::array<uint32_t, kFloatConstantCount * 4> source_regs;
++  for (size_t i = 0; i < source_regs.size(); ++i) {
++    source_regs[i] = uint32_t(i * UINT32_C(0x9E3779B9)) ^
++                     (UINT32_C(0xA5A5A5A5) + uint32_t(i));
++  }
++
++  const auto verify = [&](uint64_t map) {
++    std::array<uint8_t, kMaximumOutputBytes> expected;
++    std::array<uint8_t, kMaximumOutputBytes> actual;
++    size_t expected_bytes = 0;
++    for (uint32_t index = 0; index < kFloatConstantCount; ++index) {
++      if (map & (UINT64_C(1) << index)) {
++        std::memcpy(expected.data() + expected_bytes, &source_regs[index * 4],
++                    kFloatConstantBytes);
++        expected_bytes += kFloatConstantBytes;
++      }
++    }
++
++    uint8_t* actual_end = actual.data();
++    CopyFloatConstantMapEntry(actual_end, source_regs.data(), map);
++    const size_t actual_bytes = size_t(actual_end - actual.data());
++    if (actual_bytes != expected_bytes ||
++        std::memcmp(expected.data(), actual.data(), expected_bytes) != 0) {
++      std::abort();
++    }
++  };
++
++  for (uint64_t map : std::array<uint64_t, 4>{
++           UINT64_C(0), ~uint64_t(0), UINT64_C(0x5555555555555555),
++           UINT64_C(0xAAAAAAAAAAAAAAAA)}) {
++    verify(map);
++  }
++
++  uint64_t random_state = UINT64_C(0xD1B54A32D192ED03);
++  for (uint32_t i = 0; i < 1024; ++i) {
++    random_state ^= random_state >> 12;
++    random_state ^= random_state << 25;
++    random_state ^= random_state >> 27;
++    verify(random_state * UINT64_C(0x2545F4914F6CDD1D));
++  }
++}
++#endif  // !defined(NDEBUG)
++
+ // glslang default built-in resource limits.
+ constexpr TBuiltInResource kGlslangDefaultTBuiltInResource = {
+     /* .maxLights = */ 32,
+@@ -7271,6 +7340,14 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+   SCOPE_profile_cpu_f("gpu");
+ #endif  // XE_GPU_FINE_GRAINED_DRAW_SCOPES
+ 
++#if !defined(NDEBUG)
++  static const bool float_constant_map_entry_copy_checked = [] {
++    CheckFloatConstantMapEntryCopy();
++    return true;
++  }();
++  (void)float_constant_map_entry_copy_checked;
++#endif  // !defined(NDEBUG)
++
+   const RegisterFile& regs = *register_file_;
+ 
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+@@ -7365,16 +7442,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
+       for (uint32_t i = 0; i < 4; ++i) {
+-        uint64_t float_constant_map_entry = current_float_constant_map_vertex_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
+-        }
++        CopyFloatConstantMapEntry(
++            mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_000_X + (i << 8)],
++            current_float_constant_map_vertex_[i]);
+       }
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+                                               << SpirvShaderTranslator::kConstantBufferFloatVertex;
+@@ -7394,16 +7464,9 @@ bool VulkanCommandProcessor::UpdateBindings(const VulkanShader* vertex_shader,
+       }
+       buffer_info.range = VkDeviceSize(float_constants_size);
+       for (uint32_t i = 0; i < 4; ++i) {
+-        uint64_t float_constant_map_entry = current_float_constant_map_pixel_[i];
+-        uint32_t float_constant_index;
+-        while (rex::bit_scan_forward(float_constant_map_entry, &float_constant_index)) {
+-          float_constant_map_entry &= ~(1ull << float_constant_index);
+-          std::memcpy(
+-              mapping,
+-              &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8) + (float_constant_index << 2)],
+-              sizeof(float) * 4);
+-          mapping += sizeof(float) * 4;
+-        }
++        CopyFloatConstantMapEntry(
++            mapping, &regs[XE_GPU_REG_SHADER_CONSTANT_256_X + (i << 8)],
++            current_float_constant_map_pixel_[i]);
+       }
+       current_constant_buffers_up_to_date_ |= UINT32_C(1)
+                                               << SpirvShaderTranslator::kConstantBufferFloatPixel;
+-- 
+2.43.0
+

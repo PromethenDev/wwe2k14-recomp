@@ -1,0 +1,226 @@
+From b0e20dc98a63e80871c54a39a9ad4d636d840f7b Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 15:45:52 -0700
+Subject: [PATCH 36/97] graphics: enable persistent Vulkan shader/pipeline
+ storage
+
+The Xenia-derived storage (<user data>/cache/shaders/shareable/<title>.*)
+was implemented but GraphicsSystem::InitializeShaderStorage was never
+called, so every session recompiled every pipeline mid-play (~320 per
+session; on the owner's laptop 9 of 13 slow normal-play seconds coincided
+with pipeline creation bursts).
+
+- ReXApp::OnInitialize initializes it (blocking) after the XEX loads and
+  before the module launches, with the kernel title id.
+- store_shaders cvar (default true, restart required) replaces kStoreShaders.
+- Startup log: pipelines/shaders loaded, time, file paths.
+- Storage writer flushes without waiting for the next submission and drains
+  its queues on shutdown; submission-end flushes keep records on SIGKILL.
+
+Linux: run 2 loaded 11 pipelines/8 shaders in 4.8 ms, 0 created after.
+Wine (Windows exe): run 2 loaded 175 pipelines/130 shaders in 189 ms.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/graphics_system.cpp       |  7 ++-
+ src/graphics/vulkan/pipeline_cache.cpp | 79 +++++++++++++++++++-------
+ src/ui/rex_app.cpp                     | 11 +++-
+ 3 files changed, 71 insertions(+), 26 deletions(-)
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 87c49c7..a0b28df 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -40,9 +40,10 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+     .allowed({"none", "fxaa", "fxaa_extreme"})
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+-namespace {
+-constexpr bool kStoreShaders = true;
++REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU", "Persist Vulkan shader and pipeline storage")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++namespace {
+ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+     const std::string& effect_name) {
+   std::string lowered = effect_name;
+@@ -361,7 +362,7 @@ void GraphicsSystem::InvalidateGpuMemory() {
+ 
+ void GraphicsSystem::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                              uint32_t title_id, bool blocking) {
+-  if (!kStoreShaders) {
++  if (!REXCVAR_GET(store_shaders)) {
+     return;
+   }
+   if (blocking) {
+diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
+index 91ac08f..e894a08 100644
+--- a/src/graphics/vulkan/pipeline_cache.cpp
++++ b/src/graphics/vulkan/pipeline_cache.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <array>
+ #include <atomic>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
+@@ -390,6 +391,7 @@ bool VulkanPipelineCache::Initialize() {
+ 
+ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& cache_root,
+                                                   uint32_t title_id, bool blocking) {
++  const auto storage_initialization_start = std::chrono::steady_clock::now();
+   ShutdownShaderStorage();
+   {
+     std::lock_guard<std::mutex> lock(creation_request_lock_);
+@@ -416,6 +418,8 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+   std::vector<PipelineStoredDescription> pipeline_stored_descriptions;
+   // <Shader hash, modification bits>.
+   std::set<std::pair<uint64_t, uint64_t>> shader_translations_needed;
++  size_t shaders_loaded_from_storage = 0;
++  size_t pipelines_loaded_from_storage = 0;
+   auto pipeline_storage_file_path =
+       shader_storage_shareable_root /
+       fmt::format("{:08X}.{}.vk.xpso", title_id, edram_fragment_shader_interlock ? "fsi" : "fbo");
+@@ -554,6 +558,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       }
+       // Loaded from the current storage - don't write again.
+       shader->set_ucode_storage_index(shader_storage_index_);
++      ++shaders_loaded_from_storage;
+     }
+     rex::filesystem::TruncateStdioFile(shader_storage_file_, shader_storage_valid_bytes);
+   } else {
+@@ -679,8 +684,7 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+       }
+     }
+ 
+-    REXGPU_INFO("Created {} graphics pipelines from Vulkan storage ({} requested)",
+-                created_pipeline_count.load(), pipeline_creations.size());
++    pipelines_loaded_from_storage = created_pipeline_count.load();
+     {
+       std::lock_guard<std::mutex> lock(creation_request_lock_);
+       startup_loading_ = false;
+@@ -712,6 +716,16 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c
+   storage_write_thread_ = rex::thread::Thread::Create({}, [this]() { StorageWriteThread(); });
+   assert_not_null(storage_write_thread_);
+   storage_write_thread_->set_name("Vulkan Storage writer");
++
++  const double storage_initialization_time_ms =
++      std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() -
++                                                storage_initialization_start)
++          .count();
++  REXGPU_INFO(
++      "Loaded {} pipelines and {} shaders from storage in {:.1f} ms; pipeline file: {}, shader "
++      "file: {}",
++      pipelines_loaded_from_storage, shaders_loaded_from_storage, storage_initialization_time_ms,
++      rex::path_to_utf8(pipeline_storage_file_path), rex::path_to_utf8(shader_storage_file_path));
+ }
+ 
+ void VulkanPipelineCache::ShutdownShaderStorage() {
+@@ -3648,33 +3662,54 @@ void VulkanPipelineCache::StorageWriteThread() {
+     const Shader* shader = nullptr;
+     PipelineStoredDescription pipeline_description;
+     bool write_pipeline = false;
++    bool shutdown = false;
+     {
+       std::unique_lock<std::mutex> lock(storage_write_request_lock_);
+-      if (storage_write_thread_shutdown_) {
+-        return;
+-      }
+-      if (!storage_write_shader_queue_.empty()) {
+-        shader = storage_write_shader_queue_.front();
+-        storage_write_shader_queue_.pop_front();
+-      } else if (storage_write_flush_shaders_) {
+-        storage_write_flush_shaders_ = false;
+-        flush_shaders = true;
+-      }
+-      if (!storage_write_pipeline_queue_.empty()) {
+-        std::memcpy(&pipeline_description, &storage_write_pipeline_queue_.front(),
+-                    sizeof(pipeline_description));
+-        storage_write_pipeline_queue_.pop_front();
+-        write_pipeline = true;
+-      } else if (storage_write_flush_pipelines_) {
+-        storage_write_flush_pipelines_ = false;
+-        flush_pipelines = true;
+-      }
+-      if (!shader && !write_pipeline) {
++      if (storage_write_thread_shutdown_ && storage_write_shader_queue_.empty() &&
++          storage_write_pipeline_queue_.empty()) {
++        shutdown = true;
++      } else {
++        if (!storage_write_shader_queue_.empty()) {
++          shader = storage_write_shader_queue_.front();
++          storage_write_shader_queue_.pop_front();
++        } else if (storage_write_flush_shaders_) {
++          storage_write_flush_shaders_ = false;
++          flush_shaders = true;
++        }
++        if (!storage_write_pipeline_queue_.empty()) {
++          std::memcpy(&pipeline_description, &storage_write_pipeline_queue_.front(),
++                      sizeof(pipeline_description));
++          storage_write_pipeline_queue_.pop_front();
++          write_pipeline = true;
++        } else if (storage_write_flush_pipelines_) {
++          storage_write_flush_pipelines_ = false;
++          flush_pipelines = true;
++        }
++      }
++      if (!shutdown && !shader && !write_pipeline && !flush_shaders && !flush_pipelines) {
+         storage_write_request_cond_.wait(lock);
+         continue;
+       }
+     }
+ 
++    if (shutdown) {
++      // Drain queued records above and flush them before closing the streams.
++      // Submission-end flushes provide the same protection during gameplay,
++      // including sessions terminated with SIGKILL.
++      assert_not_null(shader_storage_file_);
++      assert_not_null(pipeline_storage_file_);
++      fflush(shader_storage_file_);
++      fflush(pipeline_storage_file_);
++      return;
++    }
++
++    if (!shader && !write_pipeline) {
++      // A flush request has been removed from the protected flags. Start the
++      // next iteration so the stdio flush at the top of the loop runs now,
++      // rather than sleeping until another submission arrives.
++      continue;
++    }
++
+     if (shader) {
+       shader_header.ucode_data_hash = shader->ucode_data_hash();
+       shader_header.ucode_dword_count = shader->ucode_dword_count();
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 293d9fa..68c99ca 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -167,6 +167,16 @@ bool ReXApp::OnInitialize() {
+ 
+   OnPostLoadXexImage();
+ 
++  // The executable module is now loaded, so the kernel state has the title ID
++  // needed to select its persistent shader and pipeline storage. Initialize
++  // it before the module is launched and can submit its first draws.
++  auto* graphics_system =
++      static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
++  if (graphics_system && runtime_->kernel_state()) {
++    graphics_system->InitializeShaderStorage(runtime_->user_data_root() / "cache",
++                                             runtime_->kernel_state()->title_id(), true);
++  }
++
+   // Initialize rexcrt heap after LoadXexImage to avoid guest memory writes
+   // corrupting the heap region. rexcrt_heap is set by codegen (REXCRT_HEAP)
+   // when [rexcrt] contains heap functions -- originals are stripped so init
+@@ -210,7 +220,6 @@ bool ReXApp::OnInitialize() {
+   runtime_->set_display_window(window_.get());
+ 
+   // Setup graphics presenter and ImGui
+-  auto* graphics_system = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+   if (graphics_system && graphics_system->presenter()) {
+     auto* presenter = graphics_system->presenter();
+     auto* provider = graphics_system->provider();
+-- 
+2.43.0
+

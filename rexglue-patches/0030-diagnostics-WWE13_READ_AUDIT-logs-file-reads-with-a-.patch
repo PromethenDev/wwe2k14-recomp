@@ -1,0 +1,52 @@
+From 1b4537e04ce985d560ff12229a7d2713b6413395 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 08:41:54 -0700
+Subject: [PATCH 30/97] diagnostics: WWE13_READ_AUDIT logs file reads with a
+ hash of the delivered bytes
+
+WWE13_READ_AUDIT=<path substring> logs offset, length, bytes read, buffer and an FNV-1a
+hash of the data XFile::ReadInternal delivered, so file I/O can be checked offline against
+the host file. Used to show every logo.bik2 read was byte-exact (114/114). Off by default.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xfile.cpp | 16 ++++++++++++++++
+ 1 file changed, 16 insertions(+)
+
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index b0971cb..36f508b 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -19,6 +19,7 @@
+ #include <rex/system/xfile.h>
+ #include <rex/thread/mutex.h>
+ 
++#include <cstdlib>
+ #include <span>
+ 
+ namespace rex::system {
+@@ -164,6 +165,21 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
+                   buffer_length),
+               size_t(byte_offset), &bytes_read);
+           if (XSUCCEEDED(result)) {
++            // Diagnostic (WWE13_READ_AUDIT=<substring>): log reads of matching paths with an
++            // FNV-1a hash of the delivered bytes, for offline comparison with the host file.
++            static const char* read_audit = std::getenv("WWE13_READ_AUDIT");
++            if (read_audit && path().find(read_audit) != std::string::npos) {
++              const uint8_t* p = buffer_physical_heap
++                                     ? memory()->TranslatePhysical(
++                                           buffer_physical_heap->GetPhysicalAddress(
++                                               buffer_guest_address))
++                                     : memory()->TranslateVirtual(buffer_guest_address);
++              uint64_t h = 0xcbf29ce484222325ull;
++              for (size_t k = 0; k < bytes_read; ++k) h = (h ^ p[k]) * 0x100000001b3ull;
++              REXSYS_INFO("[read-audit] path={} off={} len={} got={} buf={:#x} fnv={:016x}",
++                          path(), byte_offset, buffer_length, bytes_read, buffer_guest_address,
++                          h);
++            }
+             if (buffer_physical_heap) {
+               buffer_physical_heap->TriggerCallbacks(
+                   rex::thread::global_critical_region::AcquireDirect(), buffer_guest_address,
+-- 
+2.43.0
+

@@ -1,0 +1,86 @@
+From f3ed54a17af3e98d592275a0d8ee913f54f9ead4 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 20:29:40 -0700
+Subject: [PATCH 82/97] Audio: retry opening the output, then fall back to
+ silent real-time output instead of hanging
+
+WWE13 2026-10-01: SDL_InitSubSystem(AUDIO) failed ('Could not setup connection to PulseAudio', a streaming host
+was reconfiguring the sound server) and the title froze ~5 s after boot - its main thread spins in the sound
+engine waiting for the audio thread, which never ran. Now: 4 attempts 500 ms apart, then SDL's disk driver
+writing to /dev/null (NUL on Windows), which consumes frames at real time so the title runs silent.
+Verified: PULSE_SERVER=unix:/nonexistent -> 4 retries + fallback, game keeps presenting; normal pulse
+connects first try.
+---
+ include/rex/audio/sdl/sdl_audio_driver.h |  3 ++
+ src/audio/sdl/sdl_audio_driver.cpp       | 41 ++++++++++++++++++++++++
+ 2 files changed, 44 insertions(+)
+
+diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
+index b79e5bc..9239d78 100644
+--- a/include/rex/audio/sdl/sdl_audio_driver.h
++++ b/include/rex/audio/sdl/sdl_audio_driver.h
+@@ -43,6 +43,9 @@ class SDLAudioDriver : public AudioDriver {
+   rex::thread::Semaphore* semaphore_ = nullptr;
+ 
+   SDL_AudioStream* sdl_stream_ = nullptr;
++  bool OpenOutput();
++  void CloseOutput();
++
+   bool sdl_initialized_ = false;
+   uint8_t sdl_device_channels_ = 0;
+ 
+diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
+index 6c299e3..562f7ce 100644
+--- a/src/audio/sdl/sdl_audio_driver.cpp
++++ b/src/audio/sdl/sdl_audio_driver.cpp
+@@ -92,6 +92,47 @@ bool SDLAudioDriver::Initialize() {
+   // Set app name for audio device identification
+   SDL_SetAppMetadataProperty(SDL_PROP_APP_METADATA_NAME_STRING, "rexglue");
+ 
++  // A sound server that is briefly unavailable (e.g. being reconfigured by a streaming host as the title starts)
++  // gets a few short retries before falling back to silent output.
++  for (int attempt = 0; attempt < 4; ++attempt) {
++    if (OpenOutput()) {
++      return true;
++    }
++    CloseOutput();
++    REXAPU_WARN("Audio output not available (attempt {} of 4); retrying", attempt + 1);
++    SDL_Delay(500);
++  }
++  // No usable audio output (no device, sound server unreachable, broken driver). Titles wait on the audio
++  // thread to consume frames, so running without any output freezes them shortly after boot (WWE13 2026-10-01:
++  // "Could not setup connection to PulseAudio" -> main thread spun forever in the sound engine). Fall back to
++  // SDL's disk driver writing to the null device: it consumes frames at real-time pace, so the game runs silent.
++  CloseOutput();
++  REXAPU_WARN("No audio output could be opened; continuing without sound (silent real-time output)");
++  SDL_SetHintWithPriority(SDL_HINT_AUDIO_DRIVER, "disk", SDL_HINT_OVERRIDE);
++#ifdef _WIN32
++  SDL_SetHintWithPriority(SDL_HINT_AUDIO_DISK_OUTPUT_FILE, "NUL", SDL_HINT_OVERRIDE);
++#else
++  SDL_SetHintWithPriority(SDL_HINT_AUDIO_DISK_OUTPUT_FILE, "/dev/null", SDL_HINT_OVERRIDE);
++#endif
++  if (OpenOutput()) {
++    return true;
++  }
++  CloseOutput();
++  return false;
++}
++
++void SDLAudioDriver::CloseOutput() {
++  if (sdl_stream_) {
++    SDL_DestroyAudioStream(sdl_stream_);
++    sdl_stream_ = nullptr;
++  }
++  if (sdl_initialized_) {
++    SDL_QuitSubSystem(SDL_INIT_AUDIO);
++    sdl_initialized_ = false;
++  }
++}
++
++bool SDLAudioDriver::OpenOutput() {
+   if (!SDL_InitSubSystem(SDL_INIT_AUDIO)) {
+     REXAPU_ERROR("SDL_InitSubSystem(SDL_INIT_AUDIO) failed: {}", SDL_GetError());
+     return false;
+-- 
+2.43.0
+

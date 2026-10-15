@@ -1,0 +1,752 @@
+From 56cb7fae92ef101a00a735459058e7bd2810e340 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 07:40:27 -0700
+Subject: [PATCH 94/97] Freeze logger: spin/blocked/idle classification from
+ per-thread CPU, 20 host-PC samples of spinning threads symbolized from the
+ binary's .symtab, memory-recovery counters (kind, last guest addr/protect,
+ age), guest-state hook; fix gap underflow (now read before last_present);
+ spin test hook
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/freeze_logger.h |  23 ++
+ src/core/freeze_logger.cpp              | 506 +++++++++++++++++++++++-
+ src/system/xmemory.cpp                  |  10 +
+ 3 files changed, 533 insertions(+), 6 deletions(-)
+
+diff --git a/include/rex/diagnostics/freeze_logger.h b/include/rex/diagnostics/freeze_logger.h
+index 7e9da6d..4f7eeb1 100644
+--- a/include/rex/diagnostics/freeze_logger.h
++++ b/include/rex/diagnostics/freeze_logger.h
+@@ -8,6 +8,7 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <cstdio>
+ 
+ namespace rex::diagnostics::freeze_logger {
+ 
+@@ -56,4 +57,26 @@ void UnregisterThread();
+ // Total number of sync events pushed into the ring (overhead accounting).
+ uint64_t RecordedEventCount();
+ 
++// --- R9 freeze-report additions (docs/CAGE-SPIN.md section 6) ---------------
++
++// Optional guest-state provider installed by the game. When set, it is invoked
++// while the report file is open (before the log tail) so it can append
++// guest-memory-derived state (the 0x82BB pump object, the present-device
++// fields, fixed .data globals). It runs on the watchdog thread, which is NOT a
++// bound guest ThreadState, so the implementation must use a captured guest
++// memory base / Memory pointer rather than REX_KERNEL_MEMORY().
++using GuestStateDumpFn = void (*)(FILE* file, uint64_t now_ns);
++void SetGuestStateDumpFn(GuestStateDumpFn fn);
++
++// The access-violation recovery paths call this once per recovered page. Cheap
++// relaxed atomics + one timestamp; safe from any thread. The report prints the
++// per-kind count plus the last guest address / protect / age.
++enum class MemoryRecoveryKind : uint32_t {
++  kGuestVirtualStaleProtect = 0,
++  kReleasedPhysical,
++  kStalePhysical,
++  kCount,
++};
++void RecordMemoryRecovery(MemoryRecoveryKind kind, uint32_t guest_address, uint32_t protect);
++
+ }  // namespace rex::diagnostics::freeze_logger
+diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
+index 507c754..0411719 100644
+--- a/src/core/freeze_logger.cpp
++++ b/src/core/freeze_logger.cpp
+@@ -29,6 +29,7 @@
+ #include <mutex>
+ #include <string>
+ #include <thread>
++#include <vector>
+ 
+ #include <rex/cvar.h>
+ #include <rex/filesystem.h>
+@@ -40,7 +41,10 @@
+ #define WIN32_LEAN_AND_MEAN
+ #include <windows.h>
+ #else
++#include <elf.h>
+ #include <execinfo.h>
++#include <fcntl.h>
++#include <link.h>
+ #include <signal.h>
+ #include <sys/syscall.h>
+ #include <time.h>
+@@ -54,6 +58,14 @@ constexpr uint32_t kRingSize = 4096;
+ constexpr int kMaxThreads = 64;
+ constexpr uint32_t kMaxCaptureDepth = 24;
+ constexpr int kFreezeGapSeconds = 10;
++// R9: per-thread CPU classification and multi-sample spin PC capture.
++constexpr int kMaxSpinSamples = 20;
++constexpr int kSpinSampleIntervalMs = 50;  // 20 samples * 50 ms = 1 s
++constexpr int kCpuHistory = 8;             // 1 Hz watchdog samples kept per slot
++constexpr double kSpinCpuPercent = 50.0;   // >= this and not waiting => spin
++// Linux backtrace frame holding the interrupted instruction (frames 0/1 are the
++// capture signal handler and the libc signal trampoline).
++constexpr int kInterruptedFrame = 2;
+ 
+ std::atomic<bool> g_started{false};
+ std::atomic<bool> g_enabled{false};
+@@ -66,6 +78,7 @@ std::atomic<uint64_t> g_present_count{0};
+ std::atomic<uint64_t> g_last_vdswap_ns{0};
+ std::atomic<uint64_t> g_vdswap_count{0};
+ std::atomic<uint32_t> g_last_present_host_tid{0};
++std::atomic<uint32_t> g_last_vdswap_host_tid{0};
+ std::atomic<bool> g_reported{false};
+ std::atomic<uint64_t> g_event_count{0};
+ uint64_t g_start_ns = 0;
+@@ -104,10 +117,15 @@ struct ThreadSlot {
+   char wait_name[48] = {};
+   std::atomic<uint32_t> cap_depth{0};
+   std::atomic<uint64_t> cap_pc[kMaxCaptureDepth] = {};
++  // R9: leaf host PCs gathered by repeated capture signals at report time.
++  std::atomic<uint32_t> spin_count{0};
++  std::atomic<uint64_t> spin_pc[kMaxSpinSamples] = {};
+ };
+ 
+ ThreadSlot g_slots[kMaxThreads];
+ std::atomic<uint64_t> g_used_mask{0};
++std::atomic<bool> g_spin_sampling{false};
++GuestStateDumpFn g_guest_state_dump = nullptr;
+ #if !defined(_WIN32)
+ thread_local ThreadSlot* t_slot = nullptr;
+ int g_capture_signal = 0;
+@@ -115,11 +133,218 @@ int g_capture_signal = 0;
+ thread_local ThreadSlot* t_slot = nullptr;
+ #endif
+ 
++// R9: per-slot CPU history. Written and read only by the watchdog thread; a
++// slot's history is matched by host_tid so slot reuse is harmless.
++struct CpuSample {
++  uint32_t host_tid = 0;
++  uint64_t cpu_ns = 0;
++  uint64_t t_ns = 0;
++};
++CpuSample g_cpu_history[kMaxThreads][kCpuHistory];
++uint32_t g_cpu_history_head[kMaxThreads] = {};
++uint32_t g_cpu_history_count[kMaxThreads] = {};
++
++// R9: access-violation recovery accounting.
++struct RecoverySlot {
++  std::atomic<uint64_t> count{0};
++  std::atomic<uint32_t> last_guest{0};
++  std::atomic<uint32_t> last_protect{0};
++  std::atomic<uint64_t> last_ns{0};
++};
++RecoverySlot g_recovery[static_cast<int>(MemoryRecoveryKind::kCount)];
++
+ uint64_t NowNs() {
+   const auto now = std::chrono::steady_clock::now().time_since_epoch();
+   return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
+ }
+ 
++// --- host symbol table (Linux ELF .symtab) ---------------------------------
++//
++// The recompiled guest functions are plain local symbols (sub_XXXXXXXX) in the
++// game binary's .symtab; there is no dynamic symbol table and no -rdynamic, so
++// dladdr/backtrace_symbols cannot resolve them. Parse /proc/self/exe lazily the
++// first time a report is generated and map a host PC to the nearest preceding
++// function symbol (subtracting the PIE load bias). On Windows the symbols live
++// in the unshipped .pdb, so callers fall back to raw addresses.
++
++struct SymbolEntry {
++  uint64_t addr;
++  const char* name;
++};
++std::vector<SymbolEntry> g_symbols;
++std::vector<char> g_symbol_strings;
++uint64_t g_symbol_base = 0;
++bool g_symbols_loaded = false;
++
++#if !defined(_WIN32)
++int SymbolsPhdrCallback(struct dl_phdr_info* info, size_t, void*) {
++  if (!info->dlpi_name || info->dlpi_name[0] == '\0') {
++    g_symbol_base = static_cast<uint64_t>(info->dlpi_addr);
++    return 1;
++  }
++  return 0;
++}
++
++void LoadSymbols() {
++  if (g_symbols_loaded) return;
++  g_symbols_loaded = true;
++  dl_iterate_phdr(SymbolsPhdrCallback, nullptr);
++  const int fd = ::open("/proc/self/exe", O_RDONLY | O_CLOEXEC);
++  if (fd < 0) return;
++  Elf64_Ehdr eh{};
++  if (::pread(fd, &eh, sizeof(eh), 0) != static_cast<ssize_t>(sizeof(eh)) ||
++      std::memcmp(eh.e_ident, ELFMAG, SELFMAG) != 0 ||
++      eh.e_shentsize != sizeof(Elf64_Shdr) || eh.e_shnum == 0) {
++    ::close(fd);
++    return;
++  }
++  std::vector<Elf64_Shdr> sections(eh.e_shnum);
++  if (::pread(fd, sections.data(), sections.size() * sizeof(Elf64_Shdr), eh.e_shoff) !=
++      static_cast<ssize_t>(sections.size() * sizeof(Elf64_Shdr))) {
++    ::close(fd);
++    return;
++  }
++  const Elf64_Shdr* symtab = nullptr;
++  for (const Elf64_Shdr& sh : sections) {
++    if (sh.sh_type == SHT_SYMTAB) {
++      symtab = &sh;
++      break;
++    }
++  }
++  if (!symtab || symtab->sh_link >= sections.size()) {
++    ::close(fd);
++    return;
++  }
++  const Elf64_Shdr& strtab = sections[symtab->sh_link];
++  const size_t symbol_count = symtab->sh_size / sizeof(Elf64_Sym);
++  if (symbol_count == 0 || strtab.sh_size == 0) {
++    ::close(fd);
++    return;
++  }
++  std::vector<Elf64_Sym> symbols(symbol_count);
++  if (::pread(fd, symbols.data(), symtab->sh_size, symtab->sh_offset) !=
++      static_cast<ssize_t>(symtab->sh_size)) {
++    ::close(fd);
++    return;
++  }
++  g_symbol_strings.resize(strtab.sh_size);
++  if (::pread(fd, g_symbol_strings.data(), strtab.sh_size, strtab.sh_offset) !=
++      static_cast<ssize_t>(strtab.sh_size)) {
++    g_symbol_strings.clear();
++    ::close(fd);
++    return;
++  }
++  ::close(fd);
++  g_symbols.reserve(symbol_count);
++  for (const Elf64_Sym& sym : symbols) {
++    if (sym.st_name == 0 || sym.st_shndx == SHN_UNDEF) continue;
++    const int type = ELF64_ST_TYPE(sym.st_info);
++    if (type != STT_FUNC && type != STT_OBJECT) continue;
++    if (sym.st_name >= g_symbol_strings.size()) continue;
++    g_symbols.push_back({sym.st_value, g_symbol_strings.data() + sym.st_name});
++  }
++  std::sort(g_symbols.begin(), g_symbols.end(),
++            [](const SymbolEntry& a, const SymbolEntry& b) { return a.addr < b.addr; });
++}
++#endif
++
++const char* SymbolizeHostPc(uint64_t pc) {
++#if defined(_WIN32)
++  (void)pc;
++  return nullptr;
++#else
++  if (g_symbols.empty()) return nullptr;
++  const uint64_t addr = pc >= g_symbol_base ? pc - g_symbol_base : pc;
++  auto it = std::upper_bound(g_symbols.begin(), g_symbols.end(), addr,
++                             [](uint64_t value, const SymbolEntry& entry) {
++                               return value < entry.addr;
++                             });
++  if (it == g_symbols.begin()) return nullptr;
++  --it;
++  return it->name;
++#endif
++}
++
++// Per-thread host CPU time in nanoseconds, or UINT64_MAX if unavailable.
++uint64_t ReadHostCpuNs(uint32_t tid) {
++#if defined(_WIN32)
++  if (tid == 0) return UINT64_MAX;
++  HANDLE handle = OpenThread(THREAD_QUERY_INFORMATION, FALSE, tid);
++  if (!handle) return UINT64_MAX;
++  FILETIME creation{}, exit{}, kernel{}, user{};
++  uint64_t total = UINT64_MAX;
++  if (GetThreadTimes(handle, &creation, &exit, &kernel, &user)) {
++    auto to_u64 = [](const FILETIME& value) {
++      return (uint64_t(value.dwHighDateTime) << 32) | value.dwLowDateTime;
++    };
++    total = (to_u64(kernel) + to_u64(user)) * 100ull;  // 100 ns ticks -> ns
++  }
++  CloseHandle(handle);
++  return total;
++#else
++  if (tid == 0) return UINT64_MAX;
++  std::ifstream input("/proc/self/task/" + std::to_string(tid) + "/stat");
++  std::string line;
++  if (!input || !std::getline(input, line)) return UINT64_MAX;
++  const size_t name_end = line.rfind(") ");
++  if (name_end == std::string::npos) return UINT64_MAX;
++  // After the comm field: state (a single non-numeric char) then ppid(0) pgrp(1)
++  // session(2) tty(3) tpgid(4) flags(5) minflt(6) cminflt(7) majflt(8)
++  // cmajflt(9) utime(10) stime(11).
++  char* cursor = const_cast<char*>(line.c_str()) + name_end + 2;
++  while (*cursor && *cursor != ' ') ++cursor;  // skip the state char
++  while (*cursor == ' ') ++cursor;
++  long fields[12] = {};
++  for (int i = 0; i < 12 && *cursor; ++i) {
++    fields[i] = std::strtol(cursor, &cursor, 10);
++    while (*cursor == ' ') ++cursor;
++  }
++  const long clk_tck = ::sysconf(_SC_CLK_TCK);
++  if (clk_tck <= 0) return UINT64_MAX;
++  const uint64_t ticks = uint64_t(fields[10] < 0 ? 0 : fields[10]) +
++                         uint64_t(fields[11] < 0 ? 0 : fields[11]);
++  return ticks * 1000000000ull / uint64_t(clk_tck);
++#endif
++}
++
++// Mean host CPU percent for a slot over the retained watchdog samples, matched
++// by host_tid. Returns -1 when there is not enough history.
++double SlotCpuPercent(int index) {
++  const ThreadSlot& slot = g_slots[index];
++  const uint32_t tid = slot.host_tid.load(std::memory_order_relaxed);
++  const uint32_t count = std::min<uint32_t>(g_cpu_history_count[index], kCpuHistory);
++  if (tid == 0 || count < 2) return -1.0;
++  uint64_t newest_t = 0, oldest_t = 0, newest_cpu = 0, oldest_cpu = 0;
++  bool have_newest = false, have_oldest = false;
++  for (uint32_t i = 0; i < count; ++i) {
++    const CpuSample& sample = g_cpu_history[index][i];
++    if (sample.host_tid != tid) continue;
++    if (!have_newest || sample.t_ns > newest_t) {
++      newest_t = sample.t_ns;
++      newest_cpu = sample.cpu_ns;
++      have_newest = true;
++    }
++    if (!have_oldest || sample.t_ns < oldest_t) {
++      oldest_t = sample.t_ns;
++      oldest_cpu = sample.cpu_ns;
++      have_oldest = true;
++    }
++  }
++  if (!have_newest || !have_oldest || newest_t <= oldest_t || newest_cpu < oldest_cpu) return -1.0;
++  const double wall_ns = double(newest_t - oldest_t);
++  const double cpu_ns = double(newest_cpu - oldest_cpu);
++  return 100.0 * cpu_ns / wall_ns;
++}
++
++const char* ClassifyThread(int index, double cpu_percent) {
++  // CPU first: a thread burning CPU is spinning regardless of a stale wait
++  // record (the guest Wwise threads keep a wait marker but run at ~100%).
++  if (cpu_percent >= kSpinCpuPercent) return "spin";
++  if (g_slots[index].wait_since_ns.load(std::memory_order_acquire) != 0) return "blocked";
++  if (cpu_percent < 0.0) return "unknown";
++  return "idle";
++}
++
+ const char* ObjectTypeName(uint32_t type) {
+   // Mirrors rex::system::XObject::Type (include/rex/system/xobject.h).
+   static const char* kNames[] = {
+@@ -165,6 +390,20 @@ void OnCaptureSignal(int, siginfo_t*, void*) {
+     slot->cap_pc[i].store(reinterpret_cast<uint64_t>(frames[i]), std::memory_order_relaxed);
+   }
+   slot->cap_depth.store(static_cast<uint32_t>(clamped), std::memory_order_release);
++  if (g_spin_sampling.load(std::memory_order_relaxed)) {
++    // The interrupted instruction is frame 2 (0 = this handler, 1 = the libc
++    // signal trampoline); fall back to the shallowest frame we have.
++    uint64_t pc = 0;
++    if (clamped > kInterruptedFrame) {
++      pc = reinterpret_cast<uint64_t>(frames[kInterruptedFrame]);
++    } else if (clamped > 0) {
++      pc = reinterpret_cast<uint64_t>(frames[clamped - 1]);
++    }
++    const uint32_t sample = slot->spin_count.fetch_add(1, std::memory_order_relaxed);
++    if (sample < kMaxSpinSamples) {
++      slot->spin_pc[sample].store(pc, std::memory_order_relaxed);
++    }
++  }
+ }
+ #endif
+ 
+@@ -189,6 +428,12 @@ void RequestCapture(ThreadSlot* slot) {
+     CONTEXT context{};
+     context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
+     if (GetThreadContext(handle, &context)) {
++      if (g_spin_sampling.load(std::memory_order_relaxed)) {
++        const uint32_t sample = slot->spin_count.fetch_add(1, std::memory_order_relaxed);
++        if (sample < kMaxSpinSamples) {
++          slot->spin_pc[sample].store(context.Rip, std::memory_order_relaxed);
++        }
++      }
+       slot->cap_pc[0].store(context.Rip, std::memory_order_relaxed);
+       uint32_t depth = 1;
+       uint64_t rbp = context.Rbp;
+@@ -233,6 +478,28 @@ void CaptureAllThreads() {
+   std::this_thread::sleep_for(std::chrono::milliseconds(150));
+ }
+ 
++// R9: for each candidate spinning slot, collect kMaxSpinSamples leaf host PCs
++// over ~1 s (all candidates in parallel). A spinning thread takes the capture
++// signal promptly; a blocked one is skipped by the caller.
++void SampleSpinPcs(const int* indices, int count) {
++  if (count <= 0) return;
++  for (int n = 0; n < count; ++n) {
++    ThreadSlot& slot = g_slots[indices[n]];
++    slot.spin_count.store(0, std::memory_order_release);
++    for (uint32_t i = 0; i < kMaxSpinSamples; ++i) {
++      slot.spin_pc[i].store(0, std::memory_order_relaxed);
++    }
++  }
++  g_spin_sampling.store(true, std::memory_order_release);
++  for (int round = 0; round < kMaxSpinSamples; ++round) {
++    for (int n = 0; n < count; ++n) {
++      RequestCapture(&g_slots[indices[n]]);
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(kSpinSampleIntervalMs));
++  }
++  g_spin_sampling.store(false, std::memory_order_release);
++}
++
+ std::string ReadHostState(uint32_t tid) {
+ #if defined(_WIN32)
+   (void)tid;
+@@ -297,8 +564,29 @@ std::string ReportDir() {
+ 
+ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+   const uint64_t last_vdswap_ns = g_last_vdswap_ns.load(std::memory_order_acquire);
++#if !defined(_WIN32)
++  LoadSymbols();
++#endif
+   CaptureAllThreads();
+ 
++  // R9: classify every active thread spin/blocked/idle from its recent CPU
++  // history, then multi-sample the host PC of the spinning ones.
++  double cpu_percent[kMaxThreads] = {};
++  const char* thread_class[kMaxThreads] = {};
++  int spin_indices[kMaxThreads] = {};
++  int spin_count = 0;
++  int top_spin = -1;
++  for (int i = 0; i < kMaxThreads; ++i) {
++    if (!g_slots[i].active.load(std::memory_order_acquire)) continue;
++    cpu_percent[i] = SlotCpuPercent(i);
++    thread_class[i] = ClassifyThread(i, cpu_percent[i]);
++    if (std::strcmp(thread_class[i], "spin") == 0) {
++      spin_indices[spin_count++] = i;
++      if (top_spin < 0 || cpu_percent[i] > cpu_percent[top_spin]) top_spin = i;
++    }
++  }
++  SampleSpinPcs(spin_indices, spin_count);
++
+   char stamp[32] = {};
+   const std::time_t t = std::time(nullptr);
+   std::tm local{};
+@@ -337,8 +625,15 @@ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+     const uint32_t host_tid = slot.host_tid.load(std::memory_order_relaxed);
+     const uint32_t guest_id = slot.guest_id.load(std::memory_order_relaxed);
+     const uint64_t wait_since = slot.wait_since_ns.load(std::memory_order_acquire);
+-    std::fprintf(file, "slot=%d name=%s guest_id=%u host_tid=%u host_state=%s\n", i, slot.name,
+-                 guest_id, host_tid, ReadHostState(host_tid).c_str());
++    const char* cls = thread_class[i] ? thread_class[i] : "unknown";
++    if (cpu_percent[i] >= 0.0) {
++      std::fprintf(file, "slot=%d name=%s guest_id=%u host_tid=%u host_state=%s cpu=%.1f%% class=%s\n",
++                   i, slot.name, guest_id, host_tid, ReadHostState(host_tid).c_str(),
++                   cpu_percent[i], cls);
++    } else {
++      std::fprintf(file, "slot=%d name=%s guest_id=%u host_tid=%u host_state=%s cpu=? class=%s\n", i,
++                   slot.name, guest_id, host_tid, ReadHostState(host_tid).c_str(), cls);
++    }
+     if (wait_since != 0) {
+       char wait_name[sizeof(slot.wait_name) + 1] = {};
+       std::memcpy(wait_name, slot.wait_name, sizeof(slot.wait_name));
+@@ -350,19 +645,60 @@ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+     } else {
+       std::fprintf(file, "  waiting_on: (not blocked in a kernel wait)\n");
+     }
++    if (std::strcmp(cls, "spin") == 0) {
++      const uint32_t samples = std::min<uint32_t>(slot.spin_count.load(std::memory_order_acquire),
++                                                  kMaxSpinSamples);
++      std::fprintf(file, "  spin_samples=%u\n", samples);
++      for (uint32_t s = 0; s < samples; ++s) {
++        const uint64_t pc = slot.spin_pc[s].load(std::memory_order_relaxed);
++        if (pc == 0) continue;
++        const char* sym = SymbolizeHostPc(pc);
++        std::fprintf(file, "    spin_pc[%u]=0x%llx sym=%s\n", s, (unsigned long long)pc,
++                     sym ? sym : "?");
++      }
++    }
+     const uint32_t depth = std::min<uint32_t>(slot.cap_depth.load(std::memory_order_acquire),
+                                               kMaxCaptureDepth);
+     if (depth > 0) {
+-      std::fprintf(file, "  capture: host_pc_count=%u (symbolize with the shipped binary)\n", depth);
++      std::fprintf(file, "  capture: host_pc_count=%u\n", depth);
+       for (uint32_t d = 0; d < depth; ++d) {
+-        std::fprintf(file, "    pc[%u]=0x%llx\n", d,
+-                     (unsigned long long)slot.cap_pc[d].load(std::memory_order_relaxed));
++        const uint64_t pc = slot.cap_pc[d].load(std::memory_order_relaxed);
++        const char* sym = SymbolizeHostPc(pc);
++        std::fprintf(file, "    pc[%u]=0x%llx sym=%s\n", d, (unsigned long long)pc,
++                     sym ? sym : "?");
+       }
+     } else {
+       std::fprintf(file, "  capture: none (thread blocked and did not run)\n");
+     }
+   }
+ 
++  // R9: access-violation recovery accounting, with age relative to the freeze.
++  std::fprintf(file, "\n=== memory recoveries ===\n");
++  static const char* kRecoveryNames[] = {
++      "guest-virtual-stale-protection",
++      "released-guest-physical",
++      "stale-guest-physical-write",
++  };
++  for (int i = 0; i < static_cast<int>(MemoryRecoveryKind::kCount); ++i) {
++    const RecoverySlot& slot = g_recovery[i];
++    const uint64_t count = slot.count.load(std::memory_order_relaxed);
++    const uint64_t last_ns = slot.last_ns.load(std::memory_order_acquire);
++    std::fprintf(file, "%s: count=%llu last_guest=0x%08X last_protect=0x%08X last_age_s=%.1f\n",
++                 kRecoveryNames[i], (unsigned long long)count,
++                 slot.last_guest.load(std::memory_order_relaxed),
++                 slot.last_protect.load(std::memory_order_relaxed),
++                 last_ns ? double(now_ns - last_ns) / 1e9 : -1.0);
++  }
++
++  // R9: guest-memory state (pump object / present device / globals), supplied by
++  // the game because rexcore cannot reach rex::system.
++  std::fprintf(file, "\n=== guest state ===\n");
++  if (g_guest_state_dump) {
++    g_guest_state_dump(file, now_ns);
++  } else {
++    std::fprintf(file, "(no guest-state provider registered)\n");
++  }
++
+   const uint64_t write = g_ring_write.load(std::memory_order_acquire);
+   const uint64_t begin = write > kRingSize ? write - kRingSize : 0;
+   std::fprintf(file, "\n=== sync ring (oldest..newest; %llu total) ===\n",
+@@ -398,6 +734,89 @@ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+       "events)",
+       gap_s, path, ActiveThreadCount(),
+       (unsigned long long)g_event_count.load(std::memory_order_relaxed));
++  // Subject of the summary: the thread that last drove VdSwap (it is the one
++  // that stops producing frames), falling back to the highest-CPU spinner.
++  int subject = -1;
++  const uint32_t vdswap_tid = g_last_vdswap_host_tid.load(std::memory_order_relaxed);
++  for (int i = 0; i < kMaxThreads; ++i) {
++    if (!g_slots[i].active.load(std::memory_order_acquire)) continue;
++    if (g_slots[i].host_tid.load(std::memory_order_relaxed) == vdswap_tid) {
++      subject = i;
++      break;
++    }
++  }
++  if (subject < 0) subject = top_spin;
++  if (subject >= 0 &&
++      (std::strcmp(thread_class[subject] ? thread_class[subject] : "", "spin") == 0 ||
++       std::strcmp(thread_class[subject] ? thread_class[subject] : "", "blocked") == 0)) {
++    /* use it */;
++  } else if (top_spin >= 0) {
++    subject = top_spin;
++  }
++  if (subject >= 0 && std::strcmp(thread_class[subject] ? thread_class[subject] : "", "spin") == 0) {
++    const ThreadSlot& slot = g_slots[subject];
++    // Majority symbol among the sampled leaf PCs.
++    const uint32_t samples =
++        std::min<uint32_t>(slot.spin_count.load(std::memory_order_acquire), kMaxSpinSamples);
++    const char* top_sym = "?";
++    uint32_t top_count = 0;
++    for (uint32_t s = 0; s < samples; ++s) {
++      const uint64_t pc = slot.spin_pc[s].load(std::memory_order_relaxed);
++      if (pc == 0) continue;
++      const char* sym = SymbolizeHostPc(pc);
++      if (!sym) continue;
++      uint32_t hits = 0;
++      for (uint32_t j = 0; j < samples; ++j) {
++        const uint64_t other = slot.spin_pc[j].load(std::memory_order_relaxed);
++        if (other != 0 && SymbolizeHostPc(other) == sym) ++hits;
++      }
++      if (hits > top_count) {
++        top_count = hits;
++        top_sym = sym;
++      }
++    }
++    REXLOG_WARN("[freeze-logger] class=spin tid={} name={} leaf={} cpu={:.1f}% samples={}",
++                slot.host_tid.load(std::memory_order_relaxed), slot.name, top_sym,
++                cpu_percent[subject], samples);
++  } else {
++    int blocked = -1;
++    uint64_t oldest_wait = 0;
++    int blocked_count = 0;
++    for (int i = 0; i < kMaxThreads; ++i) {
++      if (!g_slots[i].active.load(std::memory_order_acquire)) continue;
++      const uint64_t wait_since = g_slots[i].wait_since_ns.load(std::memory_order_acquire);
++      if (wait_since == 0) continue;
++      ++blocked_count;
++      // The test hook's synthetic wait is the injected block: always prefer it.
++      if (std::strcmp(g_slots[i].wait_name, "wwe2k14-freeze-test") == 0) {
++        blocked = i;
++        oldest_wait = wait_since;
++        break;
++      }
++      // Otherwise prefer the vdswap subject, then the oldest wait.
++      if (i == subject && blocked < 0) {
++        blocked = i;
++        oldest_wait = wait_since;
++        continue;
++      }
++      if (blocked < 0 || wait_since < oldest_wait) {
++        blocked = i;
++        oldest_wait = wait_since;
++      }
++    }
++    if (blocked >= 0) {
++      const ThreadSlot& slot = g_slots[blocked];
++      char wait_name[sizeof(slot.wait_name) + 1] = {};
++      std::memcpy(wait_name, slot.wait_name, sizeof(slot.wait_name));
++      REXLOG_WARN(
++          "[freeze-logger] class=blocked tid={} name={} waiting_on=\"{}\" handle=0x{:08X} "
++          "blocked_threads={}",
++          slot.host_tid.load(std::memory_order_relaxed), slot.name, wait_name,
++          slot.wait_handle.load(std::memory_order_relaxed), blocked_count);
++    } else {
++      REXLOG_WARN("[freeze-logger] class=no-spin-or-block (see report {})", path);
++    }
++  }
+   REXLOG_WARN("[freeze-logger] report path: {}", path);
+ }
+ 
+@@ -407,6 +826,18 @@ uint64_t RecordedEventCount() { return g_event_count.load(std::memory_order_rela
+ 
+ bool IsEnabled() { return g_enabled.load(std::memory_order_relaxed); }
+ 
++void SetGuestStateDumpFn(GuestStateDumpFn fn) { g_guest_state_dump = fn; }
++
++void RecordMemoryRecovery(MemoryRecoveryKind kind, uint32_t guest_address, uint32_t protect) {
++  const int index = static_cast<int>(kind);
++  if (index < 0 || index >= static_cast<int>(MemoryRecoveryKind::kCount)) return;
++  RecoverySlot& slot = g_recovery[index];
++  slot.count.fetch_add(1, std::memory_order_relaxed);
++  slot.last_guest.store(guest_address, std::memory_order_relaxed);
++  slot.last_protect.store(protect, std::memory_order_relaxed);
++  slot.last_ns.store(NowNs(), std::memory_order_release);
++}
++
+ void RecordPresent() {
+   if (!g_enabled.load(std::memory_order_relaxed)) return;
+   g_last_present_ns.store(NowNs(), std::memory_order_release);
+@@ -442,11 +873,56 @@ bool TestBlockVdSwapOnce() {
+   return true;
+ }
+ 
++// R9 spin positive control: busy-loop the guest VdSwap thread in a named,
++// noinline host function so the report can classify class=spin and name it.
++extern "C" {
++#if defined(__GNUC__) || defined(__clang__)
++__attribute__((noinline))
++#endif
++void wwe2k14_freeze_test_spin() {
++  volatile uint64_t counter = 0;
++  for (;;) {
++    counter = counter + 1;
++  }
++}
++}  // extern "C"
++
++bool TestSpinVdSwapOnce() {
++  static const bool armed = [] {
++    const char* value = std::getenv("WWE2K14_FREEZE_TEST_SPIN");
++    return value != nullptr && *value != '\0';
++  }();
++  if (!armed) return false;
++  static const uint64_t delay_ns = [] {
++    const char* value = std::getenv("WWE2K14_FREEZE_TEST_SPIN");
++    char* end = nullptr;
++    const long seconds = std::strtol(value, &end, 10);
++    if (end == value || *end != '\0' || seconds <= 0) return uint64_t(60) * 1000000000ull;
++    return uint64_t(seconds) * 1000000000ull;
++  }();
++  static std::atomic<bool> triggered{false};
++  if (triggered.load(std::memory_order_acquire)) return false;
++  if (NowNs() - g_start_ns < delay_ns) return false;
++  bool expected = false;
++  if (!triggered.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return false;
++  REXLOG_WARN("[freeze-logger] positive control: spinning guest VdSwap thread tid={}",
++              rex::thread::current_thread_system_id());
++  return true;
++}
++
+ void RecordVdSwap() {
+   if (!g_enabled.load(std::memory_order_relaxed)) return;
++  // Remember the thread that drives presents (the prime suspect when frames
++  // stop); stored before the test hooks so a hook that never returns still
++  // leaves its tid for the report.
++  g_last_vdswap_host_tid.store(rex::thread::current_thread_system_id(),
++                               std::memory_order_relaxed);
+   if (TestBlockVdSwapOnce()) {
+     for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
+   }
++  if (TestSpinVdSwapOnce()) {
++    wwe2k14_freeze_test_spin();
++  }
+   g_last_vdswap_ns.store(NowNs(), std::memory_order_release);
+   g_vdswap_count.fetch_add(1, std::memory_order_relaxed);
+ }
+@@ -527,10 +1003,28 @@ void Watchdog() {
+   while (g_running.load(std::memory_order_acquire)) {
+     std::this_thread::sleep_for(std::chrono::seconds(1));
+     if (!g_running.load(std::memory_order_acquire)) break;
++    const uint64_t sample_time = NowNs();
++    // R9: keep a short per-thread CPU history so a report can classify
++    // spin vs blocked vs idle from the seconds before the freeze.
++    for (int i = 0; i < kMaxThreads; ++i) {
++      ThreadSlot& slot = g_slots[i];
++      if (!slot.active.load(std::memory_order_acquire)) continue;
++      const uint32_t tid = slot.host_tid.load(std::memory_order_relaxed);
++      const uint64_t cpu_ns = ReadHostCpuNs(tid);
++      if (cpu_ns == UINT64_MAX) continue;
++      const uint32_t head = g_cpu_history_head[i];
++      g_cpu_history[i][head] = {tid, cpu_ns, sample_time};
++      g_cpu_history_head[i] = (head + 1) % kCpuHistory;
++      if (g_cpu_history_count[i] < kCpuHistory) ++g_cpu_history_count[i];
++    }
++    // Load last_present before reading the clock for the gap so a present that
++    // races this tick cannot make now < last_present and underflow the gap.
+     const uint64_t last_present = g_last_present_ns.load(std::memory_order_acquire);
+     if (last_present == 0) continue;
+     const uint64_t now = NowNs();
+-    if (now - last_present < uint64_t(kFreezeGapSeconds) * 1000000000ull) continue;
++    if (now < last_present || now - last_present < uint64_t(kFreezeGapSeconds) * 1000000000ull) {
++      continue;
++    }
+     bool expected = false;
+     if (!g_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) continue;
+     GenerateReport(now, last_present);
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 83f138d..6002cb0 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -23,6 +23,7 @@
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/diagnostics/freeze_logger.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/stream.h>
+@@ -548,6 +549,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                                rex::memory::PageAccess::kReadWrite, nullptr)) {
++        rex::diagnostics::freeze_logger::RecordMemoryRecovery(
++            rex::diagnostics::freeze_logger::MemoryRecoveryKind::kGuestVirtualStaleProtect,
++            virtual_address, guest_protect);
+         // Bounded logging: at most 32 distinct host pages are logged verbosely;
+         // after that a single summary line is emitted so a recovery storm
+         // cannot flood the log.
+@@ -608,6 +612,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                                rex::memory::PageAccess::kReadWrite, nullptr)) {
++        rex::diagnostics::freeze_logger::RecordMemoryRecovery(
++            rex::diagnostics::freeze_logger::MemoryRecoveryKind::kReleasedPhysical, virtual_address,
++            0);
+         // Bounded logging: at most 32 distinct host pages are logged verbosely;
+         // after that a single summary line is emitted so a recovery storm
+         // cannot flood the log.
+@@ -687,6 +694,9 @@ bool Memory::AccessViolationCallback(std::unique_lock<std::recursive_mutex> glob
+           reinterpret_cast<uintptr_t>(host_address) & ~(uintptr_t(host_page_size - 1));
+       if (rex::memory::Protect(reinterpret_cast<void*>(page_base), host_page_size,
+                                rex::memory::PageAccess::kReadWrite, nullptr)) {
++        rex::diagnostics::freeze_logger::RecordMemoryRecovery(
++            rex::diagnostics::freeze_logger::MemoryRecoveryKind::kStalePhysical, virtual_address,
++            guest_protect);
+         REXSYS_WARN(
+             "Recovered stale physical page protection for guest {:08X} (host {:016X}, "
+             "guest_protect {:08X})",
+-- 
+2.43.0
+

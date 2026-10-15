@@ -1,0 +1,84 @@
+From 760fbfbe702b6e05130032981b5549a451448a14 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 17:41:34 -0700
+Subject: [PATCH 09/97] vulkan: add debug_periodic_cache_clear diagnostic
+
+Every debug_periodic_cache_clear_frames (default 30) closed frames, after
+all queue work completes, clear one cache: texture (with the transient
+descriptor pools), render_target, or memory (shared-memory watches,
+primitive cache, vertex residency). Default off. Used to find which cache
+holds the stale state behind the in-match HUD-only blackout.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../rex/graphics/vulkan/command_processor.h   |  4 +++
+ src/graphics/vulkan/command_processor.cpp     | 31 +++++++++++++++++++
+ 2 files changed, 35 insertions(+)
+
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 5169d14..9073c58 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -531,6 +531,10 @@ class VulkanCommandProcessor : public CommandProcessor {
+ 
+   bool cache_clear_requested_ = false;
+ 
++  // debug_periodic_cache_clear state.
++  uint32_t periodic_cache_clear_frames_ = 0;
++  uint64_t periodic_cache_clears_ = 0;
++
+   // Host shader types that guest shaders can be translated into - they can
+   // access the shared memory (via vertex fetch, memory export, or manual index
+   // buffer reading) and textures.
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index f282e3d..6b4d4bc 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -48,6 +48,14 @@
+ #include <rex/ui/vulkan/presenter.h>
+ #include <rex/ui/vulkan/util.h>
+ 
++REXCVAR_DEFINE_STRING(debug_periodic_cache_clear, "", "GPU/Vulkan",
++                      "Diagnostic: every debug_periodic_cache_clear_frames frames, clear one "
++                      "cache: texture, render_target, or memory (shared-memory watches, "
++                      "primitive cache, vertex residency)")
++    .allowed({"", "texture", "render_target", "memory"});
++REXCVAR_DEFINE_INT32(debug_periodic_cache_clear_frames, 30, "GPU/Vulkan",
++                     "Frame period for debug_periodic_cache_clear");
++
+ // Legacy backend compatibility aliases for shared readback controls.
+ REXCVAR_DEFINE_BOOL(vulkan_readback_resolve, false, "GPU/Vulkan",
+                     "Read render-to-texture results on the CPU")
+@@ -5861,6 +5869,29 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+ 
+       shared_memory_->ClearCache();
+     }
++
++    const std::string& periodic_clear = REXCVAR_GET(debug_periodic_cache_clear);
++    int32_t periodic_clear_frames = REXCVAR_GET(debug_periodic_cache_clear_frames);
++    if (!periodic_clear.empty() && periodic_clear_frames > 0 &&
++        ++periodic_cache_clear_frames_ >= uint32_t(periodic_clear_frames) &&
++        AwaitAllQueueOperationsCompletion()) {
++      periodic_cache_clear_frames_ = 0;
++      ++periodic_cache_clears_;
++      if (periodic_clear == "texture") {
++        // Cached transient descriptor sets may reference the destroyed views.
++        ClearTransientDescriptorPools();
++        texture_cache_->ClearCache();
++      } else if (periodic_clear == "render_target") {
++        render_target_cache_->ClearCache();
++      } else if (periodic_clear == "memory") {
++        primitive_processor_->ClearCache();
++        shared_memory_->ClearCache();
++        InvalidateAllVertexBufferResidency();
++      }
++      if (periodic_cache_clears_ <= 3 || periodic_cache_clears_ % 500 == 0) {
++        REXGPU_INFO("Periodic cache clear #{}: {}", periodic_cache_clears_, periodic_clear);
++      }
++    }
+   }
+ 
+   return true;
+-- 
+2.43.0
+

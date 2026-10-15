@@ -1,0 +1,2558 @@
+From 85c972faa72b95962496e246cfc4f32409eb2ef2 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 12:48:59 -0700
+Subject: [PATCH 05/97] tests: unit tests for codegen, memory, MMIO and content
+ probe
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ tests/unit/CMakeLists.txt                     |  17 +-
+ tests/unit/codegen/jump_table_bias_test.cpp   | 641 +++++++++++++++
+ tests/unit/core/content_probe_test.cpp        | 778 ++++++++++++++++++
+ .../memory/access_violation_recovery_test.cpp | 326 ++++++++
+ tests/unit/memory/heap_allocation_test.cpp    |  25 +-
+ tests/unit/memory/test_memory.h               |  43 +
+ tests/unit/system/mmio_handler_test.cpp       | 630 ++++++++++++++
+ 7 files changed, 2437 insertions(+), 23 deletions(-)
+ create mode 100644 tests/unit/codegen/jump_table_bias_test.cpp
+ create mode 100644 tests/unit/core/content_probe_test.cpp
+ create mode 100644 tests/unit/memory/access_violation_recovery_test.cpp
+ create mode 100644 tests/unit/memory/test_memory.h
+ create mode 100644 tests/unit/system/mmio_handler_test.cpp
+
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 940052f..1ec8d08 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -2,6 +2,8 @@
+ 
+ add_executable(unit_tests
+     memory/heap_allocation_test.cpp
++    memory/access_violation_recovery_test.cpp
++    system/mmio_handler_test.cpp
+     kernel/object_table_test.cpp
+     core/cvar_test.cpp
+     core/fiber_test.cpp
+@@ -9,18 +11,31 @@ add_executable(unit_tests
+     core/stream_test.cpp
+     core/byte_order_test.cpp
+     core/chrono_test.cpp
++    core/content_probe_test.cpp
+     codegen/config_test.cpp
+     codegen/template_registry_test.cpp
++    codegen/jump_table_bias_test.cpp
+ )
+ 
+ target_include_directories(unit_tests PRIVATE
+     ${PROJECT_SOURCE_DIR}/include
+ )
+ 
+-target_link_libraries(unit_tests PRIVATE
++# rexsystem references rexkernel symbols; rescan the pair so the static link
++# resolves them regardless of the generated link order. The `$<LINK_GROUP>`
++# generator expression is not supported by every toolchain (e.g. MSVC), so it
++# is only added on non-Windows hosts (cycle-9 C3); other presets are unaffected.
++set(unit_tests_link_libs
+     rexcore
+     rexcodegen
+     rexkernel
++)
++if(NOT WIN32)
++    list(APPEND unit_tests_link_libs "$<LINK_GROUP:RESCAN,rexkernel,rexsystem>")
++endif()
++
++target_link_libraries(unit_tests PRIVATE
++    ${unit_tests_link_libs}
+     Catch2::Catch2WithMain
+ )
+ 
+diff --git a/tests/unit/codegen/jump_table_bias_test.cpp b/tests/unit/codegen/jump_table_bias_test.cpp
+new file mode 100644
+index 0000000..cae32e3
+--- /dev/null
++++ b/tests/unit/codegen/jump_table_bias_test.cpp
+@@ -0,0 +1,641 @@
++/**
++ * @file        tests/unit/codegen/jump_table_bias_test.cpp
++ * @brief       Regression test for the bctr jump-table index-bias / union-window fix
++ *
++ * Root cause (WWE '13, guest 0x83361A14): the compiler bounds the raw index
++ * with `clrlwi r7,r9,30` and then adds a constant bias with
++ * `addi r7,r7,7` before scaling and indexing the table:
++ *
++ *     clrlwi  r7, r9, 30
++ *     addi    r7, r7, 7
++ *     rlwinm  r0, r7, 2, 0, 29
++ *     lis     r12, 0x8201
++ *     addi    r12, r12, 0x20
++ *     lwzx    r0, r12, r0
++ *     mtctr   r0
++ *     bctr
++ *
++ * Pre-fix, `detectJumpTable` treated the `addi r7,r7,7` as an index overwrite
++ * and read the table from its un-biased base (entries 0..3); the guest index
++ * is 7..10, so the emitted `switch` fell through to `default: __builtin_trap()`.
++ * The cycle-8 fix captured the bias and emitted `case 7..10`, but the bias is
++ * CONDITIONAL in the real binary: a sibling path reaches the same shared bctr
++ * with the un-biased index (path A: `clrlwi rX,rS,29; cmplwi cr6,rX,7; bne
++ * <setup>` -> 0..6; path B falls through `clrlwi rX,rS,30; addi rX,rX,7` ->
++ * 7..10), so the shared 11-entry table covers the UNION [0, 11).
++ *
++ * Cycle-9 union mode: entries are read from the UN-BIASED base over
++ * [0, unionCount) and `indexBias` is 0, so `build_bctr` emits plain
++ * `case 0..unionCount-1` labels. For a self-addi bias unionCount is
++ * `indexBias + maxEntries`; for a cross-register bias committed by a mask
++ * proof (cycle 7) the path-B window is only `2^(32-MB)` entries wide, so
++ * unionCount = max(path-A bounds count, indexBias + 2^(32-MB)) -- the real
++ * sites read 11 entries (cases 0..10), not the 15 the old sum over-read.
++ * Cycle-9b (review F2) tightens the gate: union mode is
++ * only entered when the DUAL-WINDOW pattern is actually detected -- a
++ * `cmplwi/cmpwi cr?,rX,K` bounds check on the same index register with
++ * K == indexBias whose immediately following conditional branch skips the
++ * re-mask+bias block (branch target beyond the bias instruction, still inside
++ * the table setup). Otherwise the cycle-8 biased-window behavior is preserved
++ * (`indexBias` kept, entries read from the biased base). The union entry count
++ * is computed in uint64 and must not exceed `max_jump_table_entries`; on
++ * overflow/cap-exceed union mode is rejected and the biased window is used
++ * (never an unbounded read). A partial union switch is never emitted: any
++ * mid-window read/validation failure returns nullopt and the emission falls
++ * back to the guest-exact `PPC_CALL_INDIRECT_FUNC(ctx.ctr.u32)`.
++ *
++ * The test drives the production detector directly on a synthetic in-memory
++ * PPC binary (assembled instruction words; the exact sequences are the ones
++ * below). Coverage boundary: this asserts detection + bias arithmetic; the
++ * generated `case 0..10` C++ is verified against the real WWE '13 binary in
++ * the cycle-9 generated-code check.
++ *
++ * Instruction words were assembled with
++ *   powerpc-none-elf-as -a32 -be -mregnames -mpower7
++ * and disassembled back with powerpc-none-elf-objdump.
++ * NOTE (cycle 9): the dual-window words in the task brief for `clrlwi r7,r9,29`
++ * and `bne cr6,+8` were re-derived (no assembler is installed here) — the
++ * brief's 0x5527078E decodes to MB=30/ME=7 (not a clrlwi 29) and 0x40860008
++ * decodes to BI=6 (cr1, not cr6). The corrected words are 0x5527077E and
++ * 0x409A000C; see the constants below.
++ * NOTE (cycle 9b, review F1): the first corrected branch word 0x409A0008 has
++ * BD=+8, so it branched from 0x08 to 0x10 (the path-B `addi r7,r7,7`); both
++ * paths then applied the bias and the section did not exercise the dual-window
++ * split. The word is now 0x409A000C (BD=+0x0C), which branches from 0x08 to
++ * 0x14 and skips BOTH the re-mask at 0x0C and the bias at 0x10; the section
++ * asserts that displacement explicitly.
++ */
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <cstdint>
++#include <vector>
++
++#include <rex/codegen/binary_view.h>
++#include <rex/codegen/code_region.h>
++#include <rex/codegen/function_scanner.h>
++#include <rex/codegen/test_support.h>
++
++#include "../../../src/codegen/decoded_binary.h"
++
++namespace {
++
++using rex::codegen::BinaryView;
++using rex::codegen::CodeRegion;
++using rex::codegen::DecodedBinary;
++using rex::codegen::TestModule;
++
++constexpr uint32_t kBase = 0x82010000;
++
++// Instruction words (big-endian).
++constexpr uint32_t kClrlwi_r7_r9_30 = 0x552707BE;
++constexpr uint32_t kClrlwi_r7_r9_29 = 0x5527077E;  // corrected (brief said 0x5527078E)
++constexpr uint32_t kAddi_r7_r7_7 = 0x38E70007;
++constexpr uint32_t kOri_r7_r7_7 = 0x60E70007;
++constexpr uint32_t kRlwinm_r0_r7_2 = 0x54E0103A;
++constexpr uint32_t kRlwinm_r5_r7_2 = 0x54E5103A;  // rlwinm r5,r7,2,0,29
++constexpr uint32_t kAddi_r5_r5_7 = 0x38A50007;    // addi r5,r5,7 (RA!=0 -> stays addi)
++constexpr uint32_t kLis_r12_8201 = 0x3D808201;
++constexpr uint32_t kAddi_r12_r12_20 = 0x398C0020;
++constexpr uint32_t kAddi_r12_r12_24 = 0x398C0024;
++constexpr uint32_t kAddi_r12_r12_2C = 0x398C002C;
++constexpr uint32_t kLwzx_r0_r12_r0 = 0x7C0C002E;
++constexpr uint32_t kLwzx_r0_r12_r5 = 0x7C0C282E;  // lwzx r0,r12,r5
++constexpr uint32_t kMtctr_r0 = 0x7C0903A6;
++constexpr uint32_t kBctr = 0x4E800420;
++constexpr uint32_t kCmplwi_cr6_r7_3 = 0x2B070003;
++constexpr uint32_t kCmplwi_cr6_r7_7 = 0x2B070007;
++constexpr uint32_t kBgt_cr6_to_0x24 = 0x4199001C;
++constexpr uint32_t kBne_cr6_to_0x14 = 0x409A000C;  // F1: BD=+0x0C -> 0x14 (skips re-mask+bias)
++constexpr uint32_t kNop = 0x60000000;
++// Oversized-window constants (F2b cap tests; see the sections below).
++constexpr uint32_t kCmplwi_cr6_r7_520 = 0x2B070208;  // cmplwi cr6,r7,520
++constexpr uint32_t kCmplwi_cr6_r7_600 = 0x2B070258;  // cmplwi cr6,r7,600
++constexpr uint32_t kAddi_r7_r7_520 = 0x38E70208;     // addi r7,r7,520
++
++// Cross-register dual-window constants (cycle 6; real WWE '13 shape at
++// 0x83362BE4): the bias addi writes a DIFFERENT register than it reads
++// (`addi r19,r11,7`, RT=19 != RA=11), so the index-bias capture must trace
++// through the source register r11 and commit on its clrlwi mask.
++// Derivation (rlwinm = 21<<26 | RS<<21 | RA<<16 | SH<<11 | MB<<6 | ME<<1;
++// cmpli = 10<<26 | BF<<23 | L<<21 | RA<<16 | UIMM; addi = 14<<26 | RT<<21 |
++// RA<<16 | SIMM):
++//   clrlwi r19,r10,29    = rlwinm r19,r10,0,29,31 -> 0x54000000 | 10<<21 |
++//                          19<<16 | 29<<6 | 31<<1 = 0x5553077E
++//   clrlwi r11,r11,30    = rlwinm r11,r11,0,30,31 -> 0x54000000 | 11<<21 |
++//                          11<<16 | 30<<6 | 31<<1 = 0x556B07BE
++//   cmplwi cr6,r19,7     = 0x28000000 | 6<<23 | 19<<16 | 7 = 0x2B130007
++//   addi r19,r11,7       = 0x38000000 | 19<<21 | 11<<16 | 7 = 0x3A6B0007
++//   rlwinm r0,r19,2,0,29 = 0x54000000 | 19<<21 | 2<<11 | 29<<1 = 0x5660103A
++constexpr uint32_t kClrlwi_r19_r10_29 = 0x5553077E;
++constexpr uint32_t kClrlwi_r11_r11_30 = 0x556B07BE;
++constexpr uint32_t kCmplwi_cr6_r19_7 = 0x2B130007;
++constexpr uint32_t kAddi_r19_r11_7 = 0x3A6B0007;
++constexpr uint32_t kRlwinm_r0_r19_2 = 0x5660103A;
++
++void append_word(std::vector<uint8_t>& bytes, uint32_t word) {
++  bytes.push_back(static_cast<uint8_t>(word >> 24));
++  bytes.push_back(static_cast<uint8_t>(word >> 16));
++  bytes.push_back(static_cast<uint8_t>(word >> 8));
++  bytes.push_back(static_cast<uint8_t>(word));
++}
++
++uint32_t case_addr(uint32_t case_base, uint32_t index) { return case_base + 8 * index; }
++
++// 11 case bodies: `li r3, 0x100+i; blr` each (also the jump-table targets).
++void append_case_bodies(std::vector<uint8_t>& bytes, uint32_t count) {
++  for (uint32_t i = 0; i < count; i++) {
++    append_word(bytes, 0x38600000u | (0x100u + i));  // li r3, 0x100+i
++    append_word(bytes, 0x4E800020u);                 // blr
++  }
++}
++
++// 11-entry absolute table; entry i points at case body i.
++void append_table(std::vector<uint8_t>& bytes, uint32_t case_base) {
++  for (uint32_t i = 0; i < 11; i++) {
++    append_word(bytes, case_addr(case_base, i));
++  }
++}
++
++// N-entry absolute table; entry i points at case body i.
++void append_table_n(std::vector<uint8_t>& bytes, uint32_t count, uint32_t case_base) {
++  for (uint32_t i = 0; i < count; i++) {
++    append_word(bytes, case_addr(case_base, i));
++  }
++}
++
++// Single-path biased shape: clrlwi bounds -> addi bias -> scaled lwzx ->
++// mtctr/bctr. There is NO `cmplwi r7,7` dual-window discriminator, so (cycle
++// 9b F2a) union mode must NOT be entered and the cycle-8 biased window is
++// used. bctr at 0x8201001C, table at 0x82010020, case bodies at 0x8201004C.
++std::vector<uint8_t> biased_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r7_r9_30);  // 0x00: bounds 0..3
++  append_word(bytes, kAddi_r7_r7_7);     // 0x04: bias +7
++  append_word(bytes, kRlwinm_r0_r7_2);   // 0x08
++  append_word(bytes, kLis_r12_8201);     // 0x0C
++  append_word(bytes, kAddi_r12_r12_20);  // 0x10: table = 0x82010020
++  append_word(bytes, kLwzx_r0_r12_r0);   // 0x14
++  append_word(bytes, kMtctr_r0);         // 0x18
++  append_word(bytes, kBctr);             // 0x1C
++  append_table(bytes, kBase + 0x4C);     // 0x20..0x4B
++  append_case_bodies(bytes, 11);         // 0x4C..0xA3
++  return bytes;
++}
++
++// Same sequence without the bias addi; bctr at 0x82010018.
++std::vector<uint8_t> unbiased_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r7_r9_30);  // 0x00
++  append_word(bytes, kRlwinm_r0_r7_2);   // 0x04
++  append_word(bytes, kLis_r12_8201);     // 0x08
++  append_word(bytes, kAddi_r12_r12_20);  // 0x0C: table = 0x82010020
++  append_word(bytes, kLwzx_r0_r12_r0);   // 0x10
++  append_word(bytes, kMtctr_r0);         // 0x14
++  append_word(bytes, kBctr);             // 0x18
++  append_word(bytes, kNop);              // 0x1C
++  append_table(bytes, kBase + 0x4C);     // 0x20..0x4B
++  append_case_bodies(bytes, 11);         // 0x4C..0xA3
++  return bytes;
++}
++
++// Bias BEFORE a register-writing bounds check cannot be captured (tracing stops
++// at the clrlwi), so the un-biased window is used. bctr at 0x8201001C,
++// table at 0x82010020, case bodies at 0x8201004C.
++std::vector<uint8_t> bias_before_clrlwi_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kAddi_r7_r7_7);     // 0x00: bias first
++  append_word(bytes, kClrlwi_r7_r9_30);  // 0x04: bounds 0..3 (writes r7)
++  append_word(bytes, kRlwinm_r0_r7_2);   // 0x08
++  append_word(bytes, kLis_r12_8201);     // 0x0C
++  append_word(bytes, kAddi_r12_r12_20);  // 0x10: table = 0x82010020
++  append_word(bytes, kLwzx_r0_r12_r0);   // 0x14
++  append_word(bytes, kMtctr_r0);         // 0x18
++  append_word(bytes, kBctr);             // 0x1C
++  append_table(bytes, kBase + 0x4C);     // 0x20..0x4B
++  append_case_bodies(bytes, 11);         // 0x4C..0xA3
++  return bytes;
++}
++
++// Bias captured but positioned BEFORE a non-writing bounds check (cmplwi):
++// exercises the positional discriminator (biasAddr > bounds.checkAddr).
++// bctr at 0x82010020, table at 0x82010024, case bodies at 0x82010050.
++std::vector<uint8_t> bias_before_cmpli_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kAddi_r7_r7_7);     // 0x00: bias
++  append_word(bytes, kCmplwi_cr6_r7_3);  // 0x04: bounds 0..3 (no register write)
++  append_word(bytes, kBgt_cr6_to_0x24);  // 0x08: conditional branch to 0x24
++  append_word(bytes, kRlwinm_r0_r7_2);   // 0x0C
++  append_word(bytes, kLis_r12_8201);     // 0x10
++  append_word(bytes, kAddi_r12_r12_24);  // 0x14: table = 0x82010024
++  append_word(bytes, kLwzx_r0_r12_r0);   // 0x18
++  append_word(bytes, kMtctr_r0);         // 0x1C
++  append_word(bytes, kBctr);             // 0x20
++  append_table(bytes, kBase + 0x50);     // 0x24..0x4F
++  append_case_bodies(bytes, 11);         // 0x50..0xA7
++  return bytes;
++}
++
++// Dual-window shared bctr (the real WWE '13 shape): path A bounds-checks the
++// raw index with clrlwi 29 / cmplwi 7 / bne (un-biased 0..6); the fall-through
++// path B re-masks with clrlwi 30 and adds the +7 bias (7..10). The path-A
++// branch at 0x08 (0x409A000C, BD=+0x0C) targets 0x14, so it skips BOTH the
++// re-mask at 0x0C (`clrlwi r7,r9,30`) and the bias at 0x10 (`addi r7,r7,7`)
++// and lands on the shared setup (`rlwinm`). The shared 11-entry table covers
++// the union 0..10. bctr at 0x82010028, table at 0x8201002C (lis 0x8201 + addi
++// 0x2C; the brief's +0x20 would point at the lwzx/mtctr/bctr words and cannot
++// hold the 11-entry table), case bodies at 0x82010058.
++std::vector<uint8_t> dual_window_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r7_r9_29);   // 0x00: path A bounds 0..7
++  append_word(bytes, kCmplwi_cr6_r7_7);   // 0x04: compare with 7 (K == bias)
++  append_word(bytes, kBne_cr6_to_0x14);   // 0x08: path A -> 0x14 (skips 0x0C/0x10)
++  append_word(bytes, kClrlwi_r7_r9_30);   // 0x0C: path B re-mask 0..3
++  append_word(bytes, kAddi_r7_r7_7);      // 0x10: path B bias +7 -> 7..10
++  append_word(bytes, kRlwinm_r0_r7_2);    // 0x14: shared setup
++  append_word(bytes, kLis_r12_8201);      // 0x18
++  append_word(bytes, kAddi_r12_r12_2C);   // 0x1C: table = 0x8201002C
++  append_word(bytes, kLwzx_r0_r12_r0);    // 0x20
++  append_word(bytes, kMtctr_r0);          // 0x24
++  append_word(bytes, kBctr);              // 0x28
++  append_table(bytes, kBase + 0x58);      // 0x2C..0x57 (11 entries)
++  append_case_bodies(bytes, 11);          // 0x58..0xAF
++  return bytes;
++}
++
++// Cross-register dual-window (cycle 6, real WWE '13 shape at 0x83362BE4;
++// union count corrected in cycle 7): path A masks the raw index to 29 bits
++// (`clrlwi r19,r10,29`), bounds-checks it against 7 and branches to the shared
++// setup (un-biased 0..7); path B falls through, re-masks r11 to 30 bits and
++// adds the +7 bias into a DIFFERENT register (`addi r19,r11,7`, RT=19 !=
++// RA=11) giving 7..10. The traced index register is r19 (the addi
++// destination), so the bias addi is cross-register; the clrlwi on r11 is the
++// mask proof that commits the pending candidate, and its MB=30 fixes the
++// path-B window at 2^(32-30) = 4 entries. The union count is
++// max(path-A bounds 8, bias 7 + 4) = 11 (NOT the old bias+bounds sum 15, which
++// over-read four data words and rejected the table), so the shared 11-entry
++// table covers 0..10. bctr at 0x82010028, table at 0x8201002C, case bodies at
++// 0x82010058.
++std::vector<uint8_t> cross_register_dual_window_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r19_r10_29);  // 0x00: path A bounds 0..7
++  append_word(bytes, kCmplwi_cr6_r19_7);   // 0x04: compare with 7 (K == bias)
++  append_word(bytes, kBne_cr6_to_0x14);    // 0x08: path A -> 0x14 (skips 0x0C/0x10)
++  append_word(bytes, kClrlwi_r11_r11_30);  // 0x0C: path B re-mask 0..3
++  append_word(bytes, kAddi_r19_r11_7);     // 0x10: path B bias +7 (cross-register)
++  append_word(bytes, kRlwinm_r0_r19_2);    // 0x14: shared setup
++  append_word(bytes, kLis_r12_8201);       // 0x18
++  append_word(bytes, kAddi_r12_r12_2C);    // 0x1C: table = 0x8201002C
++  append_word(bytes, kLwzx_r0_r12_r0);     // 0x20
++  append_word(bytes, kMtctr_r0);           // 0x24
++  append_word(bytes, kBctr);               // 0x28
++  append_table_n(bytes, 11, kBase + 0x58); // 0x2C..0x57 (11 entries)
++  append_case_bodies(bytes, 11);           // 0x58..0xAF
++  return bytes;
++}
++
++// Negative cross-register fixture: the same 11-entry table, but ENTRY 10 (the
++// final required entry, at 0x54) holds a NOP word (0x60000000) instead of a
++// code pointer. Union mode reads exactly 11 entries (cycle-7 count); entry 10's
++// value is not a target inside the region -> union mode rejects and
++// detectJumpTable returns nullopt, so build_bctr falls back to
++// PPC_CALL_INDIRECT_FUNC.
++std::vector<uint8_t> cross_register_short_table_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r19_r10_29);  // 0x00: path A bounds 0..7
++  append_word(bytes, kCmplwi_cr6_r19_7);   // 0x04: compare with 7 (K == bias)
++  append_word(bytes, kBne_cr6_to_0x14);    // 0x08: path A -> 0x14 (skips 0x0C/0x10)
++  append_word(bytes, kClrlwi_r11_r11_30);  // 0x0C: path B re-mask 0..3
++  append_word(bytes, kAddi_r19_r11_7);     // 0x10: path B bias +7 (cross-register)
++  append_word(bytes, kRlwinm_r0_r19_2);    // 0x14: shared setup
++  append_word(bytes, kLis_r12_8201);       // 0x18
++  append_word(bytes, kAddi_r12_r12_2C);    // 0x1C: table = 0x8201002C
++  append_word(bytes, kLwzx_r0_r12_r0);     // 0x20
++  append_word(bytes, kMtctr_r0);           // 0x24
++  append_word(bytes, kBctr);               // 0x28
++  append_table_n(bytes, 10, kBase + 0x58); // 0x2C..0x53 (entries 0..9)
++  append_word(bytes, kNop);                // 0x54: entry 10 -> 0x60000000 (not a target)
++  append_case_bodies(bytes, 11);           // 0x58..0xAF
++  return bytes;
++}
++
++// Negative (P1 ori guard): a self-`ori r7,r7,7` must NOT be captured as an
++// index bias (OR can collapse indices: 0..3 | 7 == 7), so the un-biased window
++// is read. bctr at 0x8201001C, table at 0x82010020, case bodies at 0x8201004C.
++std::vector<uint8_t> ori_bias_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r7_r9_30);  // 0x00: bounds 0..3
++  append_word(bytes, kOri_r7_r7_7);      // 0x04: ori bias (must be ignored)
++  append_word(bytes, kRlwinm_r0_r7_2);   // 0x08
++  append_word(bytes, kLis_r12_8201);     // 0x0C
++  append_word(bytes, kAddi_r12_r12_20);  // 0x10: table = 0x82010020
++  append_word(bytes, kLwzx_r0_r12_r0);   // 0x14
++  append_word(bytes, kMtctr_r0);         // 0x18
++  append_word(bytes, kBctr);             // 0x1C
++  append_table(bytes, kBase + 0x4C);     // 0x20..0x4B
++  append_case_bodies(bytes, 11);         // 0x4C..0xA3
++  return bytes;
++}
++
++// Negative (P1 post-scale guard): a self-addi on the SCALED register
++// (`rlwinm r5,r7,2; addi r5,r5,7`) is a byte-offset adjustment, not an element
++// bias, so it must NOT be captured (indexBias == 0, un-biased window read).
++// The scaled register is r5 rather than r0 because `addi r0,r0,N` decodes as
++// `li` (RA=0), which would never reach the addi bias-capture path and so would
++// not exercise the guard. bctr at 0x8201001C, table at 0x82010020, case bodies
++// at 0x8201004C.
++std::vector<uint8_t> scaled_bias_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r7_r9_30);  // 0x00: bounds 0..3
++  append_word(bytes, kRlwinm_r5_r7_2);   // 0x04: scale r7 -> r5
++  append_word(bytes, kAddi_r5_r5_7);     // 0x08: post-scale addi (must be ignored)
++  append_word(bytes, kLis_r12_8201);     // 0x0C
++  append_word(bytes, kAddi_r12_r12_20);  // 0x10: table = 0x82010020
++  append_word(bytes, kLwzx_r0_r12_r5);   // 0x14
++  append_word(bytes, kMtctr_r0);         // 0x18
++  append_word(bytes, kBctr);             // 0x1C
++  append_table(bytes, kBase + 0x4C);     // 0x20..0x4B
++  append_case_bodies(bytes, 11);         // 0x4C..0xA3
++  return bytes;
++}
++
++// Oversized-bias dual-window (F2b): the union window [0, bias+count) would be
++// 520 + 4 = 524 entries > max_jump_table_entries (512), so union mode must be
++// rejected and the cycle-8 biased window used. The biased entries live at
++// tableBase = 0x8201002C + 520*4; the gap before them is NOP-filled, so a
++// union read would read 0x60000000 as entry 0, which is not a code target and
++// is rejected -- this test fails if the cap check is missing. (The gap cannot
++// be zero-filled: a >=2-word null run splits the decoded code region, which
++// would also put the biased entries outside `containingRegion`.) bctr at
++// 0x82010028.
++std::vector<uint8_t> oversized_bias_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r7_r9_29);    // 0x00: path A bounds 0..7
++  append_word(bytes, kCmplwi_cr6_r7_520);  // 0x04: K == bias (520)
++  append_word(bytes, kBne_cr6_to_0x14);    // 0x08: path A -> 0x14 (skips 0x0C/0x10)
++  append_word(bytes, kClrlwi_r7_r9_30);    // 0x0C: path B re-mask 0..3
++  append_word(bytes, kAddi_r7_r7_520);     // 0x10: path B bias +520
++  append_word(bytes, kRlwinm_r0_r7_2);     // 0x14: shared setup
++  append_word(bytes, kLis_r12_8201);       // 0x18
++  append_word(bytes, kAddi_r12_r12_2C);    // 0x1C: table = 0x8201002C
++  append_word(bytes, kLwzx_r0_r12_r0);     // 0x20
++  append_word(bytes, kMtctr_r0);           // 0x24
++  append_word(bytes, kBctr);               // 0x28
++  // NOP gap up to the biased window at 0x2C + 520*4 (see the comment above:
++  // nulls would split the code region).
++  while (bytes.size() < 0x2C + 520 * 4) append_word(bytes, kNop);
++  const uint32_t case_base = kBase + 0x2C + 520 * 4 + 4 * 4;  // after 4 entries
++  for (uint32_t i = 0; i < 4; i++) append_word(bytes, case_addr(case_base, i));
++  append_case_bodies(bytes, 4);
++  return bytes;
++}
++
++// Oversized-bounds dual-window (F2b): the bounds check carries a 600 immediate
++// (601 entries) and the +7 bias makes the union 7 + 601 = 608 entries >
++// max_jump_table_entries (512), so union mode must be rejected. The fallback is
++// the cycle-8 biased-window read (601 entries from tableBase = 0x8201002C +
++// 7*4), i.e. bounded by the bounds immediate, not by the union cap.
++// bctr at 0x82010028.
++std::vector<uint8_t> oversized_bounds_binary() {
++  std::vector<uint8_t> bytes;
++  append_word(bytes, kClrlwi_r7_r9_29);    // 0x00: path A bounds 0..7
++  append_word(bytes, kCmplwi_cr6_r7_7);    // 0x04: K == bias (dual-window check)
++  append_word(bytes, kBne_cr6_to_0x14);    // 0x08: path A -> 0x14 (skips 0x0C/0x10)
++  append_word(bytes, kCmplwi_cr6_r7_600);  // 0x0C: oversized bounds (601 entries)
++  append_word(bytes, kAddi_r7_r7_7);       // 0x10: path B bias +7
++  append_word(bytes, kRlwinm_r0_r7_2);     // 0x14: shared setup
++  append_word(bytes, kLis_r12_8201);       // 0x18
++  append_word(bytes, kAddi_r12_r12_2C);    // 0x1C: table = 0x8201002C
++  append_word(bytes, kLwzx_r0_r12_r0);     // 0x20
++  append_word(bytes, kMtctr_r0);           // 0x24
++  append_word(bytes, kBctr);               // 0x28
++  // 608 entries: the union window [0, 608) would be read if union mode were
++  // (wrongly) entered; the biased window reads entries 7..607.
++  const uint32_t case_base = kBase + 0x2C + 608 * 4;
++  for (uint32_t i = 0; i < 608; i++) append_word(bytes, case_addr(case_base, i));
++  append_case_bodies(bytes, 608);
++  return bytes;
++}
++
++struct Detection {
++  bool found = false;
++  int32_t indexBias = 0;
++  uint32_t tableAddress = 0;
++  uint8_t indexRegister = 0xFF;
++  std::vector<uint32_t> targets;
++};
++
++Detection detect(const std::vector<uint8_t>& bytes, uint32_t bctrAddr) {
++  TestModule module;
++  module.Load(kBase, bytes.data(), bytes.size());
++
++  BinaryView view = BinaryView::fromModule(module);
++  DecodedBinary decoded(view);
++  decoded.decode();
++
++  Detection result;
++  const CodeRegion* region = decoded.regionContaining(bctrAddr);
++  REQUIRE(region != nullptr);
++
++  auto jt = rex::codegen::detectJumpTable(decoded, bctrAddr, *region, kBase, region->end);
++  if (jt) {
++    result.found = true;
++    result.indexBias = jt->indexBias;
++    result.tableAddress = jt->tableAddress;
++    result.indexRegister = jt->indexRegister;
++    result.targets = jt->targets;
++  }
++  return result;
++}
++
++}  // namespace
++
++TEST_CASE("jump table index bias", "[jump_table]") {
++  SECTION("single-path biased table (no cmplwi-split) keeps the biased window") {
++    auto bytes = biased_binary();
++    Detection d = detect(bytes, kBase + 0x1C);
++
++    REQUIRE(d.found);
++    // F2a: there is no `cmplwi r7,7` dual-window discriminator, so there is no
++    // proof of an un-biased sibling path; the cycle-8 biased window is kept
++    // (indexBias == 7, entries read from the biased base).
++    CHECK(d.indexBias == 7);
++    CHECK(d.indexRegister == 7);
++    CHECK(d.tableAddress == kBase + 0x20);
++    CHECK(d.targets.size() == 4);
++
++    // Entries 7..10 of the 11-entry table (case bodies 7..10).
++    const std::vector<uint32_t> biased_window = {kBase + 0x84, kBase + 0x8C, kBase + 0x94,
++                                                 kBase + 0x9C};
++    CHECK(d.targets == biased_window);
++
++    // The pre-fix (un-biased 0..3) read would have returned entries 0..3.
++    const std::vector<uint32_t> unbiased_window = {kBase + 0x4C, kBase + 0x54, kBase + 0x5C,
++                                                   kBase + 0x64};
++    CHECK(d.targets != unbiased_window);
++
++    // Emission contract: build_bctr prints `case i + indexBias` -> cases 7..10.
++    for (size_t i = 0; i < d.targets.size(); i++) {
++      CHECK(static_cast<int32_t>(i) + d.indexBias == static_cast<int32_t>(i) + 7);
++    }
++    CHECK(static_cast<int32_t>(d.targets.size() - 1) + d.indexBias == 10);
++  }
++
++  SECTION("no bias addi reads the un-biased table window") {
++    auto bytes = unbiased_binary();
++    Detection d = detect(bytes, kBase + 0x18);
++
++    REQUIRE(d.found);
++    CHECK(d.indexBias == 0);
++    CHECK(d.tableAddress == kBase + 0x20);
++    const std::vector<uint32_t> unbiased_window = {kBase + 0x4C, kBase + 0x54, kBase + 0x5C,
++                                                   kBase + 0x64};
++    CHECK(d.targets == unbiased_window);
++  }
++
++  SECTION("bias before a register-writing bounds check is not a table offset") {
++    auto bytes = bias_before_clrlwi_binary();
++    Detection d = detect(bytes, kBase + 0x1C);
++
++    REQUIRE(d.found);
++    CHECK(d.indexBias == 0);
++    const std::vector<uint32_t> unbiased_window = {kBase + 0x4C, kBase + 0x54, kBase + 0x5C,
++                                                   kBase + 0x64};
++    CHECK(d.targets == unbiased_window);
++  }
++
++  SECTION("bias before a non-writing bounds check is rejected positionally") {
++    auto bytes = bias_before_cmpli_binary();
++    Detection d = detect(bytes, kBase + 0x20);
++
++    REQUIRE(d.found);
++    CHECK(d.indexBias == 0);
++    CHECK(d.tableAddress == kBase + 0x24);
++    const std::vector<uint32_t> unbiased_window = {kBase + 0x50, kBase + 0x58, kBase + 0x60,
++                                                   kBase + 0x68};
++    CHECK(d.targets == unbiased_window);
++  }
++
++  SECTION("dual-window shared bctr reads the 11-entry union window (cases 0..10)") {
++    auto bytes = dual_window_binary();
++
++    // F1: the path-A branch word itself must skip BOTH path-B instructions.
++    // From its address (0x08) the +0x0C displacement lands on the shared setup
++    // at 0x14, i.e. past the re-mask at 0x0C (`clrlwi r7,r9,30`) and past the
++    // bias at 0x10 (`addi r7,r7,7`).
++    const int32_t branch_disp = static_cast<int16_t>(kBne_cr6_to_0x14 & 0x0000FFFCu);
++    CHECK((kBase + 0x08) + static_cast<uint32_t>(branch_disp) == kBase + 0x14);
++    CHECK((kBase + 0x08) + static_cast<uint32_t>(branch_disp) > kBase + 0x10);
++
++    Detection d = detect(bytes, kBase + 0x28);
++
++    REQUIRE(d.found);
++    // Union mode: the +7 bias is conditional (path A reaches the table
++    // un-biased), so the union [0, 7+4) is read from the un-biased base and
++    // the emission is plain cases 0..10.
++    CHECK(d.indexBias == 0);
++    CHECK(d.indexRegister == 7);
++    CHECK(d.tableAddress == kBase + 0x2C);
++    CHECK(d.targets.size() == 11);
++
++    std::vector<uint32_t> all_cases;
++    for (uint32_t i = 0; i < 11; i++) all_cases.push_back(kBase + 0x58 + 8 * i);
++    CHECK(d.targets == all_cases);
++
++    // Emission contract: cases 0..10 (no partial union switch).
++    for (size_t i = 0; i < d.targets.size(); i++) {
++      CHECK(static_cast<int32_t>(i) + d.indexBias == static_cast<int32_t>(i));
++    }
++    CHECK(static_cast<int32_t>(d.targets.size() - 1) + d.indexBias == 10);
++  }
++
++  SECTION("oversized bias rejects union mode and keeps the biased window (F2b)") {
++    auto bytes = oversized_bias_binary();
++    Detection d = detect(bytes, kBase + 0x28);
++
++    REQUIRE(d.found);
++    // Union count 520 + 4 = 524 > max_jump_table_entries (512): union mode is
++    // rejected, the biased window [520, 524) is read from the biased base.
++    CHECK(d.indexBias == 520);
++    CHECK(d.tableAddress == kBase + 0x2C);
++    CHECK(d.targets.size() == 4);
++
++    const uint32_t case_base = kBase + 0x2C + 520 * 4 + 4 * 4;
++    std::vector<uint32_t> biased_cases;
++    for (uint32_t i = 0; i < 4; i++) biased_cases.push_back(case_addr(case_base, i));
++    CHECK(d.targets == biased_cases);
++  }
++
++  SECTION("oversized bounds rejects union mode and keeps the biased window (F2b)") {
++    auto bytes = oversized_bounds_binary();
++    Detection d = detect(bytes, kBase + 0x28);
++
++    REQUIRE(d.found);
++    // Union count 7 + 601 = 608 > max_jump_table_entries (512): union mode is
++    // rejected; the cycle-8 biased window reads the 601 entries bounded by the
++    // bounds immediate, starting at table entry 7.
++    CHECK(d.indexBias == 7);
++    CHECK(d.tableAddress == kBase + 0x2C);
++    CHECK(d.targets.size() == 601);
++
++    const uint32_t case_base = kBase + 0x2C + 608 * 4;
++    CHECK(d.targets.front() == case_addr(case_base, 7));
++    CHECK(d.targets.back() == case_addr(case_base, 607));
++  }
++
++  SECTION("self-ori bias is not captured (P1 ori guard)") {
++    auto bytes = ori_bias_binary();
++    Detection d = detect(bytes, kBase + 0x1C);
++
++    REQUIRE(d.found);
++    CHECK(d.indexBias == 0);
++    CHECK(d.tableAddress == kBase + 0x20);
++    const std::vector<uint32_t> unbiased_window = {kBase + 0x4C, kBase + 0x54, kBase + 0x5C,
++                                                   kBase + 0x64};
++    CHECK(d.targets == unbiased_window);
++  }
++
++  SECTION("post-scale self-addi is not captured (P1 scaled-register guard)") {
++    auto bytes = scaled_bias_binary();
++    Detection d = detect(bytes, kBase + 0x1C);
++
++    REQUIRE(d.found);
++    CHECK(d.indexBias == 0);
++    CHECK(d.tableAddress == kBase + 0x20);
++    const std::vector<uint32_t> unbiased_window = {kBase + 0x4C, kBase + 0x54, kBase + 0x5C,
++                                                   kBase + 0x64};
++    CHECK(d.targets == unbiased_window);
++  }
++
++  SECTION("cross-register bias dual-window reads the 11-entry union window (cases 0..10)") {
++    auto bytes = cross_register_dual_window_binary();
++    Detection d = detect(bytes, kBase + 0x28);
++
++    REQUIRE(d.found);
++    // The pending candidate is committed by the clrlwi mask on the SOURCE
++    // register (r11) with MB=30, so path B is 2^(32-30) = 4 entries wide; the
++    // union count is max(path-A bounds 8, bias 7 + 4) = 11. The traced index
++    // register stays r19 (the addi destination) and union mode emits plain
++    // cases 0..10.
++    CHECK(d.indexBias == 0);
++    CHECK(d.indexRegister == 19);
++    CHECK(d.tableAddress == kBase + 0x2C);
++    REQUIRE(d.targets.size() == 11);
++
++    for (uint32_t i = 0; i < 11; i++) {
++      CHECK(d.targets[i] == kBase + 0x58 + 8 * i);
++    }
++    CHECK(static_cast<int32_t>(d.targets.size() - 1) + d.indexBias == 10);
++  }
++
++  SECTION("cross-register bias with invalid union tail rejects the table") {
++    auto bytes = cross_register_short_table_binary();
++    Detection d = detect(bytes, kBase + 0x28);
++
++    // Union entry 10 reads the NOP word at 0x54 as the address 0x60000000,
++    // which is not a code target inside the region: union mode must reject the
++    // table entirely (nullopt) rather than emit a partial switch with a trap
++    // default.
++    CHECK_FALSE(d.found);
++  }
++}
+diff --git a/tests/unit/core/content_probe_test.cpp b/tests/unit/core/content_probe_test.cpp
+new file mode 100644
+index 0000000..79605f1
+--- /dev/null
++++ b/tests/unit/core/content_probe_test.cpp
+@@ -0,0 +1,778 @@
++/**
++ * @file        content_probe_test.cpp
++ * @brief       Unit tests for the content_probe luma/hash helpers
++ *
++ * Tests deterministic byte-buffer luma and hash computation with known inputs.
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay
++ * @license     BSD 3-Clause License
++ */
++
++#include <array>
++#include <cstdint>
++#include <cstring>
++#include <vector>
++
++#include <catch2/catch_approx.hpp>
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/graphics/pipeline/texture/util.h>
++#include <rex/graphics/util/content_probe.h>
++
++namespace {
++
++// Writes a linear image into a Xenos-tiled buffer using the SDK's own tiled
++// offset function, mirroring how the probe reads the resolved target back.
++void WriteTiledFromLinear(uint8_t bpp_log2, uint32_t width, uint32_t height, uint32_t pitch,
++                          const uint8_t* linear, std::vector<uint8_t>& tiled) {
++  const uint32_t bytes_per_pixel = 1u << bpp_log2;
++  for (uint32_t y = 0; y < height; ++y) {
++    for (uint32_t x = 0; x < width; ++x) {
++      int32_t offset =
++          rex::graphics::texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch, bpp_log2);
++      REQUIRE(offset >= 0);
++      std::memcpy(tiled.data() + size_t(offset),
++                  linear + (size_t(y) * width + x) * bytes_per_pixel, bytes_per_pixel);
++    }
++  }
++}
++
++}  // namespace
++
++TEST_CASE("content_probe FNV-1a 32-bit hash is deterministic", "[content_probe]") {
++  SECTION("Empty input produces expected hash") {
++    const uint8_t empty[] = {};
++    CHECK(rex::graphics::content_probe::fnv1a32(empty, 0) == 2166136261u);
++  }
++
++  SECTION("Known input produces deterministic hash") {
++    const uint8_t data[] = {0xFF, 0x00, 0x80, 0x7F};
++    uint32_t h1 = rex::graphics::content_probe::fnv1a32(data, sizeof(data));
++    uint32_t h2 = rex::graphics::content_probe::fnv1a32(data, sizeof(data));
++    CHECK(h1 == h2);
++    CHECK(h1 != 0);  // Should not be all-zero
++  }
++}
++
++TEST_CASE("content_probe RGBA8 luma computation", "[content_probe]") {
++  // Create a 4x4 RGBA8 buffer with known values
++  SECTION("Pure black yields luma 0") {
++    std::array<uint8_t, 4 * 4 * 4> buf{};  // All zeros
++    uint32_t luma = rex::graphics::content_probe::compute_luma_q8(buf.data(), 4, 4, 1);
++    CHECK(luma == 0);
++  }
++
++  SECTION("Pure white yields luma 256 (Q8.8 = 1.0 * 256)") {
++    std::array<uint8_t, 4 * 4 * 4> buf;
++    buf.fill(0);
++    for (size_t i = 0; i < buf.size(); i += 4) {
++      buf[i + 0] = 255;  // R
++      buf[i + 1] = 255;  // G
++      buf[i + 2] = 255;  // B
++    }
++    uint32_t luma = rex::graphics::content_probe::compute_luma_q8(buf.data(), 4, 4, 1);
++    // Luma = 0.299*255 + 0.587*255 + 0.114*255 = 255.0 (exact)
++    // Q8.8: 255 * 256 = 65280
++    CHECK(luma == 65280);
++  }
++
++  SECTION("Mid-gray yields expected luma") {
++    std::array<uint8_t, 4 * 4 * 4> buf;
++    buf.fill(0);
++    for (size_t i = 0; i < buf.size(); i += 4) {
++      buf[i + 0] = 128;
++      buf[i + 1] = 128;
++      buf[i + 2] = 128;
++    }
++    uint32_t luma = rex::graphics::content_probe::compute_luma_q8(buf.data(), 4, 4, 1);
++    // Luma = 0.299*128 + 0.587*128 + 0.114*128 = 128.0
++    // Q8.8: 128 * 256 = 32768
++    CHECK(luma == 32768);
++  }
++
++  SECTION("Stride sampling reduces sample count") {
++    std::array<uint8_t, 8 * 8 * 4> buf;
++    buf.fill(0);
++    // Set every other pixel to white
++    for (uint32_t y = 0; y < 8; y += 2) {
++      for (uint32_t x = 0; x < 8; x += 2) {
++        size_t idx = (y * 8 + x) * 4;
++        buf[idx + 0] = 255;
++        buf[idx + 1] = 255;
++        buf[idx + 2] = 255;
++      }
++    }
++    // With stride=1, samples all 64 pixels (16 white, 48 black = 1/4 white)
++    // Luma = 1/4 * 65280 = 16320
++    uint32_t luma_full = rex::graphics::content_probe::compute_luma_q8(buf.data(), 8, 8, 1);
++    // With stride=2, samples 16 pixels (all white)
++    uint32_t luma_stride2 = rex::graphics::content_probe::compute_luma_q8(buf.data(), 8, 8, 2);
++    CHECK(luma_full == 16320);  // 1/4 white, 3/4 black
++    CHECK(luma_stride2 == 65280);  // All sampled pixels are white
++  }
++
++  SECTION("Zero dimensions yield 0") {
++    std::array<uint8_t, 16> buf{};
++    CHECK(rex::graphics::content_probe::compute_luma_q8(buf.data(), 0, 4, 1) == 0);
++    CHECK(rex::graphics::content_probe::compute_luma_q8(buf.data(), 4, 0, 1) == 0);
++    CHECK(rex::graphics::content_probe::compute_luma_q8(nullptr, 4, 4, 1) == 0);
++  }
++}
++
++TEST_CASE("content_probe RGBA8 hash computation", "[content_probe]") {
++  SECTION("All-black buffer yields deterministic hash") {
++    std::array<uint8_t, 4 * 4 * 4> buf{};
++    uint32_t h = rex::graphics::content_probe::compute_hash(buf.data(), 4, 4, 1);
++    CHECK(h != 0);  // Should not be all-zero
++    // Deterministic
++    CHECK(rex::graphics::content_probe::compute_hash(buf.data(), 4, 4, 1) == h);
++  }
++
++  SECTION("Different buffers produce different hashes") {
++    std::array<uint8_t, 4 * 4 * 4> buf_a{}, buf_b{};
++    buf_a.fill(0);
++    buf_b.fill(0);
++    buf_b[0] = 1;  // Change one byte
++    uint32_t h_a = rex::graphics::content_probe::compute_hash(buf_a.data(), 4, 4, 1);
++    uint32_t h_b = rex::graphics::content_probe::compute_hash(buf_b.data(), 4, 4, 1);
++    CHECK(h_a != h_b);
++  }
++
++  SECTION("Stride sampling changes hash") {
++    std::array<uint8_t, 8 * 8 * 4> buf;
++    buf.fill(0);
++    // Fill with a pattern
++    for (uint32_t y = 0; y < 8; ++y) {
++      for (uint32_t x = 0; x < 8; ++x) {
++        size_t idx = (y * 8 + x) * 4;
++        buf[idx + 0] = static_cast<uint8_t>((x * 32 + y * 17) & 0xFF);
++        buf[idx + 1] = static_cast<uint8_t>((x * 17 + y * 31) & 0xFF);
++        buf[idx + 2] = static_cast<uint8_t>((x * 13 + y * 23) & 0xFF);
++      }
++    }
++    uint32_t h1 = rex::graphics::content_probe::compute_hash(buf.data(), 8, 8, 1);
++    uint32_t h2 = rex::graphics::content_probe::compute_hash(buf.data(), 8, 8, 2);
++    // Different strides sample different pixels, so hashes should differ
++    CHECK(h1 != h2);
++  }
++
++  SECTION("Zero dimensions yield 0") {
++    std::array<uint8_t, 16> buf{};
++    CHECK(rex::graphics::content_probe::compute_hash(buf.data(), 0, 4, 1) == 0);
++    CHECK(rex::graphics::content_probe::compute_hash(buf.data(), 4, 0, 1) == 0);
++    CHECK(rex::graphics::content_probe::compute_hash(nullptr, 4, 4, 1) == 0);
++  }
++}
++
++TEST_CASE("content_probe single-channel byte mean", "[content_probe]") {
++  SECTION("All zeros yields mean 0") {
++    std::array<uint8_t, 4 * 4> buf{};
++    uint32_t mean = rex::graphics::content_probe::compute_byte_mean(buf.data(), 4, 4, 1);
++    CHECK(mean == 0);
++  }
++
++  SECTION("All 0xFF yields mean 255") {
++    std::array<uint8_t, 4 * 4> buf;
++    buf.fill(0xFF);
++    uint32_t mean = rex::graphics::content_probe::compute_byte_mean(buf.data(), 4, 4, 1);
++    CHECK(mean == 255);
++  }
++
++  SECTION("Mixed values yield correct mean") {
++    std::array<uint8_t, 4> buf = {0, 128, 128, 255};
++    uint32_t mean = rex::graphics::content_probe::compute_byte_mean(buf.data(), 4, 1, 1);
++    // (0 + 128 + 128 + 255) / 4 = 511 / 4 = 127 (integer division)
++    CHECK(mean == 127);
++  }
++
++  SECTION("Zero dimensions yield 0") {
++    std::array<uint8_t, 16> buf{};
++    CHECK(rex::graphics::content_probe::compute_byte_mean(buf.data(), 0, 4, 1) == 0);
++    CHECK(rex::graphics::content_probe::compute_byte_mean(nullptr, 4, 4, 1) == 0);
++  }
++}
++
++TEST_CASE("content_probe single-channel byte hash", "[content_probe]") {
++  SECTION("Deterministic for same input") {
++    std::array<uint8_t, 16> buf{};
++    buf.fill(0x42);
++    uint32_t h1 = rex::graphics::content_probe::compute_byte_hash(buf.data(), 4, 4, 1);
++    uint32_t h2 = rex::graphics::content_probe::compute_byte_hash(buf.data(), 4, 4, 1);
++    CHECK(h1 == h2);
++    CHECK(h1 != 0);
++  }
++
++  SECTION("Different inputs produce different hashes") {
++    std::array<uint8_t, 16> buf_a{}, buf_b{};
++    buf_a.fill(0);
++    buf_b.fill(1);
++    CHECK(rex::graphics::content_probe::compute_byte_hash(buf_a.data(), 4, 4, 1) !=
++          rex::graphics::content_probe::compute_byte_hash(buf_b.data(), 4, 4, 1));
++  }
++
++  SECTION("Zero dimensions yield 0") {
++    std::array<uint8_t, 16> buf{};
++    CHECK(rex::graphics::content_probe::compute_byte_hash(buf.data(), 0, 4, 1) == 0);
++    CHECK(rex::graphics::content_probe::compute_byte_hash(nullptr, 4, 4, 1) == 0);
++  }
++}
++
++TEST_CASE("content_probe stride=1 covers every pixel", "[content_probe]") {
++  // When stride=1, every pixel should be included in the average
++  SECTION("Luma with stride=1 equals weighted average of all pixels") {
++    // 2x2 buffer: one black, three white
++    std::array<uint8_t, 2 * 2 * 4> buf;
++    buf.fill(0);
++    // Pixel (0,0) = black
++    // Pixel (1,0) = white
++    buf[4 + 0] = 255; buf[4 + 1] = 255; buf[4 + 2] = 255;
++    // Pixel (0,1) = white
++    buf[4 * 2 + 0] = 255; buf[4 * 2 + 1] = 255; buf[4 * 2 + 2] = 255;
++    // Pixel (1,1) = white
++    buf[4 * 2 + 4 + 0] = 255; buf[4 * 2 + 4 + 1] = 255; buf[4 * 2 + 4 + 2] = 255;
++
++    uint32_t luma = rex::graphics::content_probe::compute_luma_q8(buf.data(), 2, 2, 1);
++    // Average luma = (0 + 255 + 255 + 255) / 4 = 191.25
++    // Q8.8: 191 * 256 = 48896, plus fractional part
++    // Using the formula: (299*R + 587*G + 114*B) / 1000 * 256
++    // For white: (299+587+114)*255/1000*256 = 1000*255/1000*256 = 255*256 = 65280
++    // For black: 0
++    // Average: (0 + 65280 + 65280 + 65280) / 4 = 48960
++    CHECK(luma == 48960);
++  }
++}
++
++TEST_CASE("content_probe probe target identity matcher", "[content_probe]") {
++  using rex::graphics::content_probe::MatchProbeTarget;
++  using rex::graphics::content_probe::ProbeTargetId;
++
++  SECTION("Evidence-derived full ranges match their identity") {
++    CHECK(MatchProbeTarget(0x10855000u, 0x10BED000u) == ProbeTargetId::kFront);
++    CHECK(MatchProbeTarget(0x1F591000u, 0x1F5A1000u) == ProbeTargetId::kScene0);
++    CHECK(MatchProbeTarget(0x1F9FF000u, 0x1FBFF000u) == ProbeTargetId::kScene1);
++  }
++
++  SECTION("Subranges inside a range match the same identity") {
++    CHECK(MatchProbeTarget(0x10855000u, 0x10856000u) == ProbeTargetId::kFront);
++    CHECK(MatchProbeTarget(0x1F591000u + 0x1000u, 0x1F591000u + 0x2000u) ==
++          ProbeTargetId::kScene0);
++    CHECK(MatchProbeTarget(0x1F9FF000u + 0x1000u, 0x1F9FF000u + 0x2000u) ==
++          ProbeTargetId::kScene1);
++  }
++
++  SECTION("Unknown addresses are rejected") {
++    CHECK(MatchProbeTarget(0x16500000u, 0x16510000u) == ProbeTargetId::kNone);
++    CHECK(MatchProbeTarget(0x104BD000u, 0x104BE000u) == ProbeTargetId::kNone);
++    CHECK(MatchProbeTarget(0x10855000u - 0x1000u, 0x10855000u) == ProbeTargetId::kNone);
++    CHECK(MatchProbeTarget(0x10BED000u, 0x10BF0000u) == ProbeTargetId::kNone);
++  }
++
++  SECTION("Straddling and empty extents are rejected") {
++    CHECK(MatchProbeTarget(0x1F5A0FFFu, 0x1F5A2000u) == ProbeTargetId::kNone);
++    CHECK(MatchProbeTarget(0x10855000u, 0x10855000u) == ProbeTargetId::kNone);
++    CHECK(MatchProbeTarget(0x10856000u, 0x10855000u) == ProbeTargetId::kNone);
++  }
++
++  SECTION("Probe target bases are the range starts") {
++    using rex::graphics::content_probe::ProbeTargetBase;
++    CHECK(ProbeTargetBase(ProbeTargetId::kFront) == 0x10855000u);
++    CHECK(ProbeTargetBase(ProbeTargetId::kScene0) == 0x1F591000u);
++    CHECK(ProbeTargetBase(ProbeTargetId::kScene1) == 0x1F9FF000u);
++    CHECK(ProbeTargetBase(ProbeTargetId::kNone) == 0u);
++  }
++}
++
++TEST_CASE("content_probe emission cadence", "[content_probe]") {
++  using rex::graphics::content_probe::ShouldEmitSample;
++  CHECK_FALSE(ShouldEmitSample(0, false));
++  CHECK_FALSE(ShouldEmitSample(500, false));
++  CHECK_FALSE(ShouldEmitSample(999, false));
++  CHECK(ShouldEmitSample(1000, false));
++  CHECK(ShouldEmitSample(1001, false));
++  CHECK(ShouldEmitSample(0, true));
++}
++
++TEST_CASE("content_probe 16bpp channel-high-byte luma", "[content_probe]") {
++  using rex::graphics::content_probe::compute_16bpp_luma_q8;
++
++  SECTION("Black pixel yields 0") {
++    std::array<uint8_t, 8> pixel{};
++    CHECK(compute_16bpp_luma_q8(pixel.data()) == 0);
++  }
++
++  SECTION("All 0xFFFF channels yield 65280") {
++    std::array<uint8_t, 8> pixel;
++    pixel.fill(0xFF);
++    CHECK(compute_16bpp_luma_q8(pixel.data()) == 65280);
++  }
++
++  SECTION("Pinned mixed pixel") {
++    // High bytes 0x12=18, 0x56=86, 0x9A=154, 0xDE=222 -> (18+86+154+222)/4=120.
++    std::array<uint8_t, 8> pixel = {0x34, 0x12, 0x78, 0x56, 0xBC, 0x9A, 0xF0, 0xDE};
++    CHECK(compute_16bpp_luma_q8(pixel.data()) == 120u * 256u);
++  }
++
++  SECTION("Integer truncation is pinned") {
++    // High bytes 1, 1, 1, 0 -> 3/4 = 0.
++    std::array<uint8_t, 8> pixel = {0, 1, 0, 1, 0, 1, 0, 0};
++    CHECK(compute_16bpp_luma_q8(pixel.data()) == 0);
++  }
++
++  SECTION("Nullptr yields 0") { CHECK(compute_16bpp_luma_q8(nullptr) == 0); }
++}
++
++TEST_CASE("content_probe tiled sampler equivalence with linear helpers", "[content_probe]") {
++  using namespace rex::graphics;
++
++  SECTION("All-black 256x256 k_8 matches the linear byte hash") {
++    std::vector<uint8_t> tiled(256 * 256, 0);
++    uint32_t luma = 123, hash = 456;
++    content_probe::SampleTiled(0, tiled.data(), 0, 0, 256, 256, 256,
++                               content_probe::kDefaultStride, luma, hash);
++    CHECK(luma == 0);
++    CHECK(hash == content_probe::compute_byte_hash(tiled.data(), 256, 256,
++                                                   content_probe::kDefaultStride));
++  }
++
++  SECTION("Quarter-white 8x8 k_8_8_8_8 written through GetTiledOffset2D") {
++    constexpr uint32_t kWidth = 8, kHeight = 8, kPitch = 8;
++    std::vector<uint8_t> linear(size_t(kWidth) * kHeight * 4, 0);
++    for (uint32_t y = 0; y < kHeight; y += 2) {
++      for (uint32_t x = 0; x < kWidth; x += 2) {
++        size_t idx = (size_t(y) * kWidth + x) * 4;
++        linear[idx + 0] = 255;
++        linear[idx + 1] = 255;
++        linear[idx + 2] = 255;
++      }
++    }
++    std::vector<uint8_t> tiled(4096, 0);
++    WriteTiledFromLinear(2, kWidth, kHeight, kPitch, linear.data(), tiled);
++    uint32_t luma = 0, hash = 0;
++    content_probe::SampleTiled(2, tiled.data(), 0, 0, kWidth, kHeight, kPitch, 1, luma, hash);
++    CHECK(luma == 16320);  // 1/4 white, 3/4 black, all 64 pixels sampled
++    CHECK(hash == content_probe::compute_hash(linear.data(), kWidth, kHeight, 1));
++  }
++
++  SECTION("All-0xFF 4x4 k_16_16_16_16 matches FNV-1a over all 8 bytes") {
++    constexpr uint32_t kWidth = 4, kHeight = 4, kPitch = 4;
++    std::vector<uint8_t> linear(size_t(kWidth) * kHeight * 8, 0xFF);
++    std::vector<uint8_t> tiled(4096, 0);
++    WriteTiledFromLinear(3, kWidth, kHeight, kPitch, linear.data(), tiled);
++    uint32_t luma = 0, hash = 0;
++    content_probe::SampleTiled(3, tiled.data(), 0, 0, kWidth, kHeight, kPitch, 1, luma, hash);
++    CHECK(luma == 65280);  // 0xFF high bytes in all four channels
++    CHECK(hash == content_probe::fnv1a32(linear.data(), linear.size()));
++  }
++}
++
++TEST_CASE("content_probe tiled sampler pinned constants and stride", "[content_probe]") {
++  using namespace rex::graphics;
++
++  SECTION("Pinned non-trivial RGBA8 pattern") {
++    constexpr uint32_t kWidth = 4, kHeight = 4, kPitch = 4;
++    std::vector<uint8_t> linear(size_t(kWidth) * kHeight * 4, 0);
++    for (uint32_t y = 0; y < kHeight; ++y) {
++      for (uint32_t x = 0; x < kWidth; ++x) {
++        size_t idx = (size_t(y) * kWidth + x) * 4;
++        linear[idx + 0] = uint8_t(x * 16 + 1);
++        linear[idx + 1] = uint8_t(y * 16 + 2);
++        linear[idx + 2] = uint8_t((x + y) * 8 + 3);
++        linear[idx + 3] = 255;
++      }
++    }
++    std::vector<uint8_t> tiled(4096, 0);
++    WriteTiledFromLinear(2, kWidth, kHeight, kPitch, linear.data(), tiled);
++    uint32_t luma = 0, hash = 0;
++    content_probe::SampleTiled(2, tiled.data(), 0, 0, kWidth, kHeight, kPitch, 1, luma, hash);
++    CHECK(luma == 6608);
++    CHECK(hash == 0x49AAA245u);
++  }
++
++  SECTION("Stride 4 differs from stride 1 on a quarter-white pattern") {
++    constexpr uint32_t kWidth = 8, kHeight = 8, kPitch = 8;
++    std::vector<uint8_t> linear(size_t(kWidth) * kHeight * 4, 0);
++    for (uint32_t y = 0; y < kHeight; y += 2) {
++      for (uint32_t x = 0; x < kWidth; x += 2) {
++        size_t idx = (size_t(y) * kWidth + x) * 4;
++        linear[idx + 0] = 255;
++        linear[idx + 1] = 255;
++        linear[idx + 2] = 255;
++      }
++    }
++    std::vector<uint8_t> tiled(4096, 0);
++    WriteTiledFromLinear(2, kWidth, kHeight, kPitch, linear.data(), tiled);
++    uint32_t luma1 = 0, hash1 = 0, luma4 = 0, hash4 = 0;
++    content_probe::SampleTiled(2, tiled.data(), 0, 0, kWidth, kHeight, kPitch, 1, luma1, hash1);
++    content_probe::SampleTiled(2, tiled.data(), 0, 0, kWidth, kHeight, kPitch,
++                               content_probe::kDefaultStride, luma4, hash4);
++    CHECK(luma1 == 16320);
++    CHECK(luma4 == 65280);  // stride 4 samples only white pixels
++    CHECK(hash1 != hash4);
++  }
++
++  SECTION("Zero dimensions and nullptr yield 0/0") {
++    std::vector<uint8_t> tiled(4096, 0);
++    uint32_t luma = 7, hash = 9;
++    content_probe::SampleTiled(2, tiled.data(), 0, 0, 0, 0, 8, 4, luma, hash);
++    CHECK(luma == 0);
++    CHECK(hash == 0);
++    luma = 7;
++    hash = 9;
++    content_probe::SampleTiled(2, nullptr, 0, 0, 8, 8, 8, 4, luma, hash);
++    CHECK(luma == 0);
++    CHECK(hash == 0);
++  }
++}
++
++TEST_CASE("content_probe probe counter semantics", "[content_probe]") {
++  rex::graphics::content_probe::ProbeCounters counters;
++
++  counters.OnRbColorClearWrite(0x11223344u, 1);
++  CHECK(counters.rbcc == 1);
++  CHECK(counters.rbcc_zero == 0);
++
++  counters.OnRbColorClearWrite(0, 2);
++  CHECK(counters.rbcc == 2);
++  CHECK(counters.rbcc_zero == 1);
++
++  counters.OnRbColorClearLoWrite(0, 3);
++  CHECK(counters.rbcc_lo == 1);
++  CHECK(counters.rbcc_zero == 2);
++
++  counters.OnRbColorClearLoWrite(0xDEADBEEFu, 4);
++  CHECK(counters.rbcc_lo == 2);
++  CHECK(counters.rbcc_zero == 2);
++
++  counters.OnResolveClearExecuted();
++  counters.OnResolveClearExecuted();
++  CHECK(counters.clears == 2);
++
++  counters.OnDrawPacket();
++  CHECK(counters.draws == 1);
++
++  counters.Reset();
++  CHECK(counters.rbcc == 0);
++  CHECK(counters.rbcc_lo == 0);
++  CHECK(counters.rbcc_zero == 0);
++  CHECK(counters.clears == 0);
++  CHECK(counters.draws == 0);
++}
++
++TEST_CASE("content_probe clear-register value capture", "[content_probe]") {
++  using rex::graphics::content_probe::ProbeCounters;
++
++  ProbeCounters counters;
++  // No write in the interval: the count is the presence flag and the value
++  // fields stay 0, so they must be read only when the count is non-zero.
++  CHECK(counters.rbcc == 0);
++  CHECK(counters.rbcc_val == 0);
++  CHECK(counters.rbcc_lo == 0);
++  CHECK(counters.rbcc_lo_val == 0);
++
++  SECTION("Split _LO-first clear-to-black keeps both values visible") {
++    counters.OnRbColorClearLoWrite(0x00000000u, 1);
++    CHECK(counters.rbcc_lo == 1);
++    CHECK(counters.rbcc_lo_val == 0x00000000u);  // zero is a captured value
++    CHECK(counters.rbcc_zero == 1);
++    counters.OnRbColorClearWrite(0x00000000u, 2);
++    CHECK(counters.rbcc == 1);
++    CHECK(counters.rbcc_val == 0x00000000u);
++    CHECK(counters.rbcc_zero == 2);
++  }
++
++  SECTION("Last value wins within one interval") {
++    counters.OnRbColorClearWrite(0x00112233u, 1);
++    counters.OnRbColorClearWrite(0xDEADBEEFu, 2);
++    CHECK(counters.rbcc == 2);
++    CHECK(counters.rbcc_val == 0xDEADBEEFu);
++    CHECK(counters.rbcc_zero == 0);
++    counters.OnRbColorClearLoWrite(0xFF000000u, 3);
++    counters.OnRbColorClearLoWrite(0x80000000u, 4);
++    CHECK(counters.rbcc_lo == 2);
++    CHECK(counters.rbcc_lo_val == 0x80000000u);
++  }
++
++  SECTION("A non-zero dark clear is visible even with rbcc_zero == 0") {
++    counters.OnRbColorClearWrite(0x00010101u, 1);
++    CHECK(counters.rbcc == 1);
++    CHECK(counters.rbcc_zero == 0);
++    CHECK(counters.rbcc_val == 0x00010101u);
++  }
++
++  SECTION("Reset is the per-emission boundary and zeroes the values") {
++    counters.OnRbColorClearWrite(0xFFFFFFFFu, 1);
++    counters.OnRbColorClearLoWrite(0x12345678u, 2);
++    counters.Reset();
++    CHECK(counters.rbcc == 0);
++    CHECK(counters.rbcc_lo == 0);
++    CHECK(counters.rbcc_zero == 0);
++    CHECK(counters.rbcc_val == 0);
++    CHECK(counters.rbcc_lo_val == 0);
++    // No write after the reset: values stay 0 (presence flag is the count).
++    CHECK(counters.rbcc == 0);
++    CHECK(counters.rbcc_val == 0);
++  }
++}
++
++TEST_CASE("content_probe full-surface resolve gate", "[content_probe]") {
++  using rex::graphics::content_probe::IsFullSurfaceResolve;
++  using rex::graphics::content_probe::ProbeTargetId;
++
++  SECTION("Full surfaces of each identity are accepted") {
++    CHECK(IsFullSurfaceResolve(1280, 720, ProbeTargetId::kFront));
++    CHECK(IsFullSurfaceResolve(256, 256, ProbeTargetId::kScene0));
++    CHECK(IsFullSurfaceResolve(512, 512, ProbeTargetId::kScene1));
++  }
++
++  SECTION("Observed partial scene-1 resolves are rejected") {
++    CHECK_FALSE(IsFullSurfaceResolve(168, 280, ProbeTargetId::kScene1));
++    CHECK_FALSE(IsFullSurfaceResolve(152, 296, ProbeTargetId::kScene1));
++  }
++
++  SECTION("Near-miss dimensions are rejected") {
++    CHECK_FALSE(IsFullSurfaceResolve(511, 512, ProbeTargetId::kScene1));
++    CHECK_FALSE(IsFullSurfaceResolve(512, 511, ProbeTargetId::kScene1));
++    CHECK_FALSE(IsFullSurfaceResolve(1280, 719, ProbeTargetId::kFront));
++    CHECK_FALSE(IsFullSurfaceResolve(1279, 720, ProbeTargetId::kFront));
++    CHECK_FALSE(IsFullSurfaceResolve(256, 128, ProbeTargetId::kScene0));
++  }
++
++  SECTION("Dimensions of one identity do not validate another") {
++    CHECK_FALSE(IsFullSurfaceResolve(1280, 720, ProbeTargetId::kScene1));
++    CHECK_FALSE(IsFullSurfaceResolve(256, 256, ProbeTargetId::kFront));
++    CHECK_FALSE(IsFullSurfaceResolve(512, 512, ProbeTargetId::kScene0));
++  }
++
++  SECTION("No identity and zero dimensions are rejected") {
++    CHECK_FALSE(IsFullSurfaceResolve(1280, 720, ProbeTargetId::kNone));
++    CHECK_FALSE(IsFullSurfaceResolve(0, 0, ProbeTargetId::kFront));
++  }
++}
++
++TEST_CASE("content_probe clock-box sample guard", "[content_probe]") {
++  using rex::graphics::content_probe::IsClockBoxSampleable;
++
++  SECTION("Minimum covering dimensions are accepted") {
++    CHECK(IsClockBoxSampleable(1126, 651));
++    CHECK(IsClockBoxSampleable(1280, 720));
++  }
++
++  SECTION("One pixel short is rejected") {
++    CHECK_FALSE(IsClockBoxSampleable(1125, 651));
++    CHECK_FALSE(IsClockBoxSampleable(1126, 650));
++    CHECK_FALSE(IsClockBoxSampleable(42, 22));
++    CHECK_FALSE(IsClockBoxSampleable(0, 0));
++  }
++}
++
++TEST_CASE("content_probe slot consumption reset emits the no-sample sentinel", "[content_probe]") {
++  using rex::graphics::content_probe::ProbeSlot;
++
++  ProbeSlot slot;
++  CHECK_FALSE(slot.recorded);
++  CHECK_FALSE(slot.sampled);
++  CHECK(slot.base == 0);
++  CHECK(slot.width == 0);
++  CHECK(slot.height == 0);
++  CHECK(slot.pitch == 0);
++  CHECK(slot.bpp_log2 == 0);
++  CHECK(slot.length == 0);
++  CHECK(slot.frame == 0);
++
++  // A full-surface sample recorded in an interval.
++  slot.recorded = true;
++  slot.sampled = true;
++  slot.base = 0x1F9FF000u;
++  slot.width = 512;
++  slot.height = 512;
++  slot.pitch = 512;
++  slot.bpp_log2 = 3;
++  slot.length = 0x200000;
++  slot.frame = 4242;
++  CHECK(slot.recorded);
++  CHECK(slot.sampled);
++
++  // Consumption at emission clears every field, so an interval with no
++  // full-surface record emits base=0/w=h=0/luma=hash=0/frame=0 (F1) instead
++  // of re-emitting this snapshot.
++  slot.Reset();
++  CHECK_FALSE(slot.recorded);
++  CHECK_FALSE(slot.sampled);
++  CHECK(slot.base == 0);
++  CHECK(slot.width == 0);
++  CHECK(slot.height == 0);
++  CHECK(slot.pitch == 0);
++  CHECK(slot.bpp_log2 == 0);
++  CHECK(slot.length == 0);
++  CHECK(slot.frame == 0);
++}
++
++TEST_CASE("content_probe clear-write frame-stamp ring", "[content_probe]") {
++  using rex::graphics::content_probe::ProbeCounters;
++
++  SECTION("64 writes fill the ring without overflow") {
++    ProbeCounters counters;
++    for (uint32_t i = 0; i < ProbeCounters::kMaxClearWriteEntries; ++i) {
++      counters.OnRbColorClearWrite(0xA0000000u + i, 1000 + i);
++    }
++    CHECK(counters.rbcc == 64);
++    CHECK(counters.rbcc_writes_count == 64);
++    CHECK(counters.rbcc_writes_overflow == 0);
++    // First 63 writes kept in order...
++    for (uint32_t i = 0; i < 63; ++i) {
++      CHECK(counters.rbcc_writes[i].frame == 1000 + i);
++      CHECK(counters.rbcc_writes[i].value == 0xA0000000u + i);
++    }
++    // ...and the 64th (latest) write in the last slot.
++    CHECK(counters.rbcc_writes[63].frame == 1063);
++    CHECK(counters.rbcc_writes[63].value == 0xA000003Fu);
++  }
++
++  SECTION("65th write sets overflow and overwrites only the latest slot") {
++    ProbeCounters counters;
++    for (uint32_t i = 0; i < ProbeCounters::kMaxClearWriteEntries; ++i) {
++      counters.OnRbColorClearWrite(0xB0000000u + i, 2000 + i);
++    }
++    counters.OnRbColorClearWrite(0xCCCCCCCCu, 3000);
++    CHECK(counters.rbcc == 65);
++    CHECK(counters.rbcc_writes_count == 65);
++    CHECK(counters.rbcc_writes_overflow == 1);
++    // First 63 writes untouched...
++    for (uint32_t i = 0; i < 63; ++i) {
++      CHECK(counters.rbcc_writes[i].frame == 2000 + i);
++      CHECK(counters.rbcc_writes[i].value == 0xB0000000u + i);
++    }
++    // ...the 65th (latest) write replaces the 64th in the last slot.
++    CHECK(counters.rbcc_writes[63].frame == 3000);
++    CHECK(counters.rbcc_writes[63].value == 0xCCCCCCCCu);
++    // The latest write is also the captured last value.
++    CHECK(counters.rbcc_val == 0xCCCCCCCCu);
++  }
++
++  SECTION("Further writes keep overwriting the latest slot") {
++    ProbeCounters counters;
++    for (uint32_t i = 0; i < ProbeCounters::kMaxClearWriteEntries + 10; ++i) {
++      counters.OnRbColorClearWrite(0, 4000 + i);
++    }
++    CHECK(counters.rbcc == 74);
++    CHECK(counters.rbcc_writes_count == 74);
++    CHECK(counters.rbcc_writes_overflow == 1);
++    CHECK(counters.rbcc_zero == 74);
++    CHECK(counters.rbcc_writes[63].frame == 4073);
++  }
++}
++
++TEST_CASE("content_probe clear-write rings are independent per register", "[content_probe]") {
++  using rex::graphics::content_probe::ProbeCounters;
++
++  ProbeCounters counters;
++  counters.OnRbColorClearWrite(0x11111111u, 10);
++  counters.OnRbColorClearLoWrite(0x22222222u, 11);
++  counters.OnRbColorClearLoWrite(0x33333333u, 12);
++
++  CHECK(counters.rbcc == 1);
++  CHECK(counters.rbcc_writes_count == 1);
++  CHECK(counters.rbcc_writes[0].frame == 10);
++  CHECK(counters.rbcc_writes[0].value == 0x11111111u);
++  CHECK(counters.rbcc_writes_overflow == 0);
++
++  CHECK(counters.rbcc_lo == 2);
++  CHECK(counters.rbcc_lo_writes_count == 2);
++  CHECK(counters.rbcc_lo_writes[0].frame == 11);
++  CHECK(counters.rbcc_lo_writes[0].value == 0x22222222u);
++  CHECK(counters.rbcc_lo_writes[1].frame == 12);
++  CHECK(counters.rbcc_lo_writes[1].value == 0x33333333u);
++  CHECK(counters.rbcc_lo_writes_overflow == 0);
++
++  // Overflow on one ring does not affect the other.
++  for (uint32_t i = 0; i < ProbeCounters::kMaxClearWriteEntries + 1; ++i) {
++    counters.OnRbColorClearWrite(0, 100 + i);
++  }
++  CHECK(counters.rbcc_writes_overflow == 1);
++  CHECK(counters.rbcc_lo_writes_overflow == 0);
++  CHECK(counters.rbcc_lo_writes_count == 2);
++  CHECK(counters.rbcc_lo_writes[1].frame == 12);
++}
++
++TEST_CASE("content_probe per-target resolve summaries", "[content_probe]") {
++  using rex::graphics::content_probe::ProbeCounters;
++
++  ProbeCounters counters;
++  // No appends: all summaries empty (count is the presence flag).
++  for (uint32_t i = 0; i < rex::graphics::content_probe::kProbeTargetCount; ++i) {
++    CHECK(counters.resolve_summary[i].count == 0);
++    CHECK(counters.resolve_summary[i].first_frame == 0);
++    CHECK(counters.resolve_summary[i].last_frame == 0);
++  }
++
++  counters.AppendResolveFrame(1, 500);  // kScene0
++  counters.AppendResolveFrame(1, 501);
++  counters.AppendResolveFrame(0, 499);  // kFront
++  counters.AppendResolveFrame(2, 502);  // kScene1
++  counters.AppendResolveFrame(2, 503);
++  counters.AppendResolveFrame(2, 504);
++
++  CHECK(counters.resolve_summary[0].first_frame == 499);
++  CHECK(counters.resolve_summary[0].last_frame == 499);
++  CHECK(counters.resolve_summary[0].count == 1);
++  CHECK(counters.resolve_summary[1].first_frame == 500);
++  CHECK(counters.resolve_summary[1].last_frame == 501);
++  CHECK(counters.resolve_summary[1].count == 2);
++  CHECK(counters.resolve_summary[2].first_frame == 502);
++  CHECK(counters.resolve_summary[2].last_frame == 504);
++  CHECK(counters.resolve_summary[2].count == 3);
++
++  // Out-of-range targets are ignored (defensive).
++  counters.AppendResolveFrame(7, 999);
++  CHECK(counters.resolve_summary[2].count == 3);
++}
++
++TEST_CASE("content_probe counter reset re-arms rings and summaries", "[content_probe]") {
++  using rex::graphics::content_probe::ProbeCounters;
++
++  ProbeCounters counters;
++  for (uint32_t i = 0; i < ProbeCounters::kMaxClearWriteEntries + 3; ++i) {
++    counters.OnRbColorClearWrite(0, 10 + i);
++    counters.OnRbColorClearLoWrite(0x10101010u, 20 + i);
++  }
++  counters.AppendResolveFrame(0, 100);
++  counters.AppendResolveFrame(1, 200);
++  counters.AppendResolveFrame(2, 300);
++  counters.OnResolveClearExecuted();
++  counters.OnDrawPacket();
++
++  counters.Reset();
++
++  CHECK(counters.rbcc == 0);
++  CHECK(counters.rbcc_lo == 0);
++  CHECK(counters.rbcc_zero == 0);
++  CHECK(counters.rbcc_val == 0);
++  CHECK(counters.rbcc_lo_val == 0);
++  CHECK(counters.clears == 0);
++  CHECK(counters.draws == 0);
++  CHECK(counters.rbcc_writes_count == 0);
++  CHECK(counters.rbcc_lo_writes_count == 0);
++  CHECK(counters.rbcc_writes_overflow == 0);
++  CHECK(counters.rbcc_lo_writes_overflow == 0);
++  for (const auto& entry : counters.rbcc_writes) {
++    CHECK(entry.frame == 0);
++    CHECK(entry.value == 0);
++  }
++  for (const auto& entry : counters.rbcc_lo_writes) {
++    CHECK(entry.frame == 0);
++    CHECK(entry.value == 0);
++  }
++  for (const auto& summary : counters.resolve_summary) {
++    CHECK(summary.first_frame == 0);
++    CHECK(summary.last_frame == 0);
++    CHECK(summary.count == 0);
++  }
++
++  // Re-armed: a fresh write lands in slot 0.
++  counters.OnRbColorClearWrite(0x55555555u, 77);
++  CHECK(counters.rbcc_writes_count == 1);
++  CHECK(counters.rbcc_writes[0].frame == 77);
++  CHECK(counters.rbcc_writes[0].value == 0x55555555u);
++  CHECK(counters.rbcc_writes_overflow == 0);
++}
++
+diff --git a/tests/unit/memory/access_violation_recovery_test.cpp b/tests/unit/memory/access_violation_recovery_test.cpp
+new file mode 100644
+index 0000000..17993be
+--- /dev/null
++++ b/tests/unit/memory/access_violation_recovery_test.cpp
+@@ -0,0 +1,326 @@
++/**
++ * @file        access_violation_recovery_test.cpp
++ * @brief       Unit tests for the recovery branches of
++ *              Memory::AccessViolationCallback (M6 cycle-3 fix, M6 cycle-9
++ *              released-physical-page fix)
++ *
++ * The guest-virtual branch under test recovers stale host protection for
++ * committed guest-virtual pages: when guest metadata reports the page
++ * committed and the ORIGINAL allocation protection permits the access
++ * direction, but host protection is still no-access (the stack-guard situation
++ * created by XThread::AllocateStack: commit RW, then Protect(NoAccess) the
++ * guard pages, which updates current_protect while allocation_protect stays
++ * RW), the callback restores host read/write access and returns true so the
++ * faulting guest instruction re-executes.
++ *
++ * The guest-physical branch under test recovers RELEASED physical pages:
++ * MmFreePhysicalMemory releases the block (page table entry becomes exactly
++ * free, state == 0) while host protection can remain no-access (the captured
++ * `---s` VMA on the released 64 KB block). Real hardware keeps released
++ * physical RAM readable/writable until reuse, so a fault on an exactly-free
++ * physical page restores host read/write access and returns true. Reserve-only
++ * and committed pages (state != 0) are declined.
++ *
++ * These tests exercise the real decision logic through the real
++ * Memory::AccessViolationCallback method on real heap pages; no actual SIGSEGV
++ * is required because the callback is invoked directly with the host address
++ * of the page, exactly as the host MMIO/AV handler would. See the access shim
++ * below.
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay
++ * @license     BSD 3-Clause License
++ */
++
++#include <cstdint>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include <catch2/catch_test_macros.hpp>
++
++// Test-only access shim: Memory::AccessViolationCallback is a private SDK API
++// reachable in production only through the platform SIGSEGV handler
++// (MMIOHandler -> ExceptionCallback). Unit tests invoke the real callback
++// directly on a real guest-virtual heap page, so this translation unit opens
++// the access specifier while parsing the header; no production code changes.
++// The std headers above are pre-included so the keyword macro only applies to
++// the SDK headers.
++#define private public
++#include <rex/system/xmemory.h>
++#undef private
++
++#include "test_memory.h"
++
++namespace {
++
++using rex::memory::BaseHeap;
++using rex::memory::HeapAllocationInfo;
++using rex::memory::Memory;
++using rex::test::GetTestMemory;
++using rex::test::MutableHeap;
++
++// Allocates one 4 KB page on the guest-virtual v00000000 heap (4 KB pages) and
++// returns its guest address and host pointer.
++struct GuestVirtualPage {
++  BaseHeap* heap = nullptr;
++  uint32_t guest_address = 0;
++  uint8_t* host_address = nullptr;
++
++  ~GuestVirtualPage() {
++    if (heap && guest_address) {
++      heap->Release(guest_address, nullptr);
++    }
++  }
++};
++
++GuestVirtualPage AllocateGuestVirtualPage(uint32_t allocation_protect) {
++  auto& memory = GetTestMemory();
++  GuestVirtualPage page;
++  page.heap = MutableHeap(memory.LookupHeap(0x10000000));  // v00000000, 4 KB pages
++  REQUIRE(page.heap != nullptr);
++  REQUIRE(page.heap->Alloc(
++      4096, 4096,
++      rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit,
++      allocation_protect, false, &page.guest_address));
++  page.host_address = memory.TranslateVirtual(page.guest_address);
++  REQUIRE(page.host_address != nullptr);
++  return page;
++}
++
++// Allocates one 64 KB page on the guest-physical vA0000000 heap (64 KB pages)
++// and returns its guest address and host pointer. The vA0000000 alias maps the
++// same memfd pages as the canonical 0x00000000 physical heap.
++struct GuestPhysicalPage {
++  BaseHeap* heap = nullptr;
++  uint32_t guest_address = 0;
++  uint8_t* host_address = nullptr;
++  bool released = false;
++
++  void Release() {
++    if (heap && guest_address && !released) {
++      heap->Release(guest_address, nullptr);
++      released = true;
++    }
++  }
++
++  ~GuestPhysicalPage() { Release(); }
++};
++
++GuestPhysicalPage AllocateGuestPhysicalPage(
++    uint32_t allocation_protect,
++    uint32_t allocation_type = rex::memory::kMemoryAllocationReserve |
++                              rex::memory::kMemoryAllocationCommit) {
++  auto& memory = GetTestMemory();
++  GuestPhysicalPage page;
++  page.heap = MutableHeap(memory.LookupHeap(0xA0000000));  // vA0000000, 64 KB pages
++  REQUIRE(page.heap != nullptr);
++  REQUIRE(page.heap->Alloc(64 * 1024, 64 * 1024, allocation_type, allocation_protect, false,
++                           &page.guest_address));
++  page.host_address = memory.TranslateVirtual(page.guest_address);
++  REQUIRE(page.host_address != nullptr);
++  return page;
++}
++
++// Invokes the callback exactly as the host access-violation handler would.
++bool InvokeAccessViolationCallback(Memory& memory, void* host_address, bool is_write) {
++  std::unique_lock<std::recursive_mutex> lock;
++  return memory.AccessViolationCallback(std::move(lock), host_address, is_write);
++}
++
++}  // namespace
++
++TEST_CASE("AV recovery: committed RW guest-virtual page recovers a write fault",
++          "[memory][accerr][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestVirtualPage(rex::memory::kMemoryProtectRead |
++                                       rex::memory::kMemoryProtectWrite);
++
++  // Stack-guard pattern: host/current protection dropped to no-access while the
++  // original allocation protection stays read/write.
++  uint32_t old_protect = 0;
++  REQUIRE(page.heap->Protect(page.guest_address, 4096, rex::memory::kMemoryProtectNoAccess,
++                             &old_protect));
++  CHECK(old_protect == (rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite));
++
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK((info.state & rex::memory::kMemoryAllocationCommit) != 0);
++  CHECK(info.allocation_protect ==
++        (rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite));
++  CHECK(info.protect == rex::memory::kMemoryProtectNoAccess);
++
++  CHECK(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/true));
++
++  // Host page must be writable again: the guest store re-executes on this page.
++  page.host_address[0] = 0xAB;
++  CHECK(page.host_address[0] == 0xAB);
++
++  // The recovery is host-only: guest current_protect stays no-access (the guest
++  // guard page remains a guard; only stale host state is repaired).
++  HeapAllocationInfo after{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &after));
++  CHECK(after.protect == rex::memory::kMemoryProtectNoAccess);
++  CHECK(after.allocation_protect ==
++        (rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite));
++}
++
++TEST_CASE("AV recovery: committed RW guest-virtual page recovers a read fault",
++          "[memory][accerr][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestVirtualPage(rex::memory::kMemoryProtectRead |
++                                       rex::memory::kMemoryProtectWrite);
++
++  page.host_address[0] = 0x5A;
++  REQUIRE(page.heap->Protect(page.guest_address, 4096, rex::memory::kMemoryProtectNoAccess,
++                             nullptr));
++
++  CHECK(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/false));
++  CHECK(page.host_address[0] == 0x5A);  // readable again
++}
++
++TEST_CASE("AV recovery: write fault on a read-only allocation is not recovered",
++          "[memory][accerr][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestVirtualPage(rex::memory::kMemoryProtectRead);
++
++  REQUIRE(page.heap->Protect(page.guest_address, 4096, rex::memory::kMemoryProtectNoAccess,
++                             nullptr));
++
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK(info.allocation_protect == rex::memory::kMemoryProtectRead);
++
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/true));
++}
++
++TEST_CASE("AV recovery: read fault on a read-only allocation is not recovered",
++          "[memory][accerr][recovery]") {
++  // The branch requires allocation_protect to include BOTH read and write for a
++  // read fault (kReadProtectMask == kMemoryProtectRead | kMemoryProtectWrite);
++  // this documents the implemented decision, not an idealised one.
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestVirtualPage(rex::memory::kMemoryProtectRead);
++
++  REQUIRE(page.heap->Protect(page.guest_address, 4096, rex::memory::kMemoryProtectNoAccess,
++                             nullptr));
++
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/false));
++}
++
++TEST_CASE("AV recovery: write-combine allocations satisfy the write-protect mask",
++          "[memory][accerr][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestVirtualPage(rex::memory::kMemoryProtectWriteCombine);
++
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK(info.allocation_protect == rex::memory::kMemoryProtectWriteCombine);
++
++  CHECK(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/true));
++}
++
++TEST_CASE("AV recovery: reserved-only (decommitted) pages are not recovered",
++          "[memory][accerr][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestVirtualPage(rex::memory::kMemoryProtectRead |
++                                       rex::memory::kMemoryProtectWrite);
++
++  REQUIRE(page.heap->Decommit(page.guest_address, 4096));
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK((info.state & rex::memory::kMemoryAllocationCommit) == 0);
++
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/true));
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/false));
++}
++
++TEST_CASE("AV recovery: host addresses outside guest virtual memory are ignored",
++          "[memory][accerr][recovery]") {
++  auto& memory = GetTestMemory();
++
++  // Below virtual_membase_.
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, nullptr, /*is_write=*/true));
++  // At/above physical_membase_ (the callback must not touch physical accesses).
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, memory.physical_membase(), /*is_write=*/true));
++}
++
++TEST_CASE("AV recovery: released guest-physical page recovers a read fault",
++          "[memory][accerr][physical][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestPhysicalPage(rex::memory::kMemoryProtectRead |
++                                        rex::memory::kMemoryProtectWrite);
++  page.host_address[0] = 0x3C;
++
++  // Captured production state (`---s` VMA on the released 64 KB block): host
++  // protection is no-access while the allocation is still live...
++  REQUIRE(page.heap->Protect(page.guest_address, 64 * 1024,
++                             rex::memory::kMemoryProtectNoAccess, nullptr));
++
++  // ...then MmFreePhysicalMemory releases the block. BaseHeap::Release is
++  // host-protect-neutral, so PROT_NONE persists while the page table entry
++  // becomes exactly free (state == 0), matching the captured maps line.
++  page.Release();
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK(info.state == 0);
++
++  // The Bink decoder's 16-byte LOAD fault is recovered for reads.
++  CHECK(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/false));
++  CHECK(page.host_address[0] == 0x3C);  // readable again, contents preserved
++}
++
++TEST_CASE("AV recovery: released guest-physical page recovers a write fault",
++          "[memory][accerr][physical][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestPhysicalPage(rex::memory::kMemoryProtectRead |
++                                        rex::memory::kMemoryProtectWrite);
++
++  REQUIRE(page.heap->Protect(page.guest_address, 64 * 1024,
++                             rex::memory::kMemoryProtectNoAccess, nullptr));
++  page.Release();
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK(info.state == 0);
++
++  CHECK(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/true));
++  page.host_address[0] = 0xAB;
++  CHECK(page.host_address[0] == 0xAB);
++}
++
++TEST_CASE("AV recovery: reserve-only guest-physical page is not recovered",
++          "[memory][accerr][physical][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestPhysicalPage(rex::memory::kMemoryProtectNoAccess,
++                                        rex::memory::kMemoryAllocationReserve);
++
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK(info.state == rex::memory::kMemoryAllocationReserve);
++
++  // Reserve-only (state == kMemoryAllocationReserve) is not exactly free and
++  // has no commit metadata, so neither the released-page branch nor the
++  // pre-existing stale-write branch may recover it.
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/false));
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/true));
++}
++
++TEST_CASE("AV recovery: committed no-access guest-physical page read fault is not recovered",
++          "[memory][accerr][physical][recovery]") {
++  auto& memory = GetTestMemory();
++  auto page = AllocateGuestPhysicalPage(rex::memory::kMemoryProtectRead |
++                                        rex::memory::kMemoryProtectWrite);
++
++  REQUIRE(page.heap->Protect(page.guest_address, 64 * 1024,
++                             rex::memory::kMemoryProtectNoAccess, nullptr));
++
++  HeapAllocationInfo info{};
++  REQUIRE(page.heap->QueryRegionInfo(page.guest_address, &info));
++  CHECK((info.state & rex::memory::kMemoryAllocationCommit) != 0);
++  CHECK(info.state != 0);
++
++  // Pinned as a read: a write on a committed RW allocation legitimately hits
++  // the pre-existing stale-write recovery path below the new branch.
++  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/false));
++}
+diff --git a/tests/unit/memory/heap_allocation_test.cpp b/tests/unit/memory/heap_allocation_test.cpp
+index 7a83256..0780031 100644
+--- a/tests/unit/memory/heap_allocation_test.cpp
++++ b/tests/unit/memory/heap_allocation_test.cpp
+@@ -11,31 +11,12 @@
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
+-#include <rex/cvar.h>
+-#include <rex/logging.h>
+ #include <rex/system/xmemory.h>
+ 
+-namespace {
++#include "test_memory.h"
+ 
+-// Shared memory instance - expensive to create, reuse across tests
+-rex::memory::Memory& GetTestMemory() {
+-  static rex::memory::Memory memory;
+-  static bool initialized = false;
+-  if (!initialized) {
+-    rex::InitLogging();
+-    bool result = memory.Initialize();
+-    REQUIRE(result);
+-    initialized = true;
+-  }
+-  return memory;
+-}
+-
+-// Helper to cast away const for heap operations
+-rex::memory::BaseHeap* MutableHeap(const rex::memory::BaseHeap* heap) {
+-  return const_cast<rex::memory::BaseHeap*>(heap);
+-}
+-
+-}  // namespace
++using rex::test::GetTestMemory;
++using rex::test::MutableHeap;
+ 
+ // =============================================================================
+ // Size and Alignment Rounding Tests
+diff --git a/tests/unit/memory/test_memory.h b/tests/unit/memory/test_memory.h
+new file mode 100644
+index 0000000..431b475
+--- /dev/null
++++ b/tests/unit/memory/test_memory.h
+@@ -0,0 +1,43 @@
++/**
++ * @file        test_memory.h
++ * @brief       Shared process-wide rex::memory::Memory instance for unit tests
++ *
++ * A rex::memory::Memory instance is expensive to create (it reserves and maps
++ * the whole 4 GB guest address space) and is a process-wide singleton: the
++ * constructor asserts that no other Memory instance is active. Inline
++ * function-local statics keep a single instance shared by every test
++ * translation unit that includes this header.
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay
++ * @license     BSD 3-Clause License
++ */
++
++#pragma once
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/cvar.h>
++#include <rex/logging.h>
++#include <rex/system/xmemory.h>
++
++namespace rex::test {
++
++// Shared memory instance - expensive to create, reuse across tests.
++inline rex::memory::Memory& GetTestMemory() {
++  static rex::memory::Memory memory;
++  static bool initialized = false;
++  if (!initialized) {
++    rex::InitLogging();
++    bool result = memory.Initialize();
++    REQUIRE(result);
++    initialized = true;
++  }
++  return memory;
++}
++
++// Helper to cast away const for heap operations.
++inline rex::memory::BaseHeap* MutableHeap(const rex::memory::BaseHeap* heap) {
++  return const_cast<rex::memory::BaseHeap*>(heap);
++}
++
++}  // namespace rex::test
+diff --git a/tests/unit/system/mmio_handler_test.cpp b/tests/unit/system/mmio_handler_test.cpp
+new file mode 100644
+index 0000000..8eb13a8
+--- /dev/null
++++ b/tests/unit/system/mmio_handler_test.cpp
+@@ -0,0 +1,630 @@
++/**
++ * @file        mmio_handler_test.cpp
++ * @brief       Unit tests for MMIOHandler's x86-64 load/store decoding and the
++ *              16-byte MOVDQA MMIO load execution path (cycle 10 Phase B)
++ *
++ * Cycle 10 Phase A attributed the cycle-9 SEGV_ACCERR storm to thid 9 (Bink)
++ * executing the inlined aligned base load of guest `lvlx128 v51,r8,r5`:
++ * `movdqa (%r8,%r10,1),%xmm4` (bytes 66 43 0F 6F 24 10) from guest
++ * 0x7FC82580, inside the registered GPU MMIO range. The decoder only accepted
++ * 32-bit MOV forms, so every fault logged "Unable to decode MMIO load or store
++ * instruction" and the instruction was re-executed forever.
++ *
++ * These tests cover the new 66 [REX] 0F 6F /r (MOVDQA xmm, m128) load
++ * decoding, its four ordered 32-bit MMIO reads assembled into the destination
++ * XMM register (matching the existing per-lane byte-swap convention), the
++ * declined forms, and the pre-existing range-mismatch / miss behavior. The
++ * exception callback is invoked directly with a synthetic Exception and a fake
++ * faulting instruction, exactly like the platform SIGSEGV handler would, so no
++ * actual signal is required.
++ *
++ * Cycle 11 corrects two pre-existing SIB parser defects and adds coverage for
++ * them: SIB base 101 was declined unconditionally (it is only "no base" when
++ * mod == 00; otherwise it is rbp, or r13 with REX.B), and the scale field was
++ * shifted by 8 instead of 6 (every SIB scale decoded as 1). The captured
++ * cycle-11 site is 66 41 0F 6F 4C 0D 00 (mod 01 / SIB base 101 + REX.B -> r13,
++ * index rcx, scale 1, disp8 0), a 7-byte encoding.
++ *
++ * Cycle 12 accepts and executes the aligned 16-byte MOVDQA store form
++ * 66 [REX] 0F 7F /r, the direction complement of the cycle-10 load. The
++ * captured cycle-12 faulting instruction is 66 41 0F 7F 04 04
++ * (movdqa %xmm0,(%r12,%rax,1)): mod 00 / reg 000 (xmm0) / rm 100 (SIB),
++ * SIB 0x04 = scale 1 / index rax / base 100 -> r12 with REX.B=1. SIB base 100
++ * is a real base at mod 00, so this encoding carries NO displacement and
++ * objdump decodes exactly 6 bytes as one instruction (the 16-byte store is
++ * executed as four ordered 32-bit MMIO writes at EA+0/4/8/12, each lane
++ * byte-swapped exactly like the 32-bit MOV store path). A range without a
++ * write callback declines the store with the bounded one-shot logging.
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay
++ * @license     BSD 3-Clause License
++ */
++
++#include <cstdint>
++#include <cstring>
++#include <memory>
++#include <mutex>
++#include <string>
++#include <utility>
++#include <vector>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/exception_handler.h>
++#include <rex/platform.h>
++#include <rex/types.h>
++#include <rex/vec128.h>
++
++// Test-only access shim: DecodedLoadStore and TryDecodeLoadStore are private,
++// and the constructor / ExceptionCallback are protected, in production. The
++// unit tests parse real instruction bytes through the real decoder and invoke
++// the real callback with a synthetic Exception, so this translation unit opens
++// the access specifier while parsing the header; no production code changes.
++// The standard headers above are pre-included so the keyword macro only
++// applies to the SDK header.
++#define private public
++#include <rex/system/mmio_handler.h>
++#undef private
++
++#if REX_PLATFORM_LINUX
++#include <sys/mman.h>
++#endif
++
++namespace {
++
++using rex::arch::Exception;
++using rex::arch::HostThreadContext;
++using rex::runtime::MMIOHandler;
++
++// GPU MMIO range as registered by GraphicsSystem::Initialize (cycle 10
++// Phase A: base 0x7FC80000, mask 0xFFFF0000, 64 KB).
++constexpr uint32_t kGuestMmioBase = 0x7FC80000;
++constexpr uint32_t kGuestMmioMask = 0xFFFF0000;
++constexpr size_t kWindowSize = 0x40000;
++
++// Fake host window backing virtual_membase_; the GPU MMIO range is mapped at
++// window offset 0.
++struct TestWindow {
++  std::vector<uint8_t> storage = std::vector<uint8_t>(kWindowSize);
++
++  uint8_t* base() { return storage.data(); }
++  uint8_t* physical_base() { return storage.data() + storage.size(); }
++  uint8_t* end() { return storage.data() + storage.size(); }
++
++  uint32_t GuestAddress(const void* host_address) const {
++    return kGuestMmioBase + uint32_t(static_cast<const uint8_t*>(host_address) - storage.data());
++  }
++};
++
++uint32_t HostToGuestThunk(const void* context, const void* host_address) {
++  return static_cast<const TestWindow*>(context)->GuestAddress(host_address);
++}
++
++// Records the ordered 32-bit MMIO callback reads and returns the configured
++// sentinel value for each lane.
++struct RangeReads {
++  std::vector<uint32_t> addresses;
++  std::vector<uint32_t> values = {0x11223344, 0x55667788, 0x99AABBCC, 0xDDEEFF00};
++};
++
++uint32_t ReadThunk(void* /*ppc_context*/, void* callback_context, uint32_t addr) {
++  auto* reads = static_cast<RangeReads*>(callback_context);
++  reads->addresses.push_back(addr);
++  const size_t index = reads->addresses.size() - 1;
++  return index < reads->values.size() ? reads->values[index] : 0xDEADBEEFu;
++}
++
++struct AvCallbackState {
++  uint32_t calls = 0;
++  void* host_address = nullptr;
++  bool is_write = false;
++  bool result = false;
++};
++
++bool AvCallbackThunk(std::unique_lock<std::recursive_mutex> /*global_lock*/, void* context,
++                     void* host_address, bool is_write) {
++  auto* state = static_cast<AvCallbackState*>(context);
++  ++state->calls;
++  state->host_address = host_address;
++  state->is_write = is_write;
++  return state->result;
++}
++
++// Exposes the protected constructor and exception callback to the tests. The
++// production handler is a process-wide singleton, so keep global_handler_
++// consistent to avoid the destructor's mismatch warning.
++class TestMMIOHandler : public MMIOHandler {
++ public:
++  TestMMIOHandler(uint8_t* virtual_membase, uint8_t* physical_membase, uint8_t* membase_end,
++                  HostToGuestVirtual host_to_guest_virtual, const void* host_to_guest_context,
++                  AccessViolationCallback access_violation_callback,
++                  void* access_violation_context)
++      : MMIOHandler(virtual_membase, physical_membase, membase_end, host_to_guest_virtual,
++                    host_to_guest_context, access_violation_callback, access_violation_context) {
++    global_handler_ = this;
++  }
++
++  bool Handle(Exception* ex) { return ExceptionCallback(ex); }
++};
++
++// The captured cycle-10 faulting instruction:
++//   66 43 0F 6F 24 10   movdqa (%r8,%r10,1),%xmm4
++// (0x43 = REX.X|REX.B, ModRM 0x24 = mod 00 / reg 100 (xmm4) / rm 100 (SIB),
++//  SIB 0x10 = scale 1 / index r10 / base r8).
++constexpr uint8_t kMovdqaInstruction[] = {0x66, 0x43, 0x0F, 0x6F, 0x24, 0x10};
++
++// The captured cycle-11 faulting instruction:
++//   66 41 0F 6F 4C 0D 00   movdqa 0x0(%r13,%rcx,1),%xmm1
++// (0x41 = REX.B, ModRM 0x4C = mod 01 / reg 001 (xmm1) / rm 100 (SIB),
++//  SIB 0x0D = scale 1 / index rcx / base 101 -> r13 with REX.B=1, disp8 0x00).
++// The mod 01 disp8 is part of the encoding, so the instruction is 7 bytes.
++constexpr uint8_t kMovdqaR13SibInstruction[] = {0x66, 0x41, 0x0F, 0x6F, 0x4C, 0x0D, 0x00};
++
++// The captured cycle-12 faulting instruction:
++//   66 41 0F 7F 04 04   movdqa %xmm0,(%r12,%rax,1)
++// (0x41 = REX.B, ModRM 0x04 = mod 00 / reg 000 (xmm0) / rm 100 (SIB),
++//  SIB 0x04 = scale 1 / index rax / base 100 -> r12 with REX.B=1).
++// SIB base 100 (rsp/r12) is a real base at mod 00, so there is no
++// displacement: objdump -D -b binary -m i386:x86-64 -M intel on the captured
++// logs/m9-accerr-stop1.insn.bin decodes exactly these 6 bytes as one
++// instruction and the next instruction starts at offset 6.
++constexpr uint8_t kMovdqaStoreInstruction[] = {0x66, 0x41, 0x0F, 0x7F, 0x04, 0x04};
++
++// The same store with an explicit disp32: ModRM 0x84 = mod 10 / reg 000 /
++// rm 100 (SIB), SIB 0x04 = scale 1 / index rax / base r12, disp32 0. objdump
++// decodes 66 41 0F 7F 84 04 00 00 00 00 as movdqa [r12+rax*1+0x0],xmm0 in
++// 10 bytes - the displacement is consumed as part of the instruction.
++constexpr uint8_t kMovdqaStoreDisp32Instruction[] = {0x66, 0x41, 0x0F, 0x7F, 0x84,
++                                                     0x04, 0x00, 0x00, 0x00, 0x00};
++
++// Records the ordered 32-bit MMIO callback writes.
++struct RangeWrites {
++  std::vector<uint32_t> addresses;
++  std::vector<uint32_t> values;
++};
++
++void WriteThunk(void* /*ppc_context*/, void* callback_context, uint32_t addr, uint32_t value) {
++  auto* writes = static_cast<RangeWrites*>(callback_context);
++  writes->addresses.push_back(addr);
++  writes->values.push_back(value);
++}
++
++}  // namespace
++
++#if REX_ARCH_AMD64
++
++TEST_CASE("MMIO decode: 66 REX 0F 6F MOVDQA load decodes dest XMM and length",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++
++  MMIOHandler::DecodedLoadStore decoded{};
++  REQUIRE(handler.TryDecodeLoadStore(kMovdqaInstruction, decoded));
++
++  // The 16-byte load form: load direction, no byte swap (same convention as the
++  // 32-bit MOV load form), XMM4 destination, 6-byte encoding.
++  CHECK(decoded.is_load);
++  CHECK_FALSE(decoded.byte_swap);
++  CHECK_FALSE(decoded.is_constant);
++  CHECK(decoded.value_reg == 4);
++  CHECK(decoded.length == 6);
++
++  // Generic ModRM/SIB parsing is reused unchanged: base r8, index r10, scale 1.
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 8);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 10);
++  CHECK(decoded.mem_scale == 1);
++  CHECK(decoded.mem_displacement == 0);
++}
++
++TEST_CASE("MMIO decode: 66 REX 0F 6F without SIB decodes with length",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++
++  // 66 0F 6F 08 = movdqa (%rax),%xmm1 (no REX, no SIB, mod 00).
++  const uint8_t instruction[] = {0x66, 0x0F, 0x6F, 0x08};
++  MMIOHandler::DecodedLoadStore decoded{};
++  REQUIRE(handler.TryDecodeLoadStore(instruction, decoded));
++  CHECK(decoded.is_load);
++  CHECK_FALSE(decoded.byte_swap);
++  CHECK(decoded.value_reg == 1);
++  CHECK(decoded.length == 4);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 0);
++  CHECK_FALSE(decoded.mem_has_index);
++}
++
++TEST_CASE("MMIO decode: existing 32-bit MOV/MOVBE forms are unchanged",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  MMIOHandler::DecodedLoadStore decoded{};
++
++  // 44 8B 24 02 = mov r12d, [rdx + rax*1]
++  const uint8_t mov_load[] = {0x44, 0x8B, 0x24, 0x02};
++  REQUIRE(handler.TryDecodeLoadStore(mov_load, decoded));
++  CHECK(decoded.is_load);
++  CHECK_FALSE(decoded.byte_swap);
++  CHECK(decoded.value_reg == 12);
++  CHECK(decoded.length == 4);
++  CHECK(decoded.mem_base_reg == 2);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 0);
++
++  // 0F 38 F0 8C 02 00 00 00 = movbe ecx, [rdx + rax*1]
++  const uint8_t movbe_load[] = {0x0F, 0x38, 0xF0, 0x8C, 0x02, 0x00, 0x00, 0x00};
++  REQUIRE(handler.TryDecodeLoadStore(movbe_load, decoded));
++  CHECK(decoded.is_load);
++  CHECK(decoded.byte_swap);
++  CHECK(decoded.value_reg == 1);
++  CHECK(decoded.length == 9);
++
++  // 89 0C 02 = mov [rdx + rax*1], ecx
++  const uint8_t mov_store[] = {0x89, 0x0C, 0x02};
++  REQUIRE(handler.TryDecodeLoadStore(mov_store, decoded));
++  CHECK_FALSE(decoded.is_load);
++  CHECK_FALSE(decoded.byte_swap);
++  CHECK(decoded.value_reg == 1);
++  CHECK(decoded.length == 3);
++}
++
++TEST_CASE("MMIO decode: unsupported prefixes and plain 0F 6F/0F 7F are declined",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  MMIOHandler::DecodedLoadStore decoded{};
++
++  // F3 0F 6F = MOVDQU load and F3 0F 7F = MOVDQU store (not accepted; only the
++  // aligned 0x66 forms are). F2 0F 7F is likewise declined.
++  const uint8_t movdqu_f3_load[] = {0xF3, 0x0F, 0x6F, 0x24, 0x10};
++  CHECK_FALSE(handler.TryDecodeLoadStore(movdqu_f3_load, decoded));
++  const uint8_t movdqu_f3_store[] = {0xF3, 0x0F, 0x7F, 0x24, 0x10};
++  CHECK_FALSE(handler.TryDecodeLoadStore(movdqu_f3_store, decoded));
++  const uint8_t f2_store[] = {0xF2, 0x0F, 0x7F, 0x24, 0x10};
++  CHECK_FALSE(handler.TryDecodeLoadStore(f2_store, decoded));
++
++  // 0F 6F/0F 7F without 0x66 are not 128-bit XMM forms.
++  const uint8_t no_prefix_load[] = {0x0F, 0x6F, 0x24, 0x10};
++  CHECK_FALSE(handler.TryDecodeLoadStore(no_prefix_load, decoded));
++  const uint8_t no_prefix_store[] = {0x0F, 0x7F, 0x24, 0x10};
++  CHECK_FALSE(handler.TryDecodeLoadStore(no_prefix_store, decoded));
++
++  // 66-prefixed 32-bit MOV: the 0x66 changes the operand size, so it must not
++  // fall through to the 32-bit MOV decoder.
++  const uint8_t prefixed_mov[] = {0x66, 0x8B, 0x24, 0x10};
++  CHECK_FALSE(handler.TryDecodeLoadStore(prefixed_mov, decoded));
++}
++
++TEST_CASE("MMIO decode: SIB base 101 with mod != 00 is a real rbp/r13 base",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  MMIOHandler::DecodedLoadStore decoded{};
++
++  // Captured cycle-11 site: mod 01, SIB base 101 + REX.B -> r13, index rcx,
++  // scale 1, disp8 0. The pre-fix parser declined this form unconditionally,
++  // which is only correct for mod 00. 7 bytes: mod 01 always carries disp8.
++  REQUIRE(handler.TryDecodeLoadStore(kMovdqaR13SibInstruction, decoded));
++  CHECK(decoded.is_load);
++  CHECK_FALSE(decoded.byte_swap);
++  CHECK(decoded.value_reg == 1);
++  CHECK(decoded.length == 7);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 13);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 1);
++  CHECK(decoded.mem_scale == 1);
++  CHECK(decoded.mem_displacement == 0);
++
++  // The same SIB base without REX.B is rbp (5); mod 10 carries a 4-byte
++  // displacement, so the encoding is 9 bytes.
++  const uint8_t rbp_mod10[] = {0x66, 0x0F, 0x6F, 0x8C, 0x0D, 0x00, 0x00, 0x00, 0x00};
++  REQUIRE(handler.TryDecodeLoadStore(rbp_mod10, decoded));
++  CHECK(decoded.length == 9);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 5);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 1);
++  CHECK(decoded.mem_scale == 1);
++  CHECK(decoded.mem_displacement == 0);
++}
++
++TEST_CASE("MMIO decode: SIB scale ss=01/10/11 decodes to 2/4/8",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  MMIOHandler::DecodedLoadStore decoded{};
++
++  // 66 41 0F 6F 4C <SIB> 00: mod 01, index rcx, base 101 + REX.B -> r13.
++  // The scale field is SIB bits 7-6, so it must shift by 6 (not 8).
++  const uint8_t scale2[] = {0x66, 0x41, 0x0F, 0x6F, 0x4C, 0x4D, 0x00};
++  REQUIRE(handler.TryDecodeLoadStore(scale2, decoded));
++  CHECK(decoded.mem_scale == 2);
++  CHECK(decoded.length == 7);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 13);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 1);
++
++  const uint8_t scale4[] = {0x66, 0x41, 0x0F, 0x6F, 0x4C, 0x8D, 0x00};
++  REQUIRE(handler.TryDecodeLoadStore(scale4, decoded));
++  CHECK(decoded.mem_scale == 4);
++  CHECK(decoded.length == 7);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 13);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 1);
++
++  const uint8_t scale8[] = {0x66, 0x41, 0x0F, 0x6F, 0x4C, 0xCD, 0x00};
++  REQUIRE(handler.TryDecodeLoadStore(scale8, decoded));
++  CHECK(decoded.mem_scale == 8);
++  CHECK(decoded.length == 7);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 13);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 1);
++}
++
++TEST_CASE("MMIO decode: SIB base 101 with mod 00 is the no-base absolute form",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  MMIOHandler::DecodedLoadStore decoded{};
++
++  // 66 0F 6F 0C 0D 78 56 34 12 = movdqa 0x12345678(,%rcx,1),%xmm1:
++  // mod 00, SIB base 101 -> no base, index rcx, scale 1, disp32 0x12345678.
++  // The no-base form always carries the 4-byte displacement (9 bytes total).
++  const uint8_t absolute[] = {0x66, 0x0F, 0x6F, 0x0C, 0x0D, 0x78, 0x56, 0x34, 0x12};
++  REQUIRE(handler.TryDecodeLoadStore(absolute, decoded));
++  CHECK(decoded.is_load);
++  CHECK(decoded.value_reg == 1);
++  CHECK(decoded.length == 9);
++  CHECK_FALSE(decoded.mem_has_base);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 1);
++  CHECK(decoded.mem_scale == 1);
++  CHECK(decoded.mem_displacement == 0x12345678);
++
++  // SIB index 100 (no index) with base 101 and mod 00 is the plain absolute
++  // [disp32] form: no base, no index, still 9 bytes.
++  const uint8_t absolute_no_index[] = {0x66, 0x0F, 0x6F, 0x0C, 0x25, 0x00, 0x00, 0x00, 0x00};
++  REQUIRE(handler.TryDecodeLoadStore(absolute_no_index, decoded));
++  CHECK(decoded.length == 9);
++  CHECK_FALSE(decoded.mem_has_base);
++  CHECK_FALSE(decoded.mem_has_index);
++  CHECK(decoded.mem_displacement == 0);
++}
++
++TEST_CASE("MMIO decode: 66 REX 0F 7F MOVDQA store decodes source XMM and length",
++          "[mmio][mmio_decode]") {
++  TestWindow window;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  MMIOHandler::DecodedLoadStore decoded{};
++
++  // Captured cycle-12 site: mod 00 / SIB base 100 + REX.B -> r12, index rax,
++  // scale 1. The 16-byte store direction, no byte swap, source xmm0, and the
++  // objdump-verified 6-byte encoding (base 100 at mod 00 has no displacement).
++  REQUIRE(handler.TryDecodeLoadStore(kMovdqaStoreInstruction, decoded));
++  CHECK_FALSE(decoded.is_load);
++  CHECK_FALSE(decoded.byte_swap);
++  CHECK_FALSE(decoded.is_constant);
++  CHECK(decoded.value_reg == 0);
++  CHECK(decoded.length == 6);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 12);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 0);
++  CHECK(decoded.mem_scale == 1);
++  CHECK(decoded.mem_displacement == 0);
++
++  // The same store with an explicit disp32 (mod 10) consumes all 4
++  // displacement bytes: objdump-verified 10-byte encoding.
++  REQUIRE(handler.TryDecodeLoadStore(kMovdqaStoreDisp32Instruction, decoded));
++  CHECK_FALSE(decoded.is_load);
++  CHECK_FALSE(decoded.byte_swap);
++  CHECK(decoded.value_reg == 0);
++  CHECK(decoded.length == 10);
++  CHECK(decoded.mem_has_base);
++  CHECK(decoded.mem_base_reg == 12);
++  CHECK(decoded.mem_has_index);
++  CHECK(decoded.mem_index_reg == 0);
++  CHECK(decoded.mem_scale == 1);
++  CHECK(decoded.mem_displacement == 0);
++}
++
++TEST_CASE("MMIO execute: 16-byte MOVDQA load reads four lanes and writes XMM",
++          "[mmio][mmio_execute]") {
++  TestWindow window;
++  RangeReads reads;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  REQUIRE(handler.RegisterRange(kGuestMmioBase, kGuestMmioMask, 0x10000, &reads, &ReadThunk,
++                                nullptr));
++
++  HostThreadContext context{};
++  context.rip = reinterpret_cast<uint64_t>(kMovdqaInstruction);
++  Exception ex;
++  const uint64_t fault = reinterpret_cast<uint64_t>(window.base() + 0x1000);
++  ex.InitializeAccessViolation(&context, fault, Exception::AccessViolationOperation::kRead);
++
++  CHECK(handler.Handle(&ex));
++
++  // Four ordered 32-bit callback reads at EA+0/4/8/12.
++  const uint32_t guest_ea = kGuestMmioBase + 0x1000;
++  REQUIRE(reads.addresses.size() == 4);
++  CHECK(reads.addresses[0] == guest_ea + 0);
++  CHECK(reads.addresses[1] == guest_ea + 4);
++  CHECK(reads.addresses[2] == guest_ea + 8);
++  CHECK(reads.addresses[3] == guest_ea + 12);
++
++  // Lane order: u32[0] is the first 4 bytes at EA (low dword of the XMM
++  // register). The MMIO callback returns guest (big-endian) 32-bit values, so
++  // each lane is byte-swapped exactly like the existing 32-bit MOV load path;
++  // u8[0] then holds the byte at EA+0, the memory-order bytes the faulting
++  // movdqa would have loaded.
++  const rex::vec128_t& dest = context.xmm_registers[4];
++  CHECK(dest.u32[0] == rex::byte_swap(reads.values[0]));
++  CHECK(dest.u32[1] == rex::byte_swap(reads.values[1]));
++  CHECK(dest.u32[2] == rex::byte_swap(reads.values[2]));
++  CHECK(dest.u32[3] == rex::byte_swap(reads.values[3]));
++
++  // XMM4 is marked modified and RIP advances past the 6-byte instruction.
++  CHECK((ex.modified_xmm_registers() & (UINT16_C(1) << 4)) != 0);
++  CHECK(context.rip == reinterpret_cast<uint64_t>(kMovdqaInstruction) + 6);
++}
++
++TEST_CASE("MMIO execute: 16-byte MOVDQA store writes four lanes from XMM",
++          "[mmio][mmio_execute]") {
++  TestWindow window;
++  RangeWrites writes;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  REQUIRE(handler.RegisterRange(kGuestMmioBase, kGuestMmioMask, 0x10000, &writes, nullptr,
++                                &WriteThunk));
++
++  HostThreadContext context{};
++  context.rip = reinterpret_cast<uint64_t>(kMovdqaStoreInstruction);
++  // A source XMM whose four lanes are pairwise distinguishable under the
++  // per-lane byte swap (every byte differs from its mirrored position).
++  context.xmm_registers[0].u32[0] = 0x01020304;
++  context.xmm_registers[0].u32[1] = 0x11223344;
++  context.xmm_registers[0].u32[2] = 0xA1B2C3D4;
++  context.xmm_registers[0].u32[3] = 0xDEADBEEF;
++  Exception ex;
++  const uint64_t fault = reinterpret_cast<uint64_t>(window.base() + 0x1000);
++  ex.InitializeAccessViolation(&context, fault, Exception::AccessViolationOperation::kWrite);
++
++  CHECK(handler.Handle(&ex));
++
++  // Four ordered 32-bit callback writes at EA+0/4/8/12, one per XMM lane.
++  const uint32_t guest_ea = kGuestMmioBase + 0x1000;
++  REQUIRE(writes.addresses.size() == 4);
++  CHECK(writes.addresses[0] == guest_ea + 0);
++  CHECK(writes.addresses[1] == guest_ea + 4);
++  CHECK(writes.addresses[2] == guest_ea + 8);
++  CHECK(writes.addresses[3] == guest_ea + 12);
++
++  // The MMIO callback takes guest (big-endian) 32-bit values, so each lane is
++  // byte-swapped exactly like the existing 32-bit MOV store path - the exact
++  // inverse of the 16-byte load path. Lane i, u8[0] of which is the byte at
++  // EA+4*i, is written as byte_swap(u32[i]).
++  CHECK(writes.values[0] == rex::byte_swap(0x01020304u));
++  CHECK(writes.values[1] == rex::byte_swap(0x11223344u));
++  CHECK(writes.values[2] == rex::byte_swap(0xA1B2C3D4u));
++  CHECK(writes.values[3] == rex::byte_swap(0xDEADBEEFu));
++
++  // RIP advances past the objdump-verified 6-byte instruction.
++  CHECK(context.rip == reinterpret_cast<uint64_t>(kMovdqaStoreInstruction) + 6);
++}
++
++TEST_CASE("MMIO execute: 16-byte MOVDQA store without a write callback is declined",
++          "[mmio][mmio_execute]") {
++  TestWindow window;
++  RangeWrites writes;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  // A matching range that cannot accept a store: no write callback.
++  REQUIRE(handler.RegisterRange(kGuestMmioBase, kGuestMmioMask, 0x10000, &writes, nullptr,
++                                nullptr));
++
++  HostThreadContext context{};
++  context.rip = reinterpret_cast<uint64_t>(kMovdqaStoreInstruction);
++  context.xmm_registers[0].u32[0] = 0x01020304;
++  context.xmm_registers[0].u32[1] = 0x11223344;
++  context.xmm_registers[0].u32[2] = 0xA1B2C3D4;
++  context.xmm_registers[0].u32[3] = 0xDEADBEEF;
++  Exception ex;
++  const uint64_t fault = reinterpret_cast<uint64_t>(window.base() + 0x1000);
++  ex.InitializeAccessViolation(&context, fault, Exception::AccessViolationOperation::kWrite);
++
++  // Declined (bounded failure-log path): no writes attempted, the source XMM
++  // is not touched, and RIP is not advanced.
++  CHECK_FALSE(handler.Handle(&ex));
++  CHECK(writes.addresses.empty());
++  CHECK(writes.values.empty());
++  CHECK((ex.modified_xmm_registers() & UINT16_C(1)) == 0);
++  CHECK(context.rip == reinterpret_cast<uint64_t>(kMovdqaStoreInstruction));
++}
++
++TEST_CASE("MMIO execute: a fault outside every registered range is not consumed",
++          "[mmio][mmio_execute]") {
++  TestWindow window;
++  RangeReads reads;
++  TestMMIOHandler handler(window.base(), window.physical_base(), window.end(), &HostToGuestThunk,
++                          &window, nullptr, nullptr);
++  REQUIRE(handler.RegisterRange(kGuestMmioBase, kGuestMmioMask, 0x10000, &reads, &ReadThunk,
++                                nullptr));
++
++  HostThreadContext context{};
++  context.rip = reinterpret_cast<uint64_t>(kMovdqaInstruction);
++  Exception ex;
++  // One 64 KB range past the GPU range: no registered range matches.
++  const uint64_t fault = reinterpret_cast<uint64_t>(window.base() + 0x20000);
++  ex.InitializeAccessViolation(&context, fault, Exception::AccessViolationOperation::kRead);
++
++  // The window page is readable/writable, so the pre-existing "another thread
++  // cleared the watch" branch consumes the fault without an MMIO access.
++  // (QueryProtect reports no-access unconditionally on non-Linux hosts, where
++  // the callback-less path returns false instead.)
++#if REX_PLATFORM_LINUX
++  CHECK(handler.Handle(&ex));
++#else
++  CHECK_FALSE(handler.Handle(&ex));
++#endif
++
++  CHECK(reads.addresses.empty());
++  CHECK((ex.modified_xmm_registers() & (UINT16_C(1) << 4)) == 0);
++  CHECK((ex.modified_int_registers() & (UINT16_C(1) << 4)) == 0);
++  CHECK(context.rip == reinterpret_cast<uint64_t>(kMovdqaInstruction));
++}
++
++#endif  // REX_ARCH_AMD64
++
++#if REX_PLATFORM_LINUX
++
++TEST_CASE("MMIO execute: a miss falls through to the access-violation callback",
++          "[mmio][mmio_execute]") {
++  // PROT_NONE makes QueryProtect report no-access for a fault outside every
++  // registered MMIO range, which is the pre-existing fall-through path.
++  void* page = mmap(nullptr, 4096, PROT_NONE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
++  REQUIRE(page != MAP_FAILED);
++
++  TestWindow window;
++  AvCallbackState av_state;
++  av_state.result = true;
++  TestMMIOHandler handler(static_cast<uint8_t*>(page), static_cast<uint8_t*>(page) + 4096,
++                          static_cast<uint8_t*>(page) + 4096, &HostToGuestThunk, &window,
++                          &AvCallbackThunk, &av_state);
++
++  HostThreadContext context{};
++  Exception ex;
++  const uint64_t fault = reinterpret_cast<uint64_t>(page) + 0x800;
++  ex.InitializeAccessViolation(&context, fault, Exception::AccessViolationOperation::kRead);
++
++  CHECK(handler.Handle(&ex));
++  CHECK(av_state.calls == 1);
++  CHECK(av_state.host_address == reinterpret_cast<void*>(fault));
++  CHECK_FALSE(av_state.is_write);
++  CHECK(context.rip == 0);  // no instruction was executed
++
++  CHECK(munmap(page, 4096) == 0);
++}
++
++#else
++
++TEST_CASE("MMIO execute: a miss falls through to the access-violation callback",
++          "[mmio][mmio_execute]") {
++  SKIP("PROT_NONE host pages are only set up on Linux in this test");
++}
++
++#endif  // REX_PLATFORM_LINUX
+-- 
+2.43.0
+

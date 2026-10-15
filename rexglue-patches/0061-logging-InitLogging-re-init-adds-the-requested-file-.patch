@@ -1,0 +1,104 @@
+From 41d5e1b38db3c8c93e9e4529b9798f1d2187bf3c Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 11:57:54 -0700
+Subject: [PATCH 61/97] logging: InitLogging re-init adds the requested
+ file/console sink (log_file was lost whenever a REX_* env override logged
+ before InitLogging)
+
+Any REX_* env var (e.g. REX_DEBUG_UI=false from the release launcher) made ApplyEnvironment log early; the later
+InitLogging took the re-init branch that only updated levels, so --log_file was never created. Wine gate PASS with
+REX_DEBUG_UI=false (log-fix-final-20260928), Linux smoke log present.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/logging/api.h |  3 ++-
+ src/core/logging.cpp      | 35 ++++++++++++++++++++++++++++++++++-
+ 2 files changed, 36 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/logging/api.h b/include/rex/logging/api.h
+index 1bbf6a0..70c5e72 100644
+--- a/include/rex/logging/api.h
++++ b/include/rex/logging/api.h
+@@ -40,7 +40,8 @@ namespace rex {
+  * Initialize the logging system with full configuration.
+  *
+  * Creates shared sinks and loggers for all built-in categories.
+- * Safe to call multiple times; subsequent calls update levels only.
++ * Safe to call multiple times; subsequent calls update levels, may add a
++ * requested console sink, and replace the file sink when its path changes.
+  *
+  * @param config  Logging configuration.
+  */
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 63e3a4e..32fe427 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -42,6 +42,7 @@ std::vector<LogCategoryEntry> g_registry;
+ // Shared default sinks (stored for pattern changes)
+ spdlog::sink_ptr g_console_sink;
+ spdlog::sink_ptr g_file_sink;
++std::string g_file_path;
+ 
+ // Extra global sinks added via AddSink()
+ std::vector<spdlog::sink_ptr> g_extra_sinks;
+@@ -109,10 +110,40 @@ void InitLogging(const LogConfig& config) {
+   std::lock_guard lock(g_mutex);
+ 
+   if (g_initialized) {
+-    // Re-initialization: update levels and config only
++    // Re-initialization: add any newly requested default sinks, then update config and levels.
+     g_config = config;
++
++    std::vector<spdlog::sink_ptr> new_sinks;
++    spdlog::sink_ptr replaced_file_sink;
++    if (config.log_to_console && !g_console_sink) {
++      auto sink = std::make_shared<spdlog::sinks::stdout_color_sink_mt>();
++      sink->set_level(spdlog::level::trace);
++      sink->set_pattern(config.console_pattern);
++      g_console_sink = sink;
++      new_sinks.push_back(std::move(sink));
++    }
++
++    if (config.log_file && (!g_file_sink || g_file_path != config.log_file)) {
++      auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(config.log_file, true);
++      sink->set_level(spdlog::level::trace);
++      sink->set_pattern(config.file_pattern);
++      replaced_file_sink = std::move(g_file_sink);
++      g_file_sink = sink;
++      g_file_path = config.log_file;
++      new_sinks.push_back(std::move(sink));
++    }
++
+     for (auto& entry : g_registry) {
+       if (entry.logger) {
++        auto& sinks = entry.logger->sinks();
++        if (replaced_file_sink) {
++          std::erase(sinks, replaced_file_sink);
++        }
++        for (const auto& sink : new_sinks) {
++          if (std::find(sinks.begin(), sinks.end(), sink) == sinks.end()) {
++            sinks.push_back(sink);
++          }
++        }
+         entry.logger->set_level(ResolveCategoryLevel(entry.name));
+         entry.logger->flush_on(config.flush_level);
+       }
+@@ -136,6 +167,7 @@ void InitLogging(const LogConfig& config) {
+     sink->set_level(spdlog::level::trace);
+     sink->set_pattern(config.file_pattern);
+     g_file_sink = sink;
++    g_file_path = config.log_file;
+   }
+ 
+   // Populate extra global sinks from config
+@@ -189,6 +221,7 @@ void ShutdownLogging() {
+   g_registry.clear();
+   g_console_sink.reset();
+   g_file_sink.reset();
++  g_file_path.clear();
+   g_extra_sinks.clear();
+   g_initialized = false;
+ }
+-- 
+2.43.0
+

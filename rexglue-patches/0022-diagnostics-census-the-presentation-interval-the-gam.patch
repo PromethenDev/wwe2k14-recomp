@@ -1,0 +1,139 @@
+From c5b7cc236d9640ebdb5d25732cca07d2c45d7abe Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 13:55:36 -0700
+Subject: [PATCH 22/97] diagnostics: census the presentation interval the game
+ requests per swap
+
+With WWE13_RATE_CENSUS=1, VdSwap reads the guest D3D device (VdGlobalDevice)
+field +0x36B0 that the WWE 13 swap path uses as its presentation interval and
+logs a per-second histogram as [rate-census-swap]. Shows entrances request
+interval 2 (30 FPS by design).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/rate_census.h  |  2 ++
+ src/core/rate_census.cpp               | 18 ++++++++++++++++++
+ src/kernel/xboxkrnl/xboxkrnl_video.cpp | 16 ++++++++++++++++
+ 3 files changed, 36 insertions(+)
+
+diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
+index 8ad8d4b..ffde2f5 100644
+--- a/include/rex/diagnostics/rate_census.h
++++ b/include/rex/diagnostics/rate_census.h
+@@ -58,6 +58,8 @@ std::optional<Sample> GetLatestSample();
+ void RecordVblank();
+ void RecordInterrupt(uint32_t source);
+ void RecordVdSwap();
++// Presentation interval requested by the game for the current swap.
++void RecordPresentInterval(uint32_t interval);
+ void RecordPresent();
+ void RecordGpuBusyStart();
+ void RecordGpuBusyEnd();
+diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
+index 0cb8648..3caab3e 100644
+--- a/src/core/rate_census.cpp
++++ b/src/core/rate_census.cpp
+@@ -80,6 +80,7 @@ struct Counters {
+   std::atomic<uint64_t> cp_phase_ns[kCpPhaseCount] = {};
+   std::atomic<uint64_t> cp_phase_calls[kCpPhaseCount] = {};
+   std::atomic<uint64_t> cp_wait_reg_mem_count{0};
++  std::atomic<uint64_t> present_interval[4] = {};  // 0, 1, 2, other
+ };
+ 
+ struct Snapshot {
+@@ -361,6 +362,12 @@ class RateCensus {
+     }
+   }
+ 
++  void RecordPresentInterval(uint32_t interval) {
++    if (enabled_.load(std::memory_order_relaxed)) {
++      counters_.present_interval[interval < 3 ? interval : 3].fetch_add(1, std::memory_order_relaxed);
++    }
++  }
++
+   void RecordPresent() {
+     if (enabled_.load(std::memory_order_relaxed)) {
+       counters_.present.fetch_add(1, std::memory_order_relaxed);
+@@ -664,6 +671,12 @@ class RateCensus {
+       sample.cp_wait_reg_mem_count = current.cp_wait_reg_mem_count - last.cp_wait_reg_mem_count;
+       const std::string wait_targets = TakeWaitTargets(elapsed_ms);
+       const std::string lock_waits = TakeLockWaits(elapsed_ms);
++      uint64_t intervals[4];
++      for (size_t i = 0; i < 4; ++i) {
++        const uint64_t now_count = counters_.present_interval[i].load(std::memory_order_relaxed);
++        intervals[i] = now_count - last_present_interval_[i];
++        last_present_interval_[i] = now_count;
++      }
+       uint64_t phase_calls[kCpPhaseCount];
+       for (size_t i = 0; i < kCpPhaseCount; ++i) {
+         phase_calls[i] = current.cp_phase_calls[i] - last.cp_phase_calls[i];
+@@ -701,6 +714,8 @@ class RateCensus {
+           phase_calls[size_t(CpPhase::kCopy)], phase_calls[size_t(CpPhase::kSwap)],
+           phase_calls[size_t(CpPhase::kSubmit)], wait_targets);
+       REXLOG_INFO("[rate-census-lock] t_ms={} waits={}", sample.t_ms, lock_waits);
++      REXLOG_INFO("[rate-census-swap] t_ms={} present_interval0={} interval1={} interval2={} other={}",
++                  sample.t_ms, intervals[0], intervals[1], intervals[2], intervals[3]);
+ 
+       last_host_ms = host_ms;
+       last_guest_ticks = guest_ticks;
+@@ -729,6 +744,7 @@ class RateCensus {
+   CpPhase cp_phase_stack_[kMaxPhaseDepth] = {};
+   uint32_t cp_phase_depth_ = 0;
+   uint64_t cp_phase_start_ns_ = 0;
++  uint64_t last_present_interval_[4] = {};
+   std::mutex lock_waits_mutex_;
+   std::vector<LockWait> lock_waits_;
+   bool owner_sampling_ = false;
+@@ -755,6 +771,8 @@ void RecordInterrupt(uint32_t source) { g_rate_census.RecordInterrupt(source); }
+ 
+ void RecordVdSwap() { g_rate_census.RecordVdSwap(); }
+ 
++void RecordPresentInterval(uint32_t interval) { g_rate_census.RecordPresentInterval(interval); }
++
+ void RecordPresent() { g_rate_census.RecordPresent(); }
+ 
+ void RecordGpuBusyStart() { g_rate_census.RecordGpuBusyStart(); }
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index c1c6c76..353ea9a 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -447,6 +447,9 @@ ppc_u32_result_t VdRetrainEDRAM_entry(ppc_unknown_t unk0, ppc_unknown_t unk1, pp
+   return 0;
+ }
+ 
++// Guest address of the VdGlobalDevice export (the game's D3D device pointer).
++static uint32_t g_vd_global_device_address = 0;
++
+ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
+                   ppc_pvoid_t fetch_ptr,       // frontbuffer Direct3D 9 texture header fetch
+                   ppc_pvoid_t unk2,            // system writeback ptr
+@@ -459,6 +462,18 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
+   // entry point. This is the measurable VdSwap -> presenter handoff latency;
+   // VdSwap itself does not synchronously call the presenter.
+   diagnostics::rate_census::RecordVdSwap();
++  if (diagnostics::rate_census::IsEnabled() && g_vd_global_device_address) {
++    // Census: the presentation interval the game's D3D asks for on this swap
++    // (device +0x36B0, read by the guest swap path sub_82B988D0: 0/1 = every
++    // vblank, 2 = every second vblank). WWE 13 D3D layout; diagnostic only.
++    auto memory = REX_KERNEL_MEMORY();
++    const uint32_t device =
++        memory::load_and_swap<uint32_t>(memory->TranslateVirtual(g_vd_global_device_address));
++    if (device) {
++      diagnostics::rate_census::RecordPresentInterval(
++          memory::load_and_swap<uint32_t>(memory->TranslateVirtual(device + 0x36B0)));
++    }
++  }
+ 
+   // All of these parameters are REQUIRED.
+   assert(buffer_ptr);
+@@ -543,6 +558,7 @@ void RegisterVideoExports(rex::runtime::ExportResolver* export_resolver,
+   // Pointer to a global D3D device. Games only seem to set this, so we don't
+   // have to do anything. We may want to read it back later, though.
+   uint32_t pVdGlobalDevice = memory->SystemHeapAlloc(4, 32, memory::kSystemHeapPhysical);
++  g_vd_global_device_address = pVdGlobalDevice;
+   export_resolver->SetVariableMapping("xboxkrnl.exe", 0x01BE, pVdGlobalDevice);
+   memory::store_and_swap<uint32_t>(memory->TranslateVirtual(pVdGlobalDevice), 0);
+ 
+-- 
+2.43.0
+

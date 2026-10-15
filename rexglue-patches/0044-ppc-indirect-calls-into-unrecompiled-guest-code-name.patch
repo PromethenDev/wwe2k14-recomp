@@ -1,0 +1,206 @@
+From ec8e27008c77439897c3078f48d5a5501cb8d63d Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 07:15:16 -0700
+Subject: [PATCH 44/97] ppc: indirect calls into unrecompiled guest code name
+ themselves
+
+PPC_CALL_INDIRECT_FUNC: an empty function-table entry now goes to a cold
+handler that logs '[missing-function] indirect call to 0x%08X ...' once per
+target and aborts (was: call through a null host pointer, crash with no guest
+context); WWE13_MISSING_FN_CONTINUE=1 returns instead (exploration only).
+Hit path: lookup + expected-taken null check. Unit test 2/2; ppc_tests
+1459/1459; Linux full-match gate PASS (out/linux-gate/mf-gate). Motivated by
+the 0x8328C3D0 lead (docs/gap-8328C3D0-20260925.md).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ppc/context.h                   | 18 +++++-
+ src/system/xmemory.cpp                      | 47 ++++++++++++++++
+ tests/unit/CMakeLists.txt                   |  1 +
+ tests/unit/system/missing_function_test.cpp | 61 +++++++++++++++++++++
+ 4 files changed, 125 insertions(+), 2 deletions(-)
+ create mode 100644 tests/unit/system/missing_function_test.cpp
+
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 9a8e00e..0f324ad 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -45,6 +45,12 @@ struct PPCContext;
+ // Function signature for recompiled PPC functions
+ using PPCFunc = void(PPCContext& ctx, uint8_t* base);
+ 
++// Called only when an indirect guest dispatch resolves to an empty function
++// table entry. Kept out of the lookup-hit path.
++void PPCHandleMissingIndirectFunction(PPCContext& ctx, uint8_t* base,
++                                      uint32_t guest_address);
++uint64_t PPCMissingIndirectFunctionCallCount() noexcept;
++
+ //=============================================================================
+ // Compiler-Specific Intrinsics
+ //=============================================================================
+@@ -145,8 +151,16 @@ using PPCFunc = void(PPCContext& ctx, uint8_t* base);
+ #undef PPC_CALL_INDIRECT_FUNC
+ #include <rex/perf/counter.h>
+ #define PPC_CALL_INDIRECT_FUNC(x) \
+-  PROFILE_FUNCTION_DISPATCHED();  \
+-  PPC_LOOKUP_FUNC(base, x)(ctx, base);
++  do { \
++    PROFILE_FUNCTION_DISPATCHED(); \
++    const uint32_t ppc_guest_target = uint32_t(x); \
++    PPCFunc* ppc_function = PPC_LOOKUP_FUNC(base, ppc_guest_target); \
++    if (__builtin_expect(ppc_function != nullptr, 1)) { \
++      ppc_function(ctx, base); \
++    } else { \
++      PPCHandleMissingIndirectFunction(ctx, base, ppc_guest_target); \
++    } \
++  } while (false)
+ 
+ #endif  // PPC_CONFIG_H_INCLUDED
+ 
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 75f8a94..83f138d 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -13,6 +13,9 @@
+ #include <atomic>
+ #include <chrono>
+ #include <cstring>
++#include <cstdlib>
++#include <mutex>
++#include <unordered_set>
+ #include <utility>
+ 
+ #include <fmt/format.h>
+@@ -30,6 +33,50 @@
+ // TODO(benvanik): move xbox.h out
+ #include <rex/system/xtypes.h>
+ 
++namespace {
++
++std::atomic<uint64_t> missing_indirect_function_calls{0};
++std::mutex missing_indirect_function_log_mutex;
++std::unordered_set<uint32_t> logged_missing_indirect_functions;
++
++}  // namespace
++
++#if defined(__clang__) || defined(__GNUC__)
++__attribute__((cold, noinline))
++#elif defined(_MSC_VER)
++__declspec(noinline)
++#endif
++void PPCHandleMissingIndirectFunction(PPCContext& ctx, [[maybe_unused]] uint8_t* base,
++                                      uint32_t guest_address) {
++  missing_indirect_function_calls.fetch_add(1, std::memory_order_relaxed);
++
++  bool should_log = false;
++  {
++    std::lock_guard lock(missing_indirect_function_log_mutex);
++    should_log = logged_missing_indirect_functions.insert(guest_address).second;
++  }
++
++  if (should_log) {
++    REXSYS_ERROR(
++        "[missing-function] indirect call to 0x{:08X} from lr=0x{:08X} ctr=0x{:08X}",
++        guest_address, uint32_t(ctx.lr), ctx.ctr.u32);
++    if (auto* logger = rex::GetLoggerRaw(rex::log::System)) {
++      logger->flush();
++    }
++  }
++
++  const char* continue_on_missing = std::getenv("WWE13_MISSING_FN_CONTINUE");
++  if (continue_on_missing && std::strcmp(continue_on_missing, "1") == 0) {
++    return;
++  }
++
++  std::abort();
++}
++
++uint64_t PPCMissingIndirectFunctionCallCount() noexcept {
++  return missing_indirect_function_calls.load(std::memory_order_relaxed);
++}
++
+ REXCVAR_DEFINE_BOOL(protect_zero, true, "Memory", "Protect the zero page from reads and writes")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 7301944..9396408 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -4,6 +4,7 @@ add_executable(unit_tests
+     memory/heap_allocation_test.cpp
+     memory/access_violation_recovery_test.cpp
+     system/mmio_handler_test.cpp
++    system/missing_function_test.cpp
+     kernel/object_table_test.cpp
+     core/cvar_test.cpp
+     core/fiber_test.cpp
+diff --git a/tests/unit/system/missing_function_test.cpp b/tests/unit/system/missing_function_test.cpp
+new file mode 100644
+index 0000000..720afb5
+--- /dev/null
++++ b/tests/unit/system/missing_function_test.cpp
+@@ -0,0 +1,61 @@
++#include <cstdlib>
++#include <optional>
++#include <string>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/ppc/context.h>
++
++namespace {
++
++class ScopedContinueEnvironment {
++ public:
++  ScopedContinueEnvironment() {
++    if (const char* current = std::getenv("WWE13_MISSING_FN_CONTINUE")) {
++      previous_ = current;
++    }
++#if defined(_WIN32)
++    succeeded_ = _putenv_s("WWE13_MISSING_FN_CONTINUE", "1") == 0;
++#else
++    succeeded_ = setenv("WWE13_MISSING_FN_CONTINUE", "1", 1) == 0;
++#endif
++  }
++
++  ~ScopedContinueEnvironment() {
++#if defined(_WIN32)
++    _putenv_s("WWE13_MISSING_FN_CONTINUE", previous_ ? previous_->c_str() : "");
++#else
++    if (previous_) {
++      setenv("WWE13_MISSING_FN_CONTINUE", previous_->c_str(), 1);
++    } else {
++      unsetenv("WWE13_MISSING_FN_CONTINUE");
++    }
++#endif
++  }
++
++  bool succeeded() const { return succeeded_; }
++
++ private:
++  std::optional<std::string> previous_;
++  bool succeeded_ = false;
++};
++
++}  // namespace
++
++TEST_CASE("missing indirect PPC functions can continue and count each miss", "[system][ppc]") {
++  ScopedContinueEnvironment continue_environment;
++  REQUIRE(continue_environment.succeeded());
++
++  PPCContext context{};
++  context.lr = 0x82345678;
++  context.ctr.u32 = 0x8328C3D0;
++
++  const uint64_t before = PPCMissingIndirectFunctionCallCount();
++  PPCHandleMissingIndirectFunction(context, nullptr, 0x8328C3D0);
++  CHECK(PPCMissingIndirectFunctionCallCount() == before + 1);
++
++  // Logging is one-shot per guest target, while the diagnostic counter counts
++  // every missing dispatch (including repeated exploration calls).
++  PPCHandleMissingIndirectFunction(context, nullptr, 0x8328C3D0);
++  CHECK(PPCMissingIndirectFunctionCallCount() == before + 2);
++}
+-- 
+2.43.0
+

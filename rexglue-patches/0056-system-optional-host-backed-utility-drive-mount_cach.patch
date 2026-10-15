@@ -1,0 +1,341 @@
+From 621753c702fb9b61376e70f6c71ef1ea340d22cb Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 15:32:50 -0700
+Subject: [PATCH 56/97] system: optional host-backed utility drive
+ (--mount_cache, default off) for the title's cache: partition
+
+Mounts <user_data_root>/cache_drive as \Device\Harddisk0\Cache0 = cache: when enabled; reports real host free space.
+With it, WWE 13 creates cache:\EditEx.cac (400 MB) and cache:\Spectacular.rps (150 MB); no behaviour difference was
+found in an A/B (docs/W6-CACHE-DRIVE.md in the game repo), so it stays off. Default path unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/CMakeLists.txt              |   1 +
+ src/system/cache_drive.cpp             |  93 +++++++++++++++++++++
+ src/system/cache_drive.h               |  21 +++++
+ src/system/runtime.cpp                 |  15 ++++
+ tests/unit/CMakeLists.txt              |   2 +
+ tests/unit/system/cache_drive_test.cpp | 111 +++++++++++++++++++++++++
+ 6 files changed, 243 insertions(+)
+ create mode 100644 src/system/cache_drive.cpp
+ create mode 100644 src/system/cache_drive.h
+ create mode 100644 tests/unit/system/cache_drive_test.cpp
+
+diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
+index e90504e..89c3b77 100644
+--- a/src/system/CMakeLists.txt
++++ b/src/system/CMakeLists.txt
+@@ -3,6 +3,7 @@
+ 
+ set(REXSYSTEM_SOURCES
+     runtime.cpp
++    cache_drive.cpp
+     kernel_state.cpp
+     xmemory.cpp
+     kernel_module.cpp
+diff --git a/src/system/cache_drive.cpp b/src/system/cache_drive.cpp
+new file mode 100644
+index 0000000..72dadd3
+--- /dev/null
++++ b/src/system/cache_drive.cpp
+@@ -0,0 +1,93 @@
++#include "cache_drive.h"
++
++#include <algorithm>
++#include <cstdint>
++#include <filesystem>
++#include <limits>
++#include <memory>
++#include <system_error>
++
++#include <rex/filesystem/devices/host_path_device.h>
++#include <rex/filesystem/vfs.h>
++#include <rex/logging.h>
++
++namespace rex::system::internal {
++namespace {
++
++constexpr std::uintmax_t kBytesPerAllocationUnit = 512;
++constexpr std::uintmax_t kMinimumUtilityCacheBytes = 0x09600000;
++
++std::uint32_t BytesToAllocationUnits(std::uintmax_t bytes) {
++  const auto units = bytes / kBytesPerAllocationUnit;
++  return static_cast<std::uint32_t>(
++      std::min(units, static_cast<std::uintmax_t>(std::numeric_limits<std::uint32_t>::max())));
++}
++
++class HostBackedCacheDevice final : public rex::filesystem::HostPathDevice {
++ public:
++  HostBackedCacheDevice(const std::filesystem::path& host_path)
++      : HostPathDevice(kUtilityCacheDevicePath, host_path, false) {}
++
++  std::uint32_t total_allocation_units() const override {
++    return BytesToAllocationUnits(QuerySpace().capacity);
++  }
++
++  std::uint32_t available_allocation_units() const override {
++    const auto space = QuerySpace();
++    return BytesToAllocationUnits(std::min(space.available, space.capacity));
++  }
++
++ private:
++  std::filesystem::space_info QuerySpace() const {
++    std::error_code error;
++    auto space = std::filesystem::space(host_path(), error);
++    if (error) {
++      return {};
++    }
++    return space;
++  }
++};
++
++}  // namespace
++
++bool SetupUtilityCacheDrive(rex::filesystem::VirtualFileSystem& file_system,
++                            const std::filesystem::path& user_data_root, bool enabled) {
++  if (!enabled) {
++    return true;
++  }
++  if (user_data_root.empty()) {
++    REXSYS_ERROR("Cannot mount utility cache: user_data_root is empty");
++    return false;
++  }
++
++  const auto host_path = std::filesystem::absolute(user_data_root) / "cache_drive";
++  auto device = std::make_unique<HostBackedCacheDevice>(host_path);
++  if (!device->Initialize()) {
++    REXSYS_ERROR("Failed to initialize utility cache host path: {}", host_path.string());
++    return false;
++  }
++
++  std::error_code space_error;
++  const auto host_space = std::filesystem::space(host_path, space_error);
++  if (space_error) {
++    REXSYS_WARN("Could not query free space for utility cache '{}': {}", host_path.string(),
++                space_error.message());
++  } else {
++    REXSYS_INFO("Utility cache host path '{}' has {} bytes available", host_path.string(),
++                host_space.available);
++    if (host_space.available < kMinimumUtilityCacheBytes) {
++      REXSYS_WARN("Utility cache has less than 150 MiB available; title cache setup may fail");
++    }
++  }
++
++  if (!file_system.RegisterDevice(std::move(device))) {
++    REXSYS_ERROR("Failed to register utility cache device at {}",
++                 kUtilityCacheDevicePath);
++    return false;
++  }
++  file_system.RegisterSymbolicLink(kUtilityCacheSymbolicLink, kUtilityCacheDevicePath);
++  REXSYS_INFO("Mounted {} at {}", host_path.string(), kUtilityCacheSymbolicLink);
++  return true;
++}
++
++}  // namespace rex::system::internal
+diff --git a/src/system/cache_drive.h b/src/system/cache_drive.h
+new file mode 100644
+index 0000000..14b6ebe
+--- /dev/null
++++ b/src/system/cache_drive.h
+@@ -0,0 +1,21 @@
++#pragma once
++
++#include <filesystem>
++#include <string_view>
++
++namespace rex::filesystem {
++class VirtualFileSystem;
++}
++
++namespace rex::system::internal {
++
++inline constexpr std::string_view kUtilityCacheDevicePath =
++    "\\Device\\Harddisk0\\Cache0";
++inline constexpr std::string_view kUtilityCacheSymbolicLink = "cache:";
++
++// When enabled, mount <user_data_root>/cache_drive as Cache0 and expose it at
++// cache:. A disabled call has no VFS or host-filesystem side effects.
++bool SetupUtilityCacheDrive(rex::filesystem::VirtualFileSystem& file_system,
++                            const std::filesystem::path& user_data_root, bool enabled);
++
++}  // namespace rex::system::internal
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index 7045304..f350458 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/cvar.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
+ #include <rex/filesystem/vfs.h>
+@@ -27,6 +28,12 @@
+ #include <rex/system/xthread.h>
+ #include <rex/thread.h>
+ 
++#include "cache_drive.h"
++
++REXCVAR_DEFINE_BOOL(mount_cache, false, "Filesystem",
++                    "Mount a host-backed utility cache drive at cache:")
++    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
++
+ namespace rex {
+ 
+ // Static instance for global access
+@@ -273,6 +280,14 @@ bool Runtime::SetupVfs() {
+     }
+   }
+ 
++  // Mount the optional utility cache before the broader Harddisk0 NullDevice,
++  // so Cache0 is the first matching device. The default-off helper is a no-op,
++  // preserving the existing cache: failure behavior.
++  if (!system::internal::SetupUtilityCacheDrive(*file_system_, user_data_root_,
++                                                REXCVAR_GET(mount_cache))) {
++    return false;
++  }
++
+   // Setup NullDevice for raw HDD partition accesses
+   // Cache/STFC code baked into games tries reading/writing to these
+   // Using a NullDevice returns success to all IO requests, allowing games
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 9396408..a5b9fa9 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -5,6 +5,7 @@ add_executable(unit_tests
+     memory/access_violation_recovery_test.cpp
+     system/mmio_handler_test.cpp
+     system/missing_function_test.cpp
++    system/cache_drive_test.cpp
+     kernel/object_table_test.cpp
+     core/cvar_test.cpp
+     core/fiber_test.cpp
+@@ -21,6 +22,7 @@ add_executable(unit_tests
+ 
+ target_include_directories(unit_tests PRIVATE
+     ${PROJECT_SOURCE_DIR}/include
++    ${PROJECT_SOURCE_DIR}/src
+ )
+ 
+ # rexsystem references rexkernel symbols; rescan the pair so the static link
+diff --git a/tests/unit/system/cache_drive_test.cpp b/tests/unit/system/cache_drive_test.cpp
+new file mode 100644
+index 0000000..0e75ee0
+--- /dev/null
++++ b/tests/unit/system/cache_drive_test.cpp
+@@ -0,0 +1,111 @@
++#include <algorithm>
++#include <chrono>
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <initializer_list>
++#include <limits>
++#include <memory>
++#include <string>
++#include <system_error>
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/cvar.h>
++#include <rex/filesystem/devices/null_device.h>
++#include <rex/filesystem/vfs.h>
++
++#include "system/cache_drive.h"
++
++REXCVAR_DECLARE(bool, mount_cache);
++
++namespace {
++
++std::uint32_t BytesToAllocationUnits(std::uintmax_t bytes) {
++  const auto units = bytes / 512;
++  return static_cast<std::uint32_t>(
++      std::min(units, static_cast<std::uintmax_t>(std::numeric_limits<std::uint32_t>::max())));
++}
++
++struct TemporaryDirectory {
++  std::filesystem::path path;
++
++  ~TemporaryDirectory() {
++    std::error_code error;
++    std::filesystem::remove_all(path, error);
++  }
++};
++
++struct ResetMountCacheFlag {
++  ~ResetMountCacheFlag() { rex::cvar::ResetToDefault("mount_cache"); }
++};
++
++}  // namespace
++
++TEST_CASE("utility cache mount is opt-in and resolves through Cache0", "[system][filesystem]") {
++  const auto unique_suffix = std::chrono::steady_clock::now().time_since_epoch().count();
++  TemporaryDirectory temp_root{std::filesystem::temp_directory_path() /
++                               ("rexglue-cache-drive-" + std::to_string(unique_suffix))};
++  REQUIRE(std::filesystem::create_directories(temp_root.path));
++
++  [[maybe_unused]] ResetMountCacheFlag reset_mount_cache;
++  const auto* mount_cache_info = rex::cvar::GetFlagInfo("mount_cache");
++  REQUIRE(mount_cache_info != nullptr);
++  CHECK(mount_cache_info->default_value == "false");
++  CHECK(mount_cache_info->lifecycle == rex::cvar::Lifecycle::kInitOnly);
++
++  rex::filesystem::VirtualFileSystem file_system;
++  const auto host_cache_path = temp_root.path / "cache_drive";
++  REXCVAR_SET(mount_cache, false);
++  REQUIRE(rex::system::internal::SetupUtilityCacheDrive(
++      file_system, temp_root.path, REXCVAR_GET(mount_cache)));
++  CHECK_FALSE(std::filesystem::exists(host_cache_path));
++
++  std::string symbolic_target;
++  CHECK_FALSE(file_system.FindSymbolicLink("cache:", symbolic_target));
++  CHECK(file_system.ResolvePath("cache:\\sample.bin") == nullptr);
++
++  REXCVAR_SET(mount_cache, true);
++  REQUIRE(rex::system::internal::SetupUtilityCacheDrive(
++      file_system, temp_root.path, REXCVAR_GET(mount_cache)));
++  CHECK(std::filesystem::exists(host_cache_path));
++  REQUIRE(file_system.FindSymbolicLink("cache:", symbolic_target));
++  CHECK(symbolic_target == rex::system::internal::kUtilityCacheDevicePath);
++
++  {
++    std::ofstream sample_file(host_cache_path / "sample.bin", std::ios::binary);
++    REQUIRE(sample_file.good());
++    sample_file.put('x');
++    REQUIRE(sample_file.good());
++  }
++
++  // The runtime registers this broader NullDevice after Cache0. Verify that
++  // first-match device routing preserves the host-backed child.
++  const std::initializer_list<std::string> null_paths = {
++      "\\Partition0", "\\Cache0", "\\Cache1"};
++  auto null_device = std::make_unique<rex::filesystem::NullDevice>("\\Device\\Harddisk0",
++                                                                   null_paths);
++  REQUIRE(null_device->Initialize());
++  REQUIRE(file_system.RegisterDevice(std::move(null_device)));
++
++  auto* cache_path_entry = file_system.ResolvePath("cache:\\sample.bin");
++  REQUIRE(cache_path_entry != nullptr);
++  CHECK(cache_path_entry->device()->mount_path() ==
++        std::string(rex::system::internal::kUtilityCacheDevicePath));
++
++  auto* raw_device_path_entry =
++      file_system.ResolvePath("\\Device\\Harddisk0\\Cache0\\sample.bin");
++  REQUIRE(raw_device_path_entry != nullptr);
++  CHECK(raw_device_path_entry->device()->mount_path() ==
++        std::string(rex::system::internal::kUtilityCacheDevicePath));
++
++  const auto* cache_device = cache_path_entry->device();
++  std::error_code space_error;
++  const auto host_space = std::filesystem::space(host_cache_path, space_error);
++  REQUIRE_FALSE(space_error);
++  CHECK(cache_device->total_allocation_units() == BytesToAllocationUnits(host_space.capacity));
++  CHECK(cache_device->available_allocation_units() ==
++        BytesToAllocationUnits(std::min(host_space.available, host_space.capacity)));
++  CHECK(cache_device->sectors_per_allocation_unit() == 1);
++  CHECK(cache_device->bytes_per_sector() == 0x200);
++}
+-- 
+2.43.0
+

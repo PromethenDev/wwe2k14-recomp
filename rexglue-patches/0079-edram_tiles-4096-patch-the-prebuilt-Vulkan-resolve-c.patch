@@ -1,0 +1,215 @@
+From eabbe5832760e39842b3ba9b422e4fb2178e4fe2 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 07:24:17 -0700
+Subject: [PATCH 79/97] edram_tiles=4096: patch the prebuilt Vulkan
+ resolve/clear modules' EDRAM modulus (2048 -> 4096 tiles); D3D12 refuses 4096
+
+The prebuilt resolve/clear compute shaders wrap EDRAM addresses at 2048 tiles (OpUMod 2621440 unscaled /
+tile stride * 2048 scaled); in the opt-in 4096-tile mode (WWE13 1080p) a 1920x1080 depth surface spans tiles
+1632..3264, so the modulus must be 4096 tiles there. Modules are copied and patched only at 4096 tiles; the
+default 2048 mode uses the original arrays (720p replay pixel-identical).
+NOT a fix for the intermittent 1080 tiled corruption: with direct_host_resolve=false, 20/30/16 corrupted samples
+per run with this patch vs 18/14 without (an earlier '0/74' was a broken run in 2048-tile mode that the
+corruption metric could not see - retracted).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/d3d12/render_target_cache.cpp  |  10 ++
+ src/graphics/vulkan/render_target_cache.cpp | 109 ++++++++++++++++++--
+ 2 files changed, 110 insertions(+), 9 deletions(-)
+
+diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
+index 13576d8..70d0b03 100644
+--- a/src/graphics/d3d12/render_target_cache.cpp
++++ b/src/graphics/d3d12/render_target_cache.cpp
+@@ -174,6 +174,16 @@ bool D3D12RenderTargetCache::Initialize() {
+   const ui::d3d12::D3D12Provider& provider = command_processor_.GetD3D12Provider();
+   ID3D12Device* device = provider.GetDevice();
+ 
++  // The prebuilt D3D12 resolve/clear bytecode retains 2048-tile EDRAM wraps.
++  // Until those DXBC shaders can be rebuilt for the extended ring, do not let
++  // the dynamically sized 4096-tile buffer be used with this backend.
++  if (xenos::GetEdramTileCount() == xenos::kEdramMaxTileCount) {
++    REXGPU_ERROR(
++        "[rex-edram] refusing edram_tiles=4096 on D3D12: prebuilt resolve/clear shaders "
++        "wrap at 2048 tiles; use Vulkan for 4096-tile mode");
++    return false;
++  }
++
+   if (REXCVAR_GET(render_target_path_d3d12) == "rtv") {
+     path_ = Path::kHostRenderTargets;
+   } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 443e528..45778a9 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -15,6 +15,7 @@
+ #include <cstdint>
+ #include <cstring>
+ #include <memory>
++#include <string>
+ #include <tuple>
+ #include <utility>
+ #include <vector>
+@@ -101,6 +102,41 @@ namespace shaders {
+ #include "../shaders/vulkan_spirv/resolve_full_8bpp_scaled_cs.h"
+ }  // namespace shaders
+ 
++namespace {
++
++// Prebuilt resolve SPIR-V stores EDRAM ring sizes in OpConstant instructions.
++// Replace just the single ring constant per shader module, keeping the original
++// arrays untouched so the 2048-tile mode continues to use the exact same words.
++bool PatchEdramResolveSpirvRingConstant(std::vector<uint32_t>& spirv, uint32_t from,
++                                        uint32_t to) {
++  constexpr uint32_t kSpirvMagic = 0x07230203;
++  constexpr uint32_t kSpirvHeaderWords = 5;
++  constexpr uint32_t kOpConstant = 43;
++  if (spirv.size() < kSpirvHeaderWords || spirv[0] != kSpirvMagic) {
++    return false;
++  }
++
++  size_t patched_constants = 0;
++  for (size_t word_index = kSpirvHeaderWords; word_index < spirv.size();) {
++    const uint32_t instruction = spirv[word_index];
++    const uint32_t instruction_word_count = instruction >> 16;
++    const uint32_t opcode = instruction & 0xFFFF;
++    if (!instruction_word_count || instruction_word_count > spirv.size() - word_index) {
++      return false;
++    }
++    // A 32-bit OpConstant is [instruction, type id, result id, literal].
++    if (opcode == kOpConstant && instruction_word_count == 4 &&
++        spirv[word_index + 3] == from) {
++      spirv[word_index + 3] = to;
++      ++patched_constants;
++    }
++    word_index += instruction_word_count;
++  }
++  return patched_constants == 1;
++}
++
++}  // namespace
++
+ const VulkanRenderTargetCache::ResolveCopyShaderCode
+     VulkanRenderTargetCache::kResolveCopyShaders[size_t(
+         draw_util::ResolveCopyShaderIndex::kCount)] = {
+@@ -560,6 +596,42 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+   dfn.vkUpdateDescriptorSets(device, 1, &edram_storage_buffer_descriptor_write, 0, nullptr);
+ 
+   bool draw_resolution_scaled = IsDrawResolutionScaled();
++  const bool extended_edram = xenos::GetEdramTileCount() == xenos::kEdramMaxTileCount;
++  std::vector<std::string> patched_resolve_shader_names;
++
++  // The unscaled compute shaders reduce EDRAM dword addresses modulo
++  // 2048 * 1280 (2,621,440). Scaled variants compute the same wrap as
++  // tile_stride * 2048. For 4096 tiles, patch only those ring constants to
++  // 5,242,880 or 4096 respectively. The 2047 masks elsewhere extract the
++  // 11-bit Xenos base-tile field or resolve-width bitfield, not the EDRAM ring.
++  auto create_resolve_compute_pipeline = [&](VkPipelineLayout pipeline_layout,
++                                             const uint32_t* shader_code,
++                                             size_t shader_code_size_bytes,
++                                             const std::string& shader_name) {
++    if (!extended_edram) {
++      return ui::vulkan::util::CreateComputePipeline(vulkan_device, pipeline_layout, shader_code,
++                                                     shader_code_size_bytes);
++    }
++    if (shader_code_size_bytes % sizeof(uint32_t)) {
++      REXGPU_ERROR("VulkanRenderTargetCache: Invalid SPIR-V size for {}", shader_name);
++      return VkPipeline(VK_NULL_HANDLE);
++    }
++    std::vector<uint32_t> patched_shader(
++        shader_code, shader_code + shader_code_size_bytes / sizeof(uint32_t));
++    const uint32_t ring_constant_from = draw_resolution_scaled ? 2048 : 2621440;
++    const uint32_t ring_constant_to = draw_resolution_scaled ? 4096 : 5242880;
++    if (!PatchEdramResolveSpirvRingConstant(patched_shader, ring_constant_from,
++                                           ring_constant_to)) {
++      REXGPU_ERROR(
++          "VulkanRenderTargetCache: Expected exactly one EDRAM ring constant {} in {}, "
++          "refusing the 4096-tile shader",
++          ring_constant_from, shader_name);
++      return VkPipeline(VK_NULL_HANDLE);
++    }
++    patched_resolve_shader_names.push_back(shader_name);
++    return ui::vulkan::util::CreateComputePipeline(vulkan_device, pipeline_layout,
++                                                   patched_shader.data(), shader_code_size_bytes);
++  };
+ 
+   // Resolve copy pipeline layout.
+   VkDescriptorSetLayout resolve_copy_descriptor_set_layouts[kResolveCopyDescriptorSetCount] = {};
+@@ -631,12 +703,16 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+     // Somewhat verification whether resolve_copy_shaders_ is up to date.
+     assert_true(resolve_copy_shader_code.unscaled && resolve_copy_shader_code.unscaled_size_bytes &&
+                 resolve_copy_shader_code.scaled && resolve_copy_shader_code.scaled_size_bytes);
+-    VkPipeline resolve_copy_pipeline = ui::vulkan::util::CreateComputePipeline(
+-        vulkan_device, resolve_copy_pipeline_layout_,
++    const std::string resolve_copy_shader_name =
++        std::string(resolve_copy_shader_info.debug_name) +
++        (draw_resolution_scaled ? " (scaled)" : " (unscaled)");
++    VkPipeline resolve_copy_pipeline = create_resolve_compute_pipeline(
++        resolve_copy_pipeline_layout_,
+         draw_resolution_scaled ? resolve_copy_shader_code.scaled
+                                : resolve_copy_shader_code.unscaled,
+         draw_resolution_scaled ? resolve_copy_shader_code.scaled_size_bytes
+-                               : resolve_copy_shader_code.unscaled_size_bytes);
++                               : resolve_copy_shader_code.unscaled_size_bytes,
++        resolve_copy_shader_name);
+     if (resolve_copy_pipeline == VK_NULL_HANDLE) {
+       REXGPU_ERROR(
+           "VulkanRenderTargetCache: Failed to create the resolve copy "
+@@ -870,12 +946,14 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+       Shutdown();
+       return false;
+     }
+-    resolve_fsi_clear_32bpp_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+-        vulkan_device, resolve_fsi_clear_pipeline_layout_,
++    resolve_fsi_clear_32bpp_pipeline_ = create_resolve_compute_pipeline(
++        resolve_fsi_clear_pipeline_layout_,
+         draw_resolution_scaled ? shaders::resolve_clear_32bpp_scaled_cs
+                                : shaders::resolve_clear_32bpp_cs,
+         draw_resolution_scaled ? sizeof(shaders::resolve_clear_32bpp_scaled_cs)
+-                               : sizeof(shaders::resolve_clear_32bpp_cs));
++                               : sizeof(shaders::resolve_clear_32bpp_cs),
++        draw_resolution_scaled ? "resolve_clear_32bpp (scaled)"
++                               : "resolve_clear_32bpp (unscaled)");
+     if (resolve_fsi_clear_32bpp_pipeline_ == VK_NULL_HANDLE) {
+       REXGPU_ERROR(
+           "VulkanRenderTargetCache: Failed to create the 32bpp resolve EDRAM "
+@@ -883,12 +961,14 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+       Shutdown();
+       return false;
+     }
+-    resolve_fsi_clear_64bpp_pipeline_ = ui::vulkan::util::CreateComputePipeline(
+-        vulkan_device, resolve_fsi_clear_pipeline_layout_,
++    resolve_fsi_clear_64bpp_pipeline_ = create_resolve_compute_pipeline(
++        resolve_fsi_clear_pipeline_layout_,
+         draw_resolution_scaled ? shaders::resolve_clear_64bpp_scaled_cs
+                                : shaders::resolve_clear_64bpp_cs,
+         draw_resolution_scaled ? sizeof(shaders::resolve_clear_64bpp_scaled_cs)
+-                               : sizeof(shaders::resolve_clear_64bpp_cs));
++                               : sizeof(shaders::resolve_clear_64bpp_cs),
++        draw_resolution_scaled ? "resolve_clear_64bpp (scaled)"
++                               : "resolve_clear_64bpp (unscaled)");
+     if (resolve_fsi_clear_64bpp_pipeline_ == VK_NULL_HANDLE) {
+       REXGPU_ERROR(
+           "VulkanRenderTargetCache: Failed to create the 64bpp resolve EDRAM "
+@@ -977,6 +1057,17 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
+   last_update_framebuffer_ = VK_NULL_HANDLE;
+ 
+   InitializeCommon();
++  if (extended_edram) {
++    std::string patched_shader_list;
++    for (const std::string& shader_name : patched_resolve_shader_names) {
++      if (!patched_shader_list.empty()) {
++        patched_shader_list += ", ";
++      }
++      patched_shader_list += shader_name;
++    }
++    REXGPU_INFO("[rex-edram] Vulkan 4096-tile prebuilt resolve SPIR-V patched: {}",
++                patched_shader_list);
++  }
+   return true;
+ }
+ 
+-- 
+2.43.0
+

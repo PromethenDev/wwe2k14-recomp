@@ -1,0 +1,11 @@
+# wwe2k14 - ReXGlue Codegen Configuration
+project_name = "wwe2k14"
+file_path = "game/default.xex"
+out_directory_path = "generated"
+
+includes = ["config/functions.toml"]
+
+# CRT setjmp/longjmp (same fix as WWE '13 8ade35d): without these libjpeg decodes (logos, Lettering,
+# custom images) take the error path and the game crashes.
+setjmp_address = 0x8343C4D0
+longjmp_address = 0x8343C1B0

@@ -1,0 +1,283 @@
+From a19db2cb5f0a485499cd0750331752ee2f97375f Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 07:27:38 -0700
+Subject: [PATCH 67/97] XMP custom music: Unicode-safe song names and file
+ opens on Windows (path::string() threw for names outside the ANSI code page,
+ e.g. superscript letters -> game crash on opening the entrance editor); _w
+ decoder opens + _wfopen for stb_vorbis; folder scan and decode wrapped so a
+ bad file is logged and skipped
+
+Reproduced under Wine with the owner's file name on 63f2a9e4 (0xE06D7363 crash); fixed build lists and plays it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/audio/custom_music_player.cpp |  41 ++++++++---
+ src/kernel/xam/apps/xmp_app.cpp   | 114 ++++++++++++++++--------------
+ 2 files changed, 93 insertions(+), 62 deletions(-)
+
+diff --git a/src/audio/custom_music_player.cpp b/src/audio/custom_music_player.cpp
+index 74e4da4..2fd6a31 100644
+--- a/src/audio/custom_music_player.cpp
++++ b/src/audio/custom_music_player.cpp
+@@ -15,8 +15,12 @@
+ #include <algorithm>
+ #include <cstring>
+ 
++#include <rex/filesystem.h>
++#include <rex/platform.h>
+ #include <rex/logging.h>
+ 
++#include <cstdio>
++
+ // The decoder implementations live in thirdparty/decoders/decoder_impl.cpp;
+ // only the declarations are needed here.
+ #include <decoders/dr_mp3.h>
+@@ -30,7 +34,7 @@ namespace rex::audio {
+ namespace {
+ 
+ const char* FormatName(const std::filesystem::path& path) {
+-  auto extension = path.extension().string();
++  auto extension = rex::path_to_utf8(path.extension());
+   std::transform(extension.begin(), extension.end(), extension.begin(), [](unsigned char c) {
+     return static_cast<char>(std::tolower(c));
+   });
+@@ -176,12 +180,19 @@ void ResampleToStereo(const std::vector<float>& input, uint32_t in_channels, uin
+ }
+ 
+ std::unique_ptr<TrackReader> OpenReader(const std::filesystem::path& path, std::string* error) {
+-  const std::string filename = path.string();
++#if REX_PLATFORM_WIN32
++  // Wide paths: song names often contain characters outside the ANSI code page.
++  const std::wstring filename = path.wstring();
++#define REX_MUSIC_OPEN(fn) fn##_w
++#else
++  const std::string filename = rex::path_to_utf8(path);
++#define REX_MUSIC_OPEN(fn) fn
++#endif
+   const char* format = FormatName(path);
+ 
+   if (std::strcmp(format, "mp3") == 0) {
+     auto reader = std::make_unique<Mp3Reader>();
+-    if (!drmp3_init_file(&reader->decoder, filename.c_str(), nullptr)) {
++    if (!REX_MUSIC_OPEN(drmp3_init_file)(&reader->decoder, filename.c_str(), nullptr)) {
+       *error = "dr_mp3 failed to open";
+       return nullptr;
+     }
+@@ -191,7 +202,7 @@ std::unique_ptr<TrackReader> OpenReader(const std::filesystem::path& path, std::
+   }
+   if (std::strcmp(format, "flac") == 0) {
+     auto reader = std::make_unique<FlacReader>();
+-    reader->decoder = drflac_open_file(filename.c_str(), nullptr);
++    reader->decoder = REX_MUSIC_OPEN(drflac_open_file)(filename.c_str(), nullptr);
+     if (!reader->decoder) {
+       *error = "dr_flac failed to open";
+       return nullptr;
+@@ -200,7 +211,7 @@ std::unique_ptr<TrackReader> OpenReader(const std::filesystem::path& path, std::
+   }
+   if (std::strcmp(format, "wav") == 0) {
+     auto reader = std::make_unique<WavReader>();
+-    if (!drwav_init_file(&reader->decoder, filename.c_str(), nullptr)) {
++    if (!REX_MUSIC_OPEN(drwav_init_file)(&reader->decoder, filename.c_str(), nullptr)) {
+       *error = "dr_wav failed to open";
+       return nullptr;
+     }
+@@ -209,7 +220,15 @@ std::unique_ptr<TrackReader> OpenReader(const std::filesystem::path& path, std::
+   if (std::strcmp(format, "ogg") == 0) {
+     auto reader = std::make_unique<VorbisReader>();
+     int vorbis_error = 0;
++#if REX_PLATFORM_WIN32
++    FILE* file = _wfopen(filename.c_str(), L"rb");
++    reader->decoder = file ? stb_vorbis_open_file(file, 1, &vorbis_error, nullptr) : nullptr;
++    if (file && !reader->decoder) {
++      std::fclose(file);
++    }
++#else
+     reader->decoder = stb_vorbis_open_filename(filename.c_str(), &vorbis_error, nullptr);
++#endif
+     if (!reader->decoder) {
+       *error = "stb_vorbis failed to open (" + std::to_string(vorbis_error) + ")";
+       return nullptr;
+@@ -223,6 +242,7 @@ std::unique_ptr<TrackReader> OpenReader(const std::filesystem::path& path, std::
+   *error = std::string("unsupported extension ") + format;
+   return nullptr;
+ }
++#undef REX_MUSIC_OPEN
+ 
+ }  // namespace
+ 
+@@ -328,9 +348,14 @@ void CustomMusicPlayer::WorkerMain() {
+     }
+ 
+     std::string error;
+-    auto track = DecodeCustomMusicFile(path, output_rate_.load(std::memory_order_relaxed), &error);
++    std::unique_ptr<CustomMusicTrack> track;
++    try {
++      track = DecodeCustomMusicFile(path, output_rate_.load(std::memory_order_relaxed), &error);
++    } catch (const std::exception& e) {
++      error = std::string("exception: ") + e.what();
++    }
+     if (!track) {
+-      REXLOG_ERROR("custom music: failed to decode '{}': {}", path.string(), error);
++      REXLOG_ERROR("custom music: failed to decode '{}': {}", rex::path_to_utf8(path), error);
+       std::lock_guard<std::mutex> guard(mutex_);
+       // A newer request may have arrived while decoding; only publish the
+       // failure if it did not.
+@@ -355,7 +380,7 @@ void CustomMusicPlayer::WorkerMain() {
+       sample_rate_.store(track->sample_rate, std::memory_order_relaxed);
+       duration_ms_.store(track->duration_ms, std::memory_order_relaxed);
+       REXLOG_INFO("custom music: play '{}' path={} decoder={} source_rate={}Hz duration={}ms",
+-                  name, path.string(), track->decoder, track->sample_rate, track->duration_ms);
++                  name, rex::path_to_utf8(path), track->decoder, track->sample_rate, track->duration_ms);
+       track_ = std::move(track);
+       cursor_ = 0;
+       state_.store(kPlaying, std::memory_order_relaxed);
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index d150c18..8055d49 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -229,7 +229,7 @@ X_HRESULT XmpApp::XMPPlayCustomSong(const CustomMusicSong* song) {
+   Player().SetVolume(volume_);
+   if (!Player().Play(song->path, rex::string::to_utf8(song->name))) {
+     REXKRNL_ERROR("XMP custom play failed to start for '{}' ({})", rex::string::to_utf8(song->name),
+-                  song->path.string());
++                  rex::path_to_utf8(song->path));
+     active_custom_song_ = {};
+     state_ = State::kIdle;
+     OnStateChanged();
+@@ -273,66 +273,72 @@ void XmpApp::OnStateChanged() {
+ 
+ void XmpApp::EnsureCustomMusicLoaded() {
+   std::call_once(custom_music_once_, [this]() {
+-    const std::string configured_directory = REXCVAR_GET(xmp_music_dir);
+-    std::filesystem::path music_directory =
+-        configured_directory.empty() ? rex::filesystem::GetExecutableFolder() / "music"
+-                                     : rex::to_path(configured_directory);
+-    std::error_code absolute_error;
+-    auto absolute_directory = std::filesystem::absolute(music_directory, absolute_error);
+-    if (!absolute_error) {
+-      music_directory = std::move(absolute_directory);
+-    }
++    try {
++      const std::string configured_directory = REXCVAR_GET(xmp_music_dir);
++      std::filesystem::path music_directory =
++          configured_directory.empty() ? rex::filesystem::GetExecutableFolder() / "music"
++                                       : rex::to_path(configured_directory);
++      std::error_code absolute_error;
++      auto absolute_directory = std::filesystem::absolute(music_directory, absolute_error);
++      if (!absolute_error) {
++        music_directory = std::move(absolute_directory);
++      }
+ 
+-    struct Candidate {
+-      std::filesystem::path path;
+-      std::string filename;
+-      std::string sort_key;
+-    };
+-    std::vector<Candidate> candidates;
+-    std::error_code directory_error;
+-    if (std::filesystem::is_directory(music_directory, directory_error) && !directory_error) {
+-      std::filesystem::directory_iterator iterator(music_directory, directory_error);
+-      const std::filesystem::directory_iterator end;
+-      while (!directory_error && iterator != end) {
+-        std::error_code file_error;
+-        if (iterator->is_regular_file(file_error) && !file_error) {
+-          const auto extension = LowerAscii(iterator->path().extension().string());
+-          if (extension == ".mp3" || extension == ".ogg" || extension == ".flac" ||
+-              extension == ".wav") {
+-            auto filename = iterator->path().filename().string();
+-            candidates.push_back(
+-                {iterator->path(), filename, LowerAscii(std::move(filename))});
++      struct Candidate {
++        std::filesystem::path path;
++        std::string filename;
++        std::string sort_key;
++      };
++      std::vector<Candidate> candidates;
++      std::error_code directory_error;
++      if (std::filesystem::is_directory(music_directory, directory_error) && !directory_error) {
++        std::filesystem::directory_iterator iterator(music_directory, directory_error);
++        const std::filesystem::directory_iterator end;
++        while (!directory_error && iterator != end) {
++          std::error_code file_error;
++          if (iterator->is_regular_file(file_error) && !file_error) {
++            const auto extension = LowerAscii(rex::path_to_utf8(iterator->path().extension()));
++            if (extension == ".mp3" || extension == ".ogg" || extension == ".flac" ||
++                extension == ".wav") {
++              auto filename = rex::path_to_utf8(iterator->path().filename());
++              candidates.push_back(
++                  {iterator->path(), filename, LowerAscii(std::move(filename))});
++            }
+           }
++          iterator.increment(directory_error);
+         }
+-        iterator.increment(directory_error);
+       }
+-    }
+ 
+-    std::sort(candidates.begin(), candidates.end(), [](const Candidate& left,
+-                                                       const Candidate& right) {
+-      if (left.sort_key != right.sort_key) {
+-        return left.sort_key < right.sort_key;
+-      }
+-      return left.filename < right.filename;
+-    });
+-
+-    custom_music_songs_.reserve(candidates.size());
+-    for (const auto& candidate : candidates) {
+-      auto name = rex::string::to_utf16(candidate.path.stem().string());
+-      if (name.size() > 19) {
+-        name.resize(19);
+-        if (!name.empty() && name.back() >= 0xD800 && name.back() <= 0xDBFF) {
+-          name.pop_back();
++      std::sort(candidates.begin(), candidates.end(), [](const Candidate& left,
++                                                         const Candidate& right) {
++        if (left.sort_key != right.sort_key) {
++          return left.sort_key < right.sort_key;
+         }
++        return left.filename < right.filename;
++      });
++
++      custom_music_songs_.reserve(candidates.size());
++      for (const auto& candidate : candidates) {
++        auto name = rex::path_to_utf16(candidate.path.stem());
++        if (name.size() > 19) {
++          name.resize(19);
++          if (!name.empty() && name.back() >= 0xD800 && name.back() <= 0xDBFF) {
++            name.pop_back();
++          }
++        }
++        const uint32_t format = LowerAscii(rex::path_to_utf8(candidate.path.extension())) == ".mp3" ? 1 : 0;
++        custom_music_songs_.push_back(
++            {static_cast<uint32_t>(custom_music_songs_.size() + 1), candidate.path,
++             std::move(name), format});
+       }
+-      const uint32_t format = LowerAscii(candidate.path.extension().string()) == ".mp3" ? 1 : 0;
+-      custom_music_songs_.push_back(
+-          {static_cast<uint32_t>(custom_music_songs_.size() + 1), candidate.path,
+-           std::move(name), format});
+-    }
+ 
+-    REXKRNL_INFO("custom music folder {}: {} songs", rex::path_to_utf8(music_directory),
+-                 custom_music_songs_.size());
++      REXKRNL_INFO("custom music folder {}: {} songs", rex::path_to_utf8(music_directory),
++                   custom_music_songs_.size());
++    } catch (const std::exception& e) {
++      // A song file name or folder the host cannot handle must never take the game down.
++      custom_music_songs_.clear();
++      REXKRNL_ERROR("custom music folder scan failed: {}", e.what());
++    }
+   });
+ }
+ 
+@@ -402,7 +408,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+         return X_E_NOTFOUND;
+       }
+       REXKRNL_INFO("XMP play request: {} ({}) handle={:08X}", rex::string::to_utf8(song_name),
+-                   selected_song->path.string(), song_handle);
++                   rex::path_to_utf8(selected_song->path), song_handle);
+       return XMPPlayCustomSong(selected_song);
+     }
+     case 0x00070002: {
+-- 
+2.43.0
+

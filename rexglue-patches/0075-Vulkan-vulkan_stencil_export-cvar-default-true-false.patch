@@ -1,0 +1,44 @@
+From 8ea55a4c2da6c4b5aaae547e3ad7dc2f1de79502 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 21:55:18 -0700
+Subject: [PATCH 75/97] Vulkan: vulkan_stencil_export cvar (default true) -
+ false forces the per-bit stencil fallback
+
+A/B for WWE13 BUG-7 (Radeon 780M: dark box over one predicated-tiling strip during entrances/cutscenes at 480p;
+NVIDIA, which lacks the extension and uses the fallback fixed in 96aa05b, does not show it).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/vulkan/vulkan_device.cpp | 9 +++++++--
+ 1 file changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index c6f48fd..1450437 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -21,6 +21,9 @@
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/device.h>
+ 
++REXCVAR_DEFINE_BOOL(vulkan_stencil_export, true, "UI/Vulkan",
++                    "Use VK_EXT_shader_stencil_export when available (false = per-bit stencil fallback, as on "
++                    "NVIDIA; WWE13 BUG-7 A/B for the Radeon 780M)");
+ REXCVAR_DEFINE_BOOL(vulkan_require_fragment_stores_and_atomics, true, "UI/Vulkan",
+                     "Deprecated and ignored for parity; fragmentStoresAndAtomics is always "
+                     "required for Vulkan GPU emulation")
+@@ -212,8 +215,10 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_sampler_mirror_clamp_to_edge, 1, 2)
+     // #70. Must be enabled for VK_KHR_sampler_ycbcr_conversion.
+     XE_UI_VULKAN_LOCAL_PROMOTED_EXTENSION(KHR_maintenance1, 1, 1)
+-    // #141.
+-    XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
++    // #141. vulkan_stencil_export=false forces the per-bit stencil fallback used by GPUs without it.
++    if (REXCVAR_GET(vulkan_stencil_export)) {
++      XE_UI_VULKAN_STRUCT_EXTENSION(EXT_shader_stencil_export)
++    }
+     // #148.
+     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_image_format_list, 1, 2)
+     if (get_physical_device_properties2_supported) {
+-- 
+2.43.0
+

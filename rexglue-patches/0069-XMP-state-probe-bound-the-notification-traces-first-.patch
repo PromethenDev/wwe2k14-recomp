@@ -1,0 +1,81 @@
+From 6bcefbdef95f33950b22233250179e04edac737f Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 17:56:50 -0700
+Subject: [PATCH 69/97] XMP state probe: bound the notification traces (first
+ 64, then 1 in 100) - reviewer finding
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xam/apps/xmp_app.cpp | 21 ++++++++++++++++-----
+ 1 file changed, 16 insertions(+), 5 deletions(-)
+
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index 87514b0..a276d42 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -61,6 +61,17 @@ bool XmpStateProbeEnabled() {
+   return enabled;
+ }
+ 
++// Notification traces fire on every XMP state/behaviour/controller change; keep them bounded even
++// with the probe on (first 64 lines, then 1 in 100).
++bool XmpStateProbeNotifyLog() {
++  if (!XmpStateProbeEnabled()) {
++    return false;
++  }
++  static std::atomic<uint64_t> notify_log_count{0};
++  const uint64_t count = notify_log_count.fetch_add(1, std::memory_order_relaxed) + 1;
++  return count <= 64 || count % 100 == 0;
++}
++
+ }  // namespace
+ 
+ XmpApp::XmpApp(KernelState* kernel_state)
+@@ -195,7 +206,7 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
+   active_song_index_ = 0;
+   state_ = State::kPlaying;
+   OnStateChanged();
+-  if (XmpStateProbeEnabled()) {
++  if (XmpStateProbeNotifyLog()) {
+     REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=1 (playlist play)");
+   }
+   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+@@ -256,7 +267,7 @@ X_HRESULT XmpApp::XMPPlayCustomSong(const CustomMusicSong* song) {
+   }
+   state_ = State::kPlaying;
+   OnStateChanged();
+-  if (XmpStateProbeEnabled()) {
++  if (XmpStateProbeNotifyLog()) {
+     REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=1 (custom play)");
+   }
+   kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 1);
+@@ -290,7 +301,7 @@ X_HRESULT XmpApp::XMPPrevious() {
+ }
+ 
+ void XmpApp::OnStateChanged() {
+-  if (XmpStateProbeEnabled()) {
++  if (XmpStateProbeNotifyLog()) {
+     REXKRNL_INFO("[xmp-state-probe] notify 0x0a000001 param={}",
+                  static_cast<uint32_t>(state_));
+   }
+@@ -494,7 +505,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       playback_mode_ = static_cast<PlaybackMode>(uint32_t(args->playback_mode));
+       repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
+       unknown_flags_ = args->flags;
+-      if (XmpStateProbeEnabled()) {
++      if (XmpStateProbeNotifyLog()) {
+         REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=0 (playback behavior set)");
+       }
+       kernel_state_->BroadcastNotification(kMsgPlaybackBehaviorChanged, 0);
+@@ -641,7 +652,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                     uint32_t(args->playback_client));
+ 
+       playback_client_ = PlaybackClient(uint32_t(args->playback_client));
+-      if (XmpStateProbeEnabled()) {
++      if (XmpStateProbeNotifyLog()) {
+         REXKRNL_INFO(
+             "[xmp-state-probe] XMPSetPlaybackController controller={} client={} -> notify 0x0a000003 param={}",
+             uint32_t(args->controller), uint32_t(args->playback_client),
+-- 
+2.43.0
+

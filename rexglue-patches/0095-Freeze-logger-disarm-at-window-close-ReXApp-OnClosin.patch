@@ -1,0 +1,42 @@
+From 83485aef4a265ed2618b90a907e75d62658cbc43 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 13:03:25 -0700
+Subject: [PATCH 95/97] Freeze logger: disarm at window close
+ (ReXApp::OnClosing, before TerminateTitle) - teardown can block > 10 s and
+ the still-armed watchdog wrote a spurious freeze report after the owner
+ closed WWE 2K14 rc3; verified: real close = 0 reports, forced spin still
+ detected
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/rex_app.cpp | 7 +++++++
+ 1 file changed, 7 insertions(+)
+
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 43a8813..b72211e 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -14,6 +14,7 @@
+ #include <chrono>
+ 
+ #include <rex/cvar.h>
++#include <rex/diagnostics/freeze_logger.h>
+ #include <rex/ui/flags.h>
+ #include <rex/kernel/crt/heap.h>
+ #include <rex/filesystem.h>
+@@ -368,6 +369,12 @@ void ReXApp::OnKeyDown(ui::KeyEvent& e) {
+ void ReXApp::OnClosing(ui::UIEvent& e) {
+   (void)e;
+   REXLOG_INFO("Window closing, shutting down...");
++  // Disarm the always-on freeze watchdog before TerminateTitle() / teardown:
++  // those can block past the present-gap, which used to make the still-armed
++  // watchdog write a spurious freeze report ~10 s after the player closed the
++  // window. Safe no-op when the logger was never started.
++  rex::diagnostics::freeze_logger::Stop();
++  REXLOG_INFO("[freeze-logger] disarmed at window close");
+   shutting_down_.store(true, std::memory_order_release);
+   if (runtime_ && runtime_->kernel_state()) {
+     runtime_->kernel_state()->TerminateTitle();
+-- 
+2.43.0
+

@@ -1,0 +1,1575 @@
+From 1c256349a86fe319218bf8a0b845cc8a8ba76cb4 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 12:48:59 -0700
+Subject: [PATCH 03/97] graphics: texture fetch-constant fix, Vulkan command
+ processor, content probe
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/command_processor.h      |  16 +
+ include/rex/graphics/flags.h                  |   1 +
+ include/rex/graphics/util/content_probe.h     | 280 ++++++++++++++
+ .../rex/graphics/vulkan/command_processor.h   |  45 +++
+ src/graphics/CMakeLists.txt                   |   1 +
+ src/graphics/command_processor.cpp            |  19 +-
+ src/graphics/flags.cpp                        |   2 +
+ src/graphics/pipeline/texture/cache.cpp       |  86 +++++
+ src/graphics/util/content_probe.cpp           | 217 +++++++++++
+ src/graphics/vulkan/command_processor.cpp     | 361 +++++++++++++++++-
+ src/graphics/vulkan/render_target_cache.cpp   |  10 +
+ src/ui/vulkan/vulkan_util.cpp                 | 239 +++++++++++-
+ 12 files changed, 1264 insertions(+), 13 deletions(-)
+ create mode 100644 include/rex/graphics/util/content_probe.h
+ create mode 100644 src/graphics/util/content_probe.cpp
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 6998a45..d3402fb 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -24,6 +24,7 @@
+ #include <rex/graphics/register_file.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/trace_writer.h>
++#include <rex/graphics/util/content_probe.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/memory.h>
+ #include <rex/memory/ring_buffer.h>
+@@ -143,6 +144,12 @@ class CommandProcessor {
+   bool Save(::rex::stream::ByteStream* stream);
+   bool Restore(::rex::stream::ByteStream* stream);
+ 
++  // Content probe: increment resolve-executed clear counter (zero overhead
++  // when the gpu_content_probe cvar is off)
++  void IncrementClearCount() { content_probe_counters_.OnResolveClearExecuted(); }
++  // Content probe: reset per-second counters
++  void ResetContentProbeCounters() { content_probe_counters_.Reset(); }
++
+  protected:
+   struct IndexBufferInfo {
+     xenos::IndexFormat format = xenos::IndexFormat::kInt16;
+@@ -178,6 +185,12 @@ class CommandProcessor {
+   const reg::DC_LUT_PWL_DATA* gamma_ramp_pwl_rgb() const { return gamma_ramp_pwl_rgb_[0]; }
+   virtual void OnGammaRamp256EntryTableValueWritten() {}
+   virtual void OnGammaRampPWLValueWritten() {}
++  // Content probe (sub-second ordering): monotonic guest-frame ordinal used to
++  // stamp clear-register writes. The default body returns 0 so non-Vulkan
++  // subclasses (D3D12) compile unchanged; the only call site is inside the
++  // default-off gpu_content_probe cvar gate in WriteRegister, so this is
++  // zero-cost when the probe is disabled.
++  virtual uint64_t ContentProbeFrameOrdinal() const { return 0; }
+ 
+   virtual void MakeCoherent();
+   virtual void PrepareForWait();
+@@ -271,6 +284,9 @@ class CommandProcessor {
+ 
+   uint32_t counter_ = 0;
+ 
++  // Content probe counters (zero overhead when gpu_content_probe is false)
++  content_probe::ProbeCounters content_probe_counters_;
++
+   uint32_t primary_buffer_ptr_ = 0;
+   uint32_t primary_buffer_size_ = 0;
+ 
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index e0679b8..6a9a12b 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -50,6 +50,7 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
+ 
+ // GPU Textures
+ REXCVAR_DECLARE(bool, gpu_allow_invalid_fetch_constants);
++REXCVAR_DECLARE(bool, gpu_content_probe);
+ REXCVAR_DECLARE(bool, gpu_3d_to_2d_texture);
+ REXCVAR_DECLARE(int32_t, anisotropic_override);
+ REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
+diff --git a/include/rex/graphics/util/content_probe.h b/include/rex/graphics/util/content_probe.h
+new file mode 100644
+index 0000000..d2004c6
+--- /dev/null
++++ b/include/rex/graphics/util/content_probe.h
+@@ -0,0 +1,280 @@
++/**
++ * @file        content_probe.h
++ * @brief       Lightweight host-side content analysis for GPU-resident buffers
++ *
++ * Computes mean luma and a stable content hash over stride-sampled pixels
++ * from a raw RGBA8 or single-channel byte buffer. Used by the per-second
++ * content probe diagnostic (REXCVAR gpu_content_probe).
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay
++ * @license     BSD 3-Clause License
++ */
++
++#pragma once
++
++#include <cstddef>
++#include <cstdint>
++
++namespace rex::graphics::content_probe {
++
++/// Sample stride for luma/hash computation.
++/// Each Nth pixel is sampled; stride=1 means every pixel.
++constexpr uint32_t kDefaultStride = 4;
++
++// Evidence-derived guest-address ranges of the resolve targets monitored by
++// the per-second content probe. The spans match the "potentially modified
++// memory range" of the Resolve trace lines for the adjudicated cycle-152
++// targets (logs/cycle150-game.log):
++// - kFront  [0x10855000, 0x10BED000) - 1280x720 k_8_8_8_8 (span 0x398000).
++// - kScene0 [0x1F591000, 0x1F5A1000) - 256x256 k_8 (span 0x11000).
++// - kScene1 [0x1F9FF000, 0x1FBFF000) - 512x512 k_16_16_16_16 (span 0x200000).
++constexpr uint32_t kFrontRangeStart = 0x10855000u;
++constexpr uint32_t kFrontRangeEnd = 0x10BED000u;
++constexpr uint32_t kScene0RangeStart = 0x1F591000u;
++constexpr uint32_t kScene0RangeEnd = 0x1F5A1000u;
++constexpr uint32_t kScene1RangeStart = 0x1F9FF000u;
++constexpr uint32_t kScene1RangeEnd = 0x1FBFF000u;
++
++// Full-surface dimensions of each probe target (cycle-150/152 Resolve trace
++// evidence). Content samples are only taken from resolves that cover exactly
++// this surface: the cycle-157 smoke showed scene-1 partial (0,0)-origin
++// resolves of 168x280 and 152x296 that would otherwise be sampled with a
++// luma/hash baseline not comparable to the full-surface one.
++constexpr uint32_t kFrontWidth = 1280;
++constexpr uint32_t kFrontHeight = 720;
++constexpr uint32_t kScene0Width = 256;
++constexpr uint32_t kScene0Height = 256;
++constexpr uint32_t kScene1Width = 512;
++constexpr uint32_t kScene1Height = 512;
++
++// Cycle-152 adjudicated lower-right clock box (1084,629)-(1125,650) = 42x22
++// pixels - the only region that changes during the in-match HUD-only black
++// stall. The last pixel is (1125,650), so a surface must be at least
++// 1126x651 for the box sample to stay in bounds.
++constexpr uint32_t kClockBoxX = 1084;
++constexpr uint32_t kClockBoxY = 629;
++constexpr uint32_t kClockBoxWidth = 42;
++constexpr uint32_t kClockBoxHeight = 22;
++
++/// Identity of a resolve destination extent matched against the probe ranges.
++enum class ProbeTargetId : uint32_t {
++  kNone = 0,
++  kFront = 1,
++  kScene0 = 2,
++  kScene1 = 3,
++};
++
++/// Number of probe targets (kFront, kScene0, kScene1).
++constexpr uint32_t kProbeTargetCount = 3;
++
++/// Matches a resolve destination extent [extent_start, extent_end) against the
++/// evidence-derived probe target ranges. The extent must lie fully inside
++/// exactly one range; an empty/inverted extent, an unknown address, or an
++/// extent straddling a range boundary returns kNone.
++ProbeTargetId MatchProbeTarget(uint32_t extent_start, uint32_t extent_end);
++
++/// Base guest address of a matched probe target range (0 for kNone).
++uint32_t ProbeTargetBase(ProbeTargetId target);
++
++/// Whether a resolve destination of the given dimensions is the full surface
++/// of the matched probe target (front 1280x720, scene0 256x256, scene1
++/// 512x512). Partial-surface resolves are rejected before any content copy.
++bool IsFullSurfaceResolve(uint32_t width, uint32_t height, ProbeTargetId target);
++
++/// Whether a surface is large enough to sample the clock box without reading
++/// past its last pixel (width >= 1126 && height >= 651).
++bool IsClockBoxSampleable(uint32_t width, uint32_t height);
++
++/// Pure per-interval slot state of one probe target (mirrors the Vulkan-side
++/// ContentProbeSlotInfo POD, no Vulkan dependency so the consumption reset is
++/// unit-testable). A slot is consumed at emission time by Reset(), so an
++/// interval without a full-surface record emits the documented no-sample
++/// sentinel (base=0, w=h=0, luma=hash=0, frame=0) instead of re-emitting a
++/// stale snapshot.
++struct ProbeSlot {
++  // A full-surface resolve was recorded into this double-buffered slot.
++  bool recorded = false;
++  // The recorded resolve was copied into the readback buffer and can be
++  // sampled (set only together with recorded=true).
++  bool sampled = false;
++  uint32_t base = 0;
++  uint32_t width = 0;
++  uint32_t height = 0;
++  uint32_t pitch = 0;
++  uint32_t bpp_log2 = 0;
++  uint32_t length = 0;
++  // Monotonic frame counter at record time (0 when no sample).
++  uint64_t frame = 0;
++
++  /// Consume the slot after an emission: clears recorded/sampled and zeroes
++  /// all metadata.
++  void Reset();
++};
++
++/// Whether the per-second content probe should emit a sample now.
++/// first_enabled covers the first tick after the cvar is enabled.
++constexpr bool ShouldEmitSample(int64_t elapsed_ms, bool first_enabled) {
++  return first_enabled || elapsed_ms >= 1000;
++}
++
++/// Q8.8 luma of one k_16_16_16_16 pixel (8 bytes, 4 little-endian 16-bit
++/// channels): the mean of the four channel high bytes, scaled by 256.
++uint32_t compute_16bpp_luma_q8(const uint8_t* pixel8);
++
++/// FNV-1a 32-bit hash over a byte buffer.
++/// Deterministic, fast, good enough for content-change detection.
++uint32_t fnv1a32(const uint8_t* data, size_t length);
++
++/// Compute mean luma over stride-sampled RGBA8 pixels.
++/// Luma = 0.299*R + 0.587*G + 0.114*B (fixed-point Q8.8).
++/// Returns 0..256 (256 = full white).
++uint32_t compute_luma_q8(const uint8_t* rgba8, uint32_t width, uint32_t height,
++                         uint32_t stride = kDefaultStride);
++
++/// Compute a content hash over stride-sampled RGBA8 pixels.
++/// Hashes the sampled bytes directly (R,G,B per stride step).
++uint32_t compute_hash(const uint8_t* rgba8, uint32_t width, uint32_t height,
++                      uint32_t stride = kDefaultStride);
++
++/// Compute mean luma over stride-sampled single-channel (k_8) bytes.
++/// Returns 0..256.
++uint32_t compute_byte_mean(const uint8_t* data, uint32_t width, uint32_t height,
++                           uint32_t stride = kDefaultStride);
++
++/// Compute a content hash over stride-sampled single-channel bytes.
++uint32_t compute_byte_hash(const uint8_t* data, uint32_t width, uint32_t height,
++                           uint32_t stride = kDefaultStride);
++
++/// Sample a Xenos-tiled buffer per pixel with the given stride, computing mean
++/// luma and an FNV-1a content hash over the sampled bytes. Per-pixel byte
++/// offsets come from texture_util::GetTiledOffset2D, so the sampled byte
++/// sequence equals the row-major pixel sequence of the equivalent linear image
++/// (the unit-test equivalence contract).
++/// bpp_log2: 0 = k_8 (1 byte/px), 2 = k_8_8_8_8 (4 bytes/px),
++///           3 = k_16_16_16_16 (8 bytes/px); other values yield 0/0.
++/// Luma: k_8 = mean byte (0..255); k_8_8_8_8 = Q8.8 of
++/// (299R + 587G + 114B) / 1000 per pixel; k_16_16_16_16 = Q8.8 of the mean of
++/// the four channel high bytes per pixel. Hash: FNV-1a over the sampled pixel
++/// bytes (k_8: 1 byte; k_8_8_8_8: R,G,B; k_16_16_16_16: all 8 bytes), in
++/// ascending byte order per pixel.
++void SampleTiled(uint8_t bpp_log2, const uint8_t* tiled_base, uint32_t x0, uint32_t y0,
++                 uint32_t width, uint32_t height, uint32_t pitch, uint32_t stride,
++                 uint32_t& luma_q8_out, uint32_t& hash_out);
++
++/// Per-emission-interval content probe counters (pure, no Vulkan dependency).
++struct ProbeCounters {
++  // Bounded per-write ring capacity for clear-register frame stamps. The ring
++  // keeps the first 63 writes plus the LATEST write (always retained - it is
++  // the one adjacent to a stall onset); the 65th write sets the overflow flag.
++  static constexpr uint32_t kMaxClearWriteEntries = 64;
++  // One guest write to a clear register, stamped with the monotonic frame
++  // ordinal (16-33 ms granularity) at write time.
++  struct ClearWriteEntry {
++    uint64_t frame = 0;
++    uint32_t value = 0;
++  };
++  // Per-target full-surface resolve summary over the emission interval
++  // (appended for EVERY full-surface resolve, not just the sampled one).
++  struct ResolveSummary {
++    uint64_t first_frame = 0;
++    uint64_t last_frame = 0;
++    uint32_t count = 0;
++  };
++
++  uint32_t rbcc = 0;       // RB_COLOR_CLEAR register writes
++  uint32_t rbcc_lo = 0;    // RB_COLOR_CLEAR_LO register writes
++  uint32_t rbcc_zero = 0;  // writes of value 0 to either clear register
++  // Last value written to each clear register during the current interval.
++  // The corresponding COUNT is the presence flag: read rbcc_val only when
++  // rbcc > 0 and rbcc_lo_val only when rbcc_lo > 0 (Reset leaves both 0 when
++  // there was no write). This makes a clear-to-black at onset visible even
++  // when rbcc_zero == 0 (non-zero dark clears) and split _LO-first writes.
++  uint32_t rbcc_val = 0;
++  uint32_t rbcc_lo_val = 0;
++  uint32_t clears = 0;  // resolve-executed clears
++  uint32_t draws = 0;   // PM4_DRAW_INDX(_2) packets
++  // Per-write frame-stamp rings (sub-second ordering). *_writes_count is the
++  // TOTAL number of writes in the interval (uncapped); the ring stores at most
++  // kMaxClearWriteEntries entries (first 63 + latest). *_writes_overflow is
++  // set once the stored ring has filled (more than 64 writes).
++  ClearWriteEntry rbcc_writes[kMaxClearWriteEntries] = {};
++  ClearWriteEntry rbcc_lo_writes[kMaxClearWriteEntries] = {};
++  uint32_t rbcc_writes_count = 0;
++  uint32_t rbcc_lo_writes_count = 0;
++  uint8_t rbcc_writes_overflow = 0;
++  uint8_t rbcc_lo_writes_overflow = 0;
++  // Per-target full-surface resolve frame summaries, indexed by probe target
++  // (kFront, kScene0, kScene1).
++  ResolveSummary resolve_summary[kProbeTargetCount] = {};
++
++  void OnRbColorClearWrite(uint32_t value, uint64_t frame) {
++    ++rbcc;
++    rbcc_val = value;
++    if (value == 0) {
++      ++rbcc_zero;
++    }
++    const uint32_t slot =
++        rbcc_writes_count < kMaxClearWriteEntries ? rbcc_writes_count
++                                                  : kMaxClearWriteEntries - 1;
++    rbcc_writes[slot] = ClearWriteEntry{frame, value};
++    if (rbcc_writes_count >= kMaxClearWriteEntries) {
++      rbcc_writes_overflow = 1;
++    }
++    ++rbcc_writes_count;
++  }
++  void OnRbColorClearLoWrite(uint32_t value, uint64_t frame) {
++    ++rbcc_lo;
++    rbcc_lo_val = value;
++    if (value == 0) {
++      ++rbcc_zero;
++    }
++    const uint32_t slot =
++        rbcc_lo_writes_count < kMaxClearWriteEntries ? rbcc_lo_writes_count
++                                                     : kMaxClearWriteEntries - 1;
++    rbcc_lo_writes[slot] = ClearWriteEntry{frame, value};
++    if (rbcc_lo_writes_count >= kMaxClearWriteEntries) {
++      rbcc_lo_writes_overflow = 1;
++    }
++    ++rbcc_lo_writes_count;
++  }
++  void OnResolveClearExecuted() { ++clears; }
++  void OnDrawPacket() { ++draws; }
++  // Append one full-surface resolve of the given probe target at the given
++  // frame ordinal. Out-of-range targets are ignored (defensive; the record
++  // path only passes valid indices).
++  void AppendResolveFrame(uint32_t target_index, uint64_t frame) {
++    if (target_index >= kProbeTargetCount) {
++      return;
++    }
++    ResolveSummary& summary = resolve_summary[target_index];
++    if (summary.count == 0) {
++      summary.first_frame = frame;
++    }
++    summary.last_frame = frame;
++    ++summary.count;
++  }
++  void Reset() {
++    rbcc = 0;
++    rbcc_lo = 0;
++    rbcc_zero = 0;
++    rbcc_val = 0;
++    rbcc_lo_val = 0;
++    clears = 0;
++    draws = 0;
++    for (ClearWriteEntry& entry : rbcc_writes) {
++      entry = ClearWriteEntry{};
++    }
++    for (ClearWriteEntry& entry : rbcc_lo_writes) {
++      entry = ClearWriteEntry{};
++    }
++    rbcc_writes_count = 0;
++    rbcc_lo_writes_count = 0;
++    rbcc_writes_overflow = 0;
++    rbcc_lo_writes_overflow = 0;
++    for (ResolveSummary& summary : resolve_summary) {
++      summary = ResolveSummary{};
++    }
++  }
++};
++
++}  // namespace rex::graphics::content_probe
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index 4b76791..5169d14 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -26,6 +26,7 @@
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/registers.h>
++#include <rex/graphics/util/content_probe.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/vulkan/deferred_command_buffer.h>
+ #include <rex/graphics/vulkan/graphics_system.h>
+@@ -160,6 +161,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+   }
+   uint64_t GetCompletedSubmission() const { return submission_completed_; }
+ 
++  // Content probe (cvar gpu_content_probe, default off): records a deferred
++  // readback sample of a resolve destination matching one of the evidence-
++  // derived probe targets. Copies GPU-local shared memory into a host-visible
++  // readback buffer only - guest physical memory is never touched.
++  void ContentProbeRecordResolveSample(const draw_util::ResolveInfo& resolve_info);
++
+   // Sparse binds are:
+   // - In a single submission, all submitted in one vkQueueBindSparse.
+   // - Sent to the queue without waiting for a semaphore.
+@@ -261,6 +268,12 @@ class VulkanCommandProcessor : public CommandProcessor {
+   void OnGammaRampPWLValueWritten() override;
+   void OnPrimaryBufferEnd() override;
+ 
++  // Content probe (sub-second ordering): the monotonic guest-frame ordinal
++  // (one increment per presented guest frame, driven by the XE_SWAP packet
++  // executed in the base layer). Const read is safe: frame_current_ changes
++  // only in EndSubmission on the same CP worker thread that runs WriteRegister.
++  uint64_t ContentProbeFrameOrdinal() const override { return frame_current_; }
++
+   void IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                  uint32_t frontbuffer_height) override;
+ 
+@@ -845,6 +858,38 @@ class VulkanCommandProcessor : public CommandProcessor {
+ 
+   // Temporary storage for memexport stream constants used in the draw.
+   std::vector<draw_util::MemExportRange> memexport_ranges_;
++
++  // Content probe (cvar gpu_content_probe, default off): per-second deferred
++  // content samples of the front buffer and the two scene targets. Zero
++  // overhead when the cvar is off - no allocation, no barrier, no readback.
++  // Slot state is the pure content_probe::ProbeSlot POD (recorded/sampled +
++  // ResolveInfo metadata + record-time frame); its consumption reset is
++  // unit-testable without Vulkan.
++  using ContentProbeSlotInfo = content_probe::ProbeSlot;
++  struct ContentProbeTargetState {
++    ReadbackBuffer readback;
++    ContentProbeSlotInfo slots[2];
++    // One recorded sample per emission interval (bounds the copy/barrier cost).
++    bool sample_due = true;
++  };
++  struct ContentProbeSnapshot {
++    uint32_t base = 0;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    uint32_t pitch = 0;
++    uint32_t bpp = 0;
++    uint32_t luma = 0;
++    uint32_t hash = 0;
++    // Monotonic frame counter at record time (0 when no sample this interval).
++    uint64_t frame = 0;
++    uint32_t clock_luma = 0;
++    uint32_t clock_hash = 0;
++  };
++  ContentProbeTargetState content_probe_targets_[content_probe::kProbeTargetCount];
++  ContentProbeSnapshot content_probe_snapshots_[content_probe::kProbeTargetCount];
++  std::chrono::steady_clock::time_point content_probe_last_wall_;
++  bool content_probe_first_enabled_ = false;
++  bool EnsureContentProbeReadbackSlot(ReadbackBuffer& readback, uint32_t index, uint32_t size);
+ };
+ 
+ }  // namespace rex::graphics::vulkan
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index 8f4f218..a977ca5 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -4,6 +4,7 @@
+ # Core GPU types - minimal dependencies, fully ported
+ set(REXGRAPHICS_CORE_SOURCES
+     flags.cpp
++    util/content_probe.cpp
+     xenos.cpp
+     pipeline/texture/info.cpp
+     pipeline/texture/info_formats.cpp
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 60efcd3..55666da 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -427,6 +427,17 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
+     return;
+   }
+ 
++  // Content probe: count guest writes to the RB_COLOR_CLEAR registers (one per
++  // write, regardless of value; a zero value is the clear-to-black signature).
++  // Zero overhead when the gpu_content_probe cvar is off.
++  if (REXCVAR_GET(gpu_content_probe)) {
++    if (index == XE_GPU_REG_RB_COLOR_CLEAR) {
++      content_probe_counters_.OnRbColorClearWrite(value, ContentProbeFrameOrdinal());
++    } else if (index == XE_GPU_REG_RB_COLOR_CLEAR_LO) {
++      content_probe_counters_.OnRbColorClearLoWrite(value, ContentProbeFrameOrdinal());
++    }
++  }
++
+   // Volatile for the WAIT_REG_MEM loop.
+   const_cast<volatile uint32_t&>(regs.values[index]) = value;
+   if (!regs.GetRegisterInfo(index)) {
+@@ -915,12 +926,16 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+     case PM4_EVENT_WRITE_ZPD:
+       result = ExecutePacketType3_EVENT_WRITE_ZPD(reader, packet, count);
+       break;
+-    case PM4_DRAW_INDX:
++    case PM4_DRAW_INDX: {
++      if (REXCVAR_GET(gpu_content_probe)) { content_probe_counters_.OnDrawPacket(); }
+       result = ExecutePacketType3_DRAW_INDX(reader, packet, count);
+       break;
+-    case PM4_DRAW_INDX_2:
++    }
++    case PM4_DRAW_INDX_2: {
++      if (REXCVAR_GET(gpu_content_probe)) { content_probe_counters_.OnDrawPacket(); }
+       result = ExecutePacketType3_DRAW_INDX_2(reader, packet, count);
+       break;
++    }
+     case PM4_SET_CONSTANT:
+       result = ExecutePacketType3_SET_CONSTANT(reader, packet, count);
+       break;
+diff --git a/src/graphics/flags.cpp b/src/graphics/flags.cpp
+index e2983a4..6c33960 100644
+--- a/src/graphics/flags.cpp
++++ b/src/graphics/flags.cpp
+@@ -15,6 +15,8 @@
+ 
+ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
+                     "Allow invalid fetch constants");
++REXCVAR_DEFINE_BOOL(gpu_content_probe, false, "GPU",
++                    "Per-second content probe for H-a/H-b/H-c diagnostics");
+ REXCVAR_DEFINE_BOOL(native_2x_msaa, true, "GPU", "Enable native 2x MSAA");
+ REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
+ REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
+diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
+index bef2db1..7e21439 100644
+--- a/src/graphics/pipeline/texture/cache.cpp
++++ b/src/graphics/pipeline/texture/cache.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <cstdint>
+ #include <utility>
+ 
+@@ -892,6 +893,80 @@ bool TextureCache::LoadTextureData(Texture& texture) {
+   return CommitPreparedTextureLoad(pending_load);
+ }
+ 
++namespace {
++
++// The real Xenos hardware binds texture fetch constants with the "invalid"
++// type if the rest of the descriptor is usable - the game writes such
++// descriptors, but the type field doesn't stop the hardware from sampling
++// them. Accept them only when they are self-consistent, so garbage descriptors
++// are still rejected by BindingInfoFromFetchConstant below.
++bool IsSelfConsistentInvalidTextureFetch(const xenos::xe_gpu_texture_fetch_t& fetch) {
++  // The base address must point somewhere.
++  if (fetch.base_address == 0) {
++    return false;
++  }
++  // The size fields are stored with 1 subtracted from each component. Reject
++  // zero dimensions and dimensions beyond the hardware limits of the
++  // dimension. The 1D width limit mirrors the check in
++  // BindingInfoFromFetchConstant.
++  uint32_t width;
++  switch (fetch.dimension) {
++    case xenos::DataDimension::k1D:
++      width = fetch.size_1d.width + 1;
++      if (width == 0 || width > xenos::kTexture1DMaxWidth) {
++        return false;
++      }
++      break;
++    case xenos::DataDimension::k2DOrStacked: {
++      width = fetch.size_2d.width + 1;
++      uint32_t height = fetch.size_2d.height + 1;
++      uint32_t depth_or_array_size = fetch.stacked ? fetch.size_2d.stack_depth + 1 : 1;
++      if (width == 0 || height == 0 || width > xenos::kTexture2DCubeMaxWidthHeight ||
++          height > xenos::kTexture2DCubeMaxWidthHeight ||
++          depth_or_array_size > xenos::kTexture2DMaxStackDepth) {
++        return false;
++      }
++    } break;
++    case xenos::DataDimension::k3D: {
++      width = fetch.size_3d.width + 1;
++      uint32_t height = fetch.size_3d.height + 1;
++      uint32_t depth = fetch.size_3d.depth + 1;
++      if (width == 0 || height == 0 || depth == 0 ||
++          width > xenos::kTexture3DMaxWidthHeight || height > xenos::kTexture3DMaxWidthHeight ||
++          depth > xenos::kTexture3DMaxDepth) {
++        return false;
++      }
++    } break;
++    case xenos::DataDimension::kCube: {
++      width = fetch.size_2d.width + 1;
++      uint32_t height = fetch.size_2d.height + 1;
++      if (width == 0 || height == 0 || width > xenos::kTexture2DCubeMaxWidthHeight ||
++          height > xenos::kTexture2DCubeMaxWidthHeight) {
++        return false;
++      }
++    } break;
++    default:
++      return false;
++  }
++  // The format must be one that the texture system knows about (the 6-bit
++  // field always has a table entry, but keep the guard).
++  const FormatInfo* format_info = FormatInfo::Get(fetch.format);
++  if (format_info == nullptr) {
++    return false;
++  }
++  // The pitch is in pixels >> 5, and may legitimately exceed the aligned
++  // width, but it must be able to cover at least the block-aligned width, and
++  // the field is 9 bits wide.
++  uint32_t pitch = fetch.pitch;
++  if (pitch > ((UINT32_C(1) << 9) - 1) ||
++      (pitch << 5) < rex::align(width, format_info->block_width)) {
++    return false;
++  }
++  return true;
++}
++
++}  // namespace
++
+ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetch_t& fetch,
+                                                 TextureKey& key_out, uint8_t* swizzled_signs_out) {
+   // Reset the key and the signedness.
+@@ -907,6 +982,17 @@ void TextureCache::BindingInfoFromFetchConstant(const xenos::xe_gpu_texture_fetc
+       if (REXCVAR_GET(gpu_allow_invalid_fetch_constants)) {
+         break;
+       }
++      if (IsSelfConsistentInvalidTextureFetch(fetch)) {
++        static std::atomic_flag accepted_invalid_texture_logged = ATOMIC_FLAG_INIT;
++        if (!accepted_invalid_texture_logged.test_and_set(std::memory_order_relaxed)) {
++          REXGPU_DEBUG(
++              "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) has "
++              "\"invalid\" type, but is self-consistent - accepting it as a texture.",
++              fetch.dword_0, fetch.dword_1, fetch.dword_2, fetch.dword_3, fetch.dword_4,
++              fetch.dword_5);
++        }
++        break;
++      }
+       REXGPU_WARN(
+           "Texture fetch constant ({:08X} {:08X} {:08X} {:08X} {:08X} {:08X}) "
+           "has \"invalid\" type! This is incorrect behavior, but you can try "
+diff --git a/src/graphics/util/content_probe.cpp b/src/graphics/util/content_probe.cpp
+new file mode 100644
+index 0000000..05a8d2f
+--- /dev/null
++++ b/src/graphics/util/content_probe.cpp
+@@ -0,0 +1,217 @@
++/**
++ * @file        content_probe.cpp
++ * @brief       Implementation of host-side content analysis helpers
++ *
++ * @copyright   Copyright (c) 2026 Tom Clay
++ * @license     BSD 3-Clause License
++ */
++
++#include <rex/graphics/util/content_probe.h>
++
++#include <rex/graphics/pipeline/texture/util.h>
++
++namespace rex::graphics::content_probe {
++
++ProbeTargetId MatchProbeTarget(uint32_t extent_start, uint32_t extent_end) {
++  if (extent_end <= extent_start) {
++    return ProbeTargetId::kNone;
++  }
++  struct Range {
++    uint32_t start;
++    uint32_t end;
++    ProbeTargetId id;
++  };
++  static constexpr Range kRanges[] = {
++      {kFrontRangeStart, kFrontRangeEnd, ProbeTargetId::kFront},
++      {kScene0RangeStart, kScene0RangeEnd, ProbeTargetId::kScene0},
++      {kScene1RangeStart, kScene1RangeEnd, ProbeTargetId::kScene1},
++  };
++  for (const Range& range : kRanges) {
++    if (extent_start >= range.start && extent_end <= range.end) {
++      return range.id;
++    }
++  }
++  return ProbeTargetId::kNone;
++}
++
++uint32_t ProbeTargetBase(ProbeTargetId target) {
++  switch (target) {
++    case ProbeTargetId::kFront:
++      return kFrontRangeStart;
++    case ProbeTargetId::kScene0:
++      return kScene0RangeStart;
++    case ProbeTargetId::kScene1:
++      return kScene1RangeStart;
++    default:
++      return 0;
++  }
++}
++
++bool IsFullSurfaceResolve(uint32_t width, uint32_t height, ProbeTargetId target) {
++  switch (target) {
++    case ProbeTargetId::kFront:
++      return width == kFrontWidth && height == kFrontHeight;
++    case ProbeTargetId::kScene0:
++      return width == kScene0Width && height == kScene0Height;
++    case ProbeTargetId::kScene1:
++      return width == kScene1Width && height == kScene1Height;
++    default:
++      return false;
++  }
++}
++
++bool IsClockBoxSampleable(uint32_t width, uint32_t height) {
++  return width >= kClockBoxX + kClockBoxWidth && height >= kClockBoxY + kClockBoxHeight;
++}
++
++void ProbeSlot::Reset() { *this = ProbeSlot{}; }
++
++uint32_t compute_16bpp_luma_q8(const uint8_t* pixel8) {
++  if (!pixel8) {
++    return 0;
++  }
++  // 4 little-endian 16-bit channels; the high byte of each is the coarse value.
++  return (uint32_t(pixel8[1]) + uint32_t(pixel8[3]) + uint32_t(pixel8[5]) +
++          uint32_t(pixel8[7])) /
++         4u * 256u;
++}
++
++uint32_t fnv1a32(const uint8_t* data, size_t length) {
++  uint32_t hash = 2166136261u;
++  for (size_t i = 0; i < length; ++i) {
++    hash ^= data[i];
++    hash *= 16777619u;  // FNV prime
++  }
++  return hash;
++}
++
++uint32_t compute_luma_q8(const uint8_t* rgba8, uint32_t width, uint32_t height,
++                         uint32_t stride) {
++  if (!rgba8 || width == 0 || height == 0) return 0;
++  uint64_t luma_sum = 0;
++  uint32_t count = 0;
++  for (uint32_t y = 0; y < height; y += stride) {
++    const uint8_t* row = rgba8 + y * width * 4;
++    for (uint32_t x = 0; x < width; x += stride) {
++      uint32_t r = row[x * 4 + 0];
++      uint32_t g = row[x * 4 + 1];
++      uint32_t b = row[x * 4 + 2];
++      // Q8.8 fixed-point luma: (299*R + 587*G + 114*B) / 1000, scaled by 256
++      luma_sum += (299u * r + 587u * g + 114u * b) * 256u / 1000u;
++      ++count;
++    }
++  }
++  return count > 0 ? static_cast<uint32_t>(luma_sum / count) : 0;
++}
++
++uint32_t compute_hash(const uint8_t* rgba8, uint32_t width, uint32_t height,
++                      uint32_t stride) {
++  if (!rgba8 || width == 0 || height == 0) return 0;
++  // Hash just the RGB components of sampled pixels (3 bytes each)
++  size_t sample_count = 0;
++  for (uint32_t y = 0; y < height; y += stride) {
++    const uint8_t* row = rgba8 + y * width * 4;
++    for (uint32_t x = 0; x < width; x += stride) {
++      ++sample_count;
++    }
++  }
++  // Build a compact byte array of sampled RGB triples
++  // For efficiency, hash in-place over the original buffer with stride
++  uint32_t hash = 2166136261u;
++  for (uint32_t y = 0; y < height; y += stride) {
++    const uint8_t* row = rgba8 + y * width * 4;
++    for (uint32_t x = 0; x < width; x += stride) {
++      uint32_t idx = x * 4;
++      hash ^= row[idx + 0]; hash *= 16777619u;
++      hash ^= row[idx + 1]; hash *= 16777619u;
++      hash ^= row[idx + 2]; hash *= 16777619u;
++    }
++  }
++  return hash;
++}
++
++uint32_t compute_byte_mean(const uint8_t* data, uint32_t width, uint32_t height,
++                           uint32_t stride) {
++  if (!data || width == 0 || height == 0) return 0;
++  uint64_t sum = 0;
++  uint32_t count = 0;
++  for (uint32_t y = 0; y < height; y += stride) {
++    const uint8_t* row = data + y * width;
++    for (uint32_t x = 0; x < width; x += stride) {
++      sum += row[x];
++      ++count;
++    }
++  }
++  return count > 0 ? static_cast<uint32_t>(sum / count) : 0;
++}
++
++uint32_t compute_byte_hash(const uint8_t* data, uint32_t width, uint32_t height,
++                           uint32_t stride) {
++  if (!data || width == 0 || height == 0) return 0;
++  uint32_t hash = 2166136261u;
++  for (uint32_t y = 0; y < height; y += stride) {
++    const uint8_t* row = data + y * width;
++    for (uint32_t x = 0; x < width; x += stride) {
++      hash ^= row[x];
++      hash *= 16777619u;
++    }
++  }
++  return hash;
++}
++
++void SampleTiled(uint8_t bpp_log2, const uint8_t* tiled_base, uint32_t x0, uint32_t y0,
++                 uint32_t width, uint32_t height, uint32_t pitch, uint32_t stride,
++                 uint32_t& luma_q8_out, uint32_t& hash_out) {
++  luma_q8_out = 0;
++  hash_out = 0;
++  if (!tiled_base || !width || !height || !pitch || !stride) {
++    return;
++  }
++  if (bpp_log2 != 0 && bpp_log2 != 2 && bpp_log2 != 3) {
++    return;
++  }
++  const uint32_t bytes_per_pixel = 1u << bpp_log2;
++  uint64_t luma_sum = 0;
++  uint32_t count = 0;
++  uint32_t hash = 2166136261u;
++  for (uint32_t y = y0; y < y0 + height; y += stride) {
++    for (uint32_t x = x0; x < x0 + width; x += stride) {
++      uint32_t offset = uint32_t(
++          texture_util::GetTiledOffset2D(int32_t(x), int32_t(y), pitch, bpp_log2));
++      const uint8_t* pixel = tiled_base + offset;
++      switch (bpp_log2) {
++        case 0: {
++          // k_8: mean byte.
++          luma_sum += pixel[0];
++          hash ^= pixel[0];
++          hash *= 16777619u;
++        } break;
++        case 2: {
++          // k_8_8_8_8: Q8.8 RGB luma over the sampled pixels.
++          luma_sum +=
++              (299u * pixel[0] + 587u * pixel[1] + 114u * pixel[2]) * 256u / 1000u;
++          hash ^= pixel[0];
++          hash *= 16777619u;
++          hash ^= pixel[1];
++          hash *= 16777619u;
++          hash ^= pixel[2];
++          hash *= 16777619u;
++        } break;
++        case 3: {
++          // k_16_16_16_16: Q8.8 luma of the four channel high bytes; hash all
++          // 8 bytes of the pixel in ascending order.
++          luma_sum += compute_16bpp_luma_q8(pixel);
++          for (uint32_t i = 0; i < bytes_per_pixel; ++i) {
++            hash ^= pixel[i];
++            hash *= 16777619u;
++          }
++        } break;
++      }
++      ++count;
++    }
++  }
++  luma_q8_out = count ? static_cast<uint32_t>(luma_sum / count) : 0;
++  hash_out = count ? hash : 0;
++}
++
++}  // namespace rex::graphics::content_probe
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index a40436e..f282e3d 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <array>
++#include <chrono>
+ #include <cstdint>
+ #include <cstring>
+ #include <iterator>
+@@ -28,6 +29,7 @@
+ #include <rex/dbg.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
++#include <rex/graphics/util/content_probe.h>
+ #include <rex/graphics/util/draw.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/shader/shader.h>
+@@ -2282,6 +2284,52 @@ void VulkanCommandProcessor::OnGammaRampPWLValueWritten() {
+   gamma_ramp_pwl_current_frame_ = UINT32_MAX;
+ }
+ 
++// Content probe emission helpers (cycle-161 sub-second ordering fields).
++namespace {
++
++// Builds the per-write frame-stamp emission string for one clear-register
++// ring: "<frame>:<value>" entries comma-separated, at most 32 printed (first
++// 31 + the latest; the latest is the onset-adjacent write and is always
++// retained). Returns the empty string when there were no writes in the
++// interval (the register count is the presence flag). Sets truncated_out when
++// more than 32 entries existed and the middle was not printed.
++std::string FormatClearWriteRing(const content_probe::ProbeCounters::ClearWriteEntry* entries,
++                                 uint32_t count, bool& truncated_out) {
++  truncated_out = false;
++  if (count == 0) {
++    return {};
++  }
++  constexpr uint32_t kPrintCap = 32;
++  const uint32_t kMaxEntries = content_probe::ProbeCounters::kMaxClearWriteEntries;
++  truncated_out = count > kPrintCap;
++  const uint32_t latest_index = count > kMaxEntries ? kMaxEntries - 1 : count - 1;
++  const uint32_t head_count = std::min<uint32_t>(count, kPrintCap - 1);
++  std::string out;
++  for (uint32_t i = 0; i < head_count; ++i) {
++    if (!out.empty()) {
++      out += ",";
++    }
++    out += fmt::format("{}:{:08X}", entries[i].frame, entries[i].value);
++  }
++  if (latest_index >= head_count) {
++    out += ",";
++    out += fmt::format("{}:{:08X}", entries[latest_index].frame, entries[latest_index].value);
++  }
++  return out;
++}
++
++// Builds the per-target full-surface resolve summary string "first:last:count"
++// (decimal). Empty when the target had no full-surface resolve in the
++// interval (count is the presence flag).
++std::string FormatResolveSummary(const content_probe::ProbeCounters::ResolveSummary& summary) {
++  if (summary.count == 0) {
++    return {};
++  }
++  return fmt::format("{}:{}:{}", summary.first_frame, summary.last_frame, summary.count);
++}
++
++}  // namespace
++
+ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbuffer_width,
+                                        uint32_t frontbuffer_height) {
+   SCOPE_profile_cpu_f("gpu");
+@@ -2425,7 +2473,7 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
+        swap_post_effect,
+-       swap_source_needs_rb_swap](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
++       swap_source_needs_rb_swap, presenter](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         // In case the swap command is the only one in the frame.
+         if (!BeginSubmission(true)) {
+           return false;
+@@ -2928,18 +2976,163 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+-        }
++         }
+ 
+-        // Need to submit all the commands before giving the image back to the
+-        // presenter so it can submit its own commands for displaying it to the
+-        // queue, and also need to submit the release barrier.
+-        EndSubmission(true);
+-        return true;
+-      });
++         // Need to submit all the commands before giving the image back to the
++         // presenter so it can submit its own commands for displaying it to the
++         // queue, and also need to submit the release barrier.
++         EndSubmission(true);
++         return true;
++       });
+ 
+   // End the frame even if did not present for any reason (the image refresher
+   // was not called), to prevent leaking per-frame resources.
+   EndSubmission(true);
++
++  // Content probe: per-second deferred content samples + clear/draw counters.
++  // Everything here is behind the default-off gpu_content_probe cvar.
++  if (REXCVAR_GET(gpu_content_probe)) {
++    auto now = std::chrono::steady_clock::now();
++    if (!content_probe_first_enabled_) {
++      content_probe_first_enabled_ = true;
++      content_probe_last_wall_ = now;
++      auto* gpu_logger = ::rex::GetLoggerRaw(::rex::log::GPU);
++      if (gpu_logger && gpu_logger->should_log(spdlog::level::trace)) {
++        gpu_logger->log(spdlog::source_loc{__FILE__, __LINE__, __FUNCTION__},
++                        spdlog::level::trace, "CONTENT_PROBE_START frame={}", frame_current_);
++      }
++    }
++    auto elapsed =
++        std::chrono::duration_cast<std::chrono::milliseconds>(now - content_probe_last_wall_)
++            .count();
++    if (content_probe::ShouldEmitSample(elapsed, false)) {
++      // Deferred read of the slots written in the previous interval (the
++      // memexport readback pattern: no queue drain, readiness by submission
++      // index). A not-yet-ready slot keeps the previous snapshot.
++      CheckSubmissionFenceAndDeviceLoss(0);
++      const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++      const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++      const VkDevice device = vulkan_device->device();
++      for (uint32_t i = 0; i < content_probe::kProbeTargetCount; ++i) {
++        ContentProbeTargetState& target = content_probe_targets_[i];
++        ContentProbeSnapshot& snapshot = content_probe_snapshots_[i];
++        const uint32_t read_index = 1u - target.readback.current_index;
++        ContentProbeSlotInfo& slot = target.slots[read_index];
++        if (!slot.recorded) {
++          // No matching resolve in the interval: explicitly distinguishable
++          // from a black-but-present target (base stays 0).
++          snapshot = ContentProbeSnapshot{};
++        } else if (!slot.sampled) {
++          // Identity seen, but the resolve was not a full-surface
++          // (0,0)-origin one - base-only line, no content.
++          snapshot = ContentProbeSnapshot{};
++          snapshot.base = slot.base;
++          snapshot.width = slot.width;
++          snapshot.height = slot.height;
++          snapshot.pitch = slot.pitch;
++          snapshot.bpp = 1u << slot.bpp_log2;
++        } else {
++          bool slot_ready = target.readback.buffers[read_index] != VK_NULL_HANDLE &&
++                            target.readback.memories[read_index] != VK_NULL_HANDLE &&
++                            target.readback.mapped_data[read_index] != nullptr &&
++                            slot.length <= target.readback.sizes[read_index] &&
++                            slot.length <= target.readback.written_size[read_index] &&
++                            target.readback.submission_written[read_index] != 0 &&
++                            target.readback.submission_written[read_index] <=
++                                submission_completed_;
++          if (slot_ready) {
++            VkMappedMemoryRange readback_memory_range = {};
++            readback_memory_range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++            readback_memory_range.memory = target.readback.memories[read_index];
++            readback_memory_range.offset = 0;
++            readback_memory_range.size = VK_WHOLE_SIZE;
++            dfn.vkInvalidateMappedMemoryRanges(device, 1, &readback_memory_range);
++            const uint8_t* sampled =
++                reinterpret_cast<const uint8_t*>(target.readback.mapped_data[read_index]);
++            snapshot = ContentProbeSnapshot{};
++            snapshot.base = slot.base;
++            snapshot.width = slot.width;
++            snapshot.height = slot.height;
++            snapshot.pitch = slot.pitch;
++            snapshot.bpp = 1u << slot.bpp_log2;
++            snapshot.frame = slot.frame;
++            content_probe::SampleTiled(slot.bpp_log2, sampled, 0, 0, slot.width, slot.height,
++                                       slot.pitch, content_probe::kDefaultStride, snapshot.luma,
++                                       snapshot.hash);
++            // Reviewer F3: never sample the clock box past the end of a
++            // smaller readback (with the F2 full-surface gate the front slot
++            // is always 1280x720, but the guard keeps the read bounded).
++            if (i == 0 && content_probe::IsClockBoxSampleable(slot.width, slot.height)) {
++              content_probe::SampleTiled(slot.bpp_log2, sampled, content_probe::kClockBoxX,
++                                         content_probe::kClockBoxY, content_probe::kClockBoxWidth,
++                                         content_probe::kClockBoxHeight, slot.pitch,
++                                         content_probe::kDefaultStride, snapshot.clock_luma,
++                                         snapshot.clock_hash);
++            }
++          }
++          // Not ready (unexpected at 30-60 fps with a >= 1 s old slot): keep
++          // the previous snapshot instead of blocking.
++        }
++        // Consume the read slot (Reviewer F1): clearing recorded/sampled and
++        // zeroing the metadata makes an interval with no full-surface record
++        // emit the documented base=0/w=h=0/luma=hash=0 no-sample line instead
++        // of re-emitting this snapshot. Then advance the double buffer and
++        // re-arm the interval sample.
++        slot.Reset();
++        target.readback.current_index = read_index;
++        target.sample_due = true;
++      }
++
++      auto* gpu_logger = ::rex::GetLoggerRaw(::rex::log::GPU);
++      if (gpu_logger && gpu_logger->should_log(spdlog::level::trace)) {
++        const ContentProbeSnapshot& fb = content_probe_snapshots_[0];
++        const ContentProbeSnapshot& s0 = content_probe_snapshots_[1];
++        const ContentProbeSnapshot& s1 = content_probe_snapshots_[2];
++        // Sub-second ordering fields (cycle-161): per-write clear frame
++        // stamps from the bounded rings (the latest write is always retained)
++        // and the per-target full-surface resolve summaries.
++        bool rbcc_f_truncated = false;
++        bool rbcc_lo_f_truncated = false;
++        const std::string rbcc_f = FormatClearWriteRing(
++            content_probe_counters_.rbcc_writes, content_probe_counters_.rbcc_writes_count,
++            rbcc_f_truncated);
++        const std::string rbcc_lo_f = FormatClearWriteRing(
++            content_probe_counters_.rbcc_lo_writes, content_probe_counters_.rbcc_lo_writes_count,
++            rbcc_lo_f_truncated);
++        const std::string fb_rf =
++            FormatResolveSummary(content_probe_counters_.resolve_summary[0]);
++        const std::string s0_rf =
++            FormatResolveSummary(content_probe_counters_.resolve_summary[1]);
++        const std::string s1_rf =
++            FormatResolveSummary(content_probe_counters_.resolve_summary[2]);
++        std::string log_msg = fmt::format(
++            "CONTENT_PROBE t={:.1f} frame={:06d} fb_base={:08X} fb_w={} fb_h={} "
++            "fb_pitch={} fb_bpp={} fb_luma={:5} fb_hash={:08x} clock_luma={:5} "
++            "clock_hash={:08x} s0_base={:08X} s0_w={} s0_h={} s0_pitch={} s0_bpp={} "
++            "s0_luma={:5} s0_hash={:08x} s1_base={:08X} s1_w={} s1_h={} s1_pitch={} "
++            "s1_bpp={} s1_luma={:5} s1_hash={:08x} clears={} rbcc={} rbcc_lo={} "
++            "rbcc_zero={} draws={} rbcc_val={:08X} rbcc_lo_val={:08X} fb_frame={} "
++            "s0_frame={} s1_frame={} rbcc_f={} rbcc_lo_f={} rbcc_f_ov={} "
++            "rbcc_lo_f_ov={} fb_rf={} s0_rf={} s1_rf={}",
++            static_cast<double>(elapsed) / 1000.0, frame_current_, fb.base, fb.width, fb.height,
++            fb.pitch, fb.bpp, fb.luma, fb.hash, fb.clock_luma, fb.clock_hash, s0.base, s0.width,
++            s0.height, s0.pitch, s0.bpp, s0.luma, s0.hash, s1.base, s1.width, s1.height, s1.pitch,
++            s1.bpp, s1.luma, s1.hash, content_probe_counters_.clears,
++            content_probe_counters_.rbcc, content_probe_counters_.rbcc_lo,
++            content_probe_counters_.rbcc_zero, content_probe_counters_.draws,
++            content_probe_counters_.rbcc_val, content_probe_counters_.rbcc_lo_val, fb.frame,
++            s0.frame, s1.frame, rbcc_f, rbcc_lo_f,
++            (content_probe_counters_.rbcc_writes_overflow || rbcc_f_truncated) ? 1 : 0,
++            (content_probe_counters_.rbcc_lo_writes_overflow || rbcc_lo_f_truncated) ? 1 : 0,
++            fb_rf, s0_rf, s1_rf);
++        gpu_logger->log(spdlog::source_loc{__FILE__, __LINE__, __FUNCTION__},
++                        spdlog::level::trace, "{}", log_msg);
++      }
++
++      ResetContentProbeCounters();
++      content_probe_last_wall_ = now;
++    }
++  }
+ }
+ 
+ bool VulkanCommandProcessor::PushBufferMemoryBarrier(
+@@ -4394,6 +4587,158 @@ bool VulkanCommandProcessor::IssueDraw_MemexportReadbackFastPath(uint32_t total_
+   return true;
+ }
+ 
++bool VulkanCommandProcessor::EnsureContentProbeReadbackSlot(ReadbackBuffer& readback, uint32_t index,
++                                                            uint32_t size) {
++  if (readback.buffers[index] != VK_NULL_HANDLE && readback.memories[index] != VK_NULL_HANDLE &&
++      readback.mapped_data[index] != nullptr && size <= readback.sizes[index]) {
++    return true;
++  }
++
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++
++  VkBuffer new_buffer = VK_NULL_HANDLE;
++  VkDeviceMemory new_memory = VK_NULL_HANDLE;
++  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++          vulkan_device, size, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++          ui::vulkan::util::MemoryPurpose::kReadback, new_buffer, new_memory)) {
++    return false;
++  }
++
++  void* new_mapping = nullptr;
++  if (dfn.vkMapMemory(device, new_memory, 0, VK_WHOLE_SIZE, 0, &new_mapping) != VK_SUCCESS) {
++    dfn.vkDestroyBuffer(device, new_buffer, nullptr);
++    dfn.vkFreeMemory(device, new_memory, nullptr);
++    return false;
++  }
++
++  if (readback.buffers[index] != VK_NULL_HANDLE || readback.memories[index] != VK_NULL_HANDLE) {
++    if (!AwaitAllQueueOperationsCompletion()) {
++      dfn.vkUnmapMemory(device, new_memory);
++      dfn.vkDestroyBuffer(device, new_buffer, nullptr);
++      dfn.vkFreeMemory(device, new_memory, nullptr);
++      return false;
++    }
++    if (readback.mapped_data[index] != nullptr && readback.memories[index] != VK_NULL_HANDLE) {
++      dfn.vkUnmapMemory(device, readback.memories[index]);
++    }
++    if (readback.buffers[index] != VK_NULL_HANDLE) {
++      dfn.vkDestroyBuffer(device, readback.buffers[index], nullptr);
++    }
++    if (readback.memories[index] != VK_NULL_HANDLE) {
++      dfn.vkFreeMemory(device, readback.memories[index], nullptr);
++    }
++  }
++
++  readback.buffers[index] = new_buffer;
++  readback.memories[index] = new_memory;
++  readback.mapped_data[index] = new_mapping;
++  readback.sizes[index] = size;
++  readback.submission_written[index] = 0;
++  readback.written_size[index] = 0;
++  return true;
++}
++
++void VulkanCommandProcessor::ContentProbeRecordResolveSample(
++    const draw_util::ResolveInfo& resolve_info) {
++  content_probe::ProbeTargetId target_id =
++      content_probe::MatchProbeTarget(resolve_info.copy_dest_extent_start,
++                                      resolve_info.copy_dest_extent_start +
++                                          resolve_info.copy_dest_extent_length);
++  if (target_id == content_probe::ProbeTargetId::kNone) {
++    return;
++  }
++  const uint32_t target_index = uint32_t(target_id) - 1u;
++  assert_true(target_index < content_probe::kProbeTargetCount);
++  ContentProbeTargetState& target = content_probe_targets_[target_index];
++
++  // The bytes-per-pixel log2 comes from the recorded resolve info, not from
++  // hard-coded target assumptions. (Computed ahead of the sample_due gate so
++  // the full-surface summary below sees every full-surface resolve; the
++  // extra work when sample_due is false is a few compares, cvar-gated.)
++  const FormatInfo* dest_format_info =
++      FormatInfo::Get(xenos::TextureFormat(resolve_info.copy_dest_info.copy_dest_format));
++  if (!dest_format_info || dest_format_info->bits_per_pixel < 8) {
++    return;
++  }
++  const uint32_t bpp_log2 = rex::log2_floor(dest_format_info->bits_per_pixel >> 3);
++
++  const uint32_t width = resolve_info.coordinate_info.width_div_8 * 8u;
++  const uint32_t height = resolve_info.height_div_8 * 8u;
++
++  // Content sampling requires the steady-state full-surface (0,0)-origin
++  // resolve: the copy must start at the matched target base, the destination
++  // region must start at the first 8-aligned pixel of the target (the
++  // offset_div_8 fields catch 8-aligned non-zero origins inside the first
++  // tile), and the region must cover the full surface (Reviewer F2: the
++  // cycle-157 smoke showed 168x280 / 152x296 scene-1 partials whose luma/hash
++  // baseline would not be comparable to the full-surface one). A rejected
++  // resolve is not recorded at all, so the emitted base stays 0 (the
++  // documented no-sample sentinel) for a partial-only interval.
++  const bool full_surface_resolve =
++      resolve_info.copy_dest_extent_start == content_probe::ProbeTargetBase(target_id) &&
++      resolve_info.copy_dest_coordinate_info.offset_x_div_8 == 0 &&
++      resolve_info.copy_dest_coordinate_info.offset_y_div_8 == 0 &&
++      content_probe::IsFullSurfaceResolve(width, height, target_id);
++  if (!full_surface_resolve) {
++    return;
++  }
++
++  // Sub-second ordering: EVERY full-surface resolve appends its frame ordinal
++  // to the per-target summary, independent of the sample_due gate below (the
++  // gate only controls the content copy path; consumption semantics are
++  // unchanged - only a recorded full-surface resolve consumes sample_due, so
++  // a partial resolve cannot starve a later full-surface resolve).
++  content_probe_counters_.AppendResolveFrame(target_index, frame_current_);
++
++  // One recorded sample per target per emission interval: a copy of the front
++  // buffer alone is ~4 MB, and the targets resolve many times per frame.
++  if (!target.sample_due) {
++    return;
++  }
++
++  target.sample_due = false;
++
++  const uint32_t write_index = target.readback.current_index;
++  ContentProbeSlotInfo& slot = target.slots[write_index];
++  slot.recorded = true;
++  slot.sampled = false;
++  slot.base = resolve_info.copy_dest_extent_start;
++  slot.width = width;
++  slot.height = height;
++  slot.pitch = resolve_info.copy_dest_coordinate_info.pitch_aligned_div_32 * 32u;
++  slot.bpp_log2 = bpp_log2;
++  slot.length = resolve_info.copy_dest_extent_length;
++  // Ordering anchor: monotonic frame counter at sample-record time (same
++  // source as the emission line's frame=).
++  slot.frame = frame_current_;
++
++  const uint32_t readback_size = AlignReadbackBufferSize(resolve_info.copy_dest_extent_length);
++  if (!EnsureContentProbeReadbackSlot(target.readback, write_index, readback_size)) {
++    slot.Reset();
++    return;
++  }
++
++  shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
++  SubmitBarriers(true);
++
++  VkBufferCopy readback_region = {};
++  readback_region.srcOffset = resolve_info.copy_dest_extent_start;
++  readback_region.dstOffset = 0;
++  readback_region.size = resolve_info.copy_dest_extent_length;
++  deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(),
++                                           target.readback.buffers[write_index], 1,
++                                           &readback_region);
++  PushBufferMemoryBarrier(target.readback.buffers[write_index], 0,
++                          resolve_info.copy_dest_extent_length, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                          VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                          VK_ACCESS_HOST_READ_BIT);
++  target.readback.submission_written[write_index] = GetCurrentSubmission();
++  target.readback.written_size[write_index] = resolve_info.copy_dest_extent_length;
++  slot.sampled = true;
++}
++
+ bool VulkanCommandProcessor::IssueCopy() {
+ #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
+   SCOPE_profile_cpu_f("gpu");
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 05d1e5c..26ec054 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1495,6 +1495,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+           written_address_out = resolve_info.copy_dest_extent_start;
+           written_length_out = resolve_info.copy_dest_extent_length;
+           copied = true;
++          // Content probe: after the resolve copy dispatch, record a deferred
++          // readback sample of the destination (cvar default off; guest
++          // physical memory is never touched).
++          if (resolve_info.copy_dest_extent_length && REXCVAR_GET(gpu_content_probe) &&
++              !draw_resolution_scaled) {
++            command_processor_.ContentProbeRecordResolveSample(resolve_info);
++          }
+         }
+       }
+     }
+@@ -1574,6 +1581,9 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+       default:
+         assert_unhandled_case(GetPath());
+     }
++    if (cleared && REXCVAR_GET(gpu_content_probe)) {
++      command_processor_.IncrementClearCount();
++    }
+   } else {
+     cleared = true;
+   }
+diff --git a/src/ui/vulkan/vulkan_util.cpp b/src/ui/vulkan/vulkan_util.cpp
+index 2106800..a93dcd7 100644
+--- a/src/ui/vulkan/vulkan_util.cpp
++++ b/src/ui/vulkan/vulkan_util.cpp
+@@ -9,9 +9,13 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <cstdint>
++#include <cstdio>
++#include <cstring>
+ 
+ #include <rex/assert.h>
++#include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/ui/vulkan/device.h>
+ #include <rex/ui/vulkan/util.h>
+@@ -21,6 +25,191 @@ namespace ui {
+ namespace vulkan {
+ namespace util {
+ 
++namespace {
++
++// Cycle 28 diagnostic instrumentation (logging only, no behavior change).
++//
++// CreateDedicatedAllocationImage has four silent `return false` paths, and the
++// host-side Vulkan allocation failure behind the 560x4688 render target
++// creation failure was not attributable to a VkResult. These helpers log the
++// first kAllocationFailureDetailLimit failures of each kind in full, then only
++// every kAllocationFailureCounterInterval-th occurrence (a counter line), so a
++// long failing run cannot flood the log.
++constexpr uint32_t kAllocationFailureDetailLimit = 8;
++constexpr uint32_t kAllocationFailureCounterInterval = 1024;
++
++struct AllocationFailureLogState {
++  std::atomic<uint32_t> count{0};
++};
++
++bool ShouldLogAllocationFailure(AllocationFailureLogState& state, uint32_t* const ordinal_out) {
++  const uint32_t ordinal = state.count.fetch_add(1, std::memory_order_relaxed) + 1;
++  *ordinal_out = ordinal;
++  return ordinal <= kAllocationFailureDetailLimit ||
++         (ordinal % kAllocationFailureCounterInterval) == 0;
++}
++
++const char* VkResultName(const VkResult result) {
++  switch (result) {
++    case VK_SUCCESS:
++      return "VK_SUCCESS";
++    case VK_NOT_READY:
++      return "VK_NOT_READY";
++    case VK_TIMEOUT:
++      return "VK_TIMEOUT";
++    case VK_EVENT_SET:
++      return "VK_EVENT_SET";
++    case VK_EVENT_RESET:
++      return "VK_EVENT_RESET";
++    case VK_INCOMPLETE:
++      return "VK_INCOMPLETE";
++    case VK_ERROR_OUT_OF_HOST_MEMORY:
++      return "VK_ERROR_OUT_OF_HOST_MEMORY";
++    case VK_ERROR_OUT_OF_DEVICE_MEMORY:
++      return "VK_ERROR_OUT_OF_DEVICE_MEMORY";
++    case VK_ERROR_INITIALIZATION_FAILED:
++      return "VK_ERROR_INITIALIZATION_FAILED";
++    case VK_ERROR_DEVICE_LOST:
++      return "VK_ERROR_DEVICE_LOST";
++    case VK_ERROR_MEMORY_MAP_FAILED:
++      return "VK_ERROR_MEMORY_MAP_FAILED";
++    case VK_ERROR_LAYER_NOT_PRESENT:
++      return "VK_ERROR_LAYER_NOT_PRESENT";
++    case VK_ERROR_EXTENSION_NOT_PRESENT:
++      return "VK_ERROR_EXTENSION_NOT_PRESENT";
++    case VK_ERROR_FEATURE_NOT_PRESENT:
++      return "VK_ERROR_FEATURE_NOT_PRESENT";
++    case VK_ERROR_INCOMPATIBLE_DRIVER:
++      return "VK_ERROR_INCOMPATIBLE_DRIVER";
++    case VK_ERROR_TOO_MANY_OBJECTS:
++      return "VK_ERROR_TOO_MANY_OBJECTS";
++    case VK_ERROR_FORMAT_NOT_SUPPORTED:
++      return "VK_ERROR_FORMAT_NOT_SUPPORTED";
++    case VK_ERROR_FRAGMENTED_POOL:
++      return "VK_ERROR_FRAGMENTED_POOL";
++    case VK_ERROR_OUT_OF_POOL_MEMORY:
++      return "VK_ERROR_OUT_OF_POOL_MEMORY";
++    case VK_ERROR_INVALID_EXTERNAL_HANDLE:
++      return "VK_ERROR_INVALID_EXTERNAL_HANDLE";
++    case VK_ERROR_SURFACE_LOST_KHR:
++      return "VK_ERROR_SURFACE_LOST_KHR";
++    case VK_ERROR_NATIVE_WINDOW_IN_USE_KHR:
++      return "VK_ERROR_NATIVE_WINDOW_IN_USE_KHR";
++    case VK_SUBOPTIMAL_KHR:
++      return "VK_SUBOPTIMAL_KHR";
++    case VK_ERROR_OUT_OF_DATE_KHR:
++      return "VK_ERROR_OUT_OF_DATE_KHR";
++    case VK_ERROR_INCOMPATIBLE_DISPLAY_KHR:
++      return "VK_ERROR_INCOMPATIBLE_DISPLAY_KHR";
++    case VK_ERROR_VALIDATION_FAILED_EXT:
++      return "VK_ERROR_VALIDATION_FAILED_EXT";
++    case VK_ERROR_INVALID_SHADER_NV:
++      return "VK_ERROR_INVALID_SHADER_NV";
++    case VK_ERROR_UNKNOWN:
++      return "VK_ERROR_UNKNOWN";
++    default:
++      return "VK_RESULT_UNRECOGNIZED";
++  }
++}
++
++uint32_t GetMemoryHeapIndex(const VulkanDevice* const vulkan_device,
++                            const uint32_t memory_type_index) {
++  VkPhysicalDeviceMemoryProperties memory_properties;
++  vulkan_device->vulkan_instance()->functions().vkGetPhysicalDeviceMemoryProperties(
++      vulkan_device->physical_device(), &memory_properties);
++  if (memory_type_index < memory_properties.memoryTypeCount) {
++    return memory_properties.memoryTypes[memory_type_index].heapIndex;
++  }
++  return UINT32_MAX;
++}
++
++void LogProcessStatusOnce() {
++  FILE* const status_file = std::fopen("/proc/self/status", "r");
++  if (!status_file) {
++    REXGPU_ERROR("VulkanAllocDiag: /proc/self/status open failed");
++    return;
++  }
++  char line[256];
++  while (std::fgets(line, sizeof(line), status_file)) {
++    if (std::strncmp(line, "VmPeak:", 7) == 0 || std::strncmp(line, "VmSize:", 7) == 0 ||
++        std::strncmp(line, "VmRSS:", 6) == 0 || std::strncmp(line, "VmHWM:", 6) == 0 ||
++        std::strncmp(line, "VmSwap:", 7) == 0 || std::strncmp(line, "Threads:", 8) == 0) {
++      size_t length = std::strlen(line);
++      while (length && (line[length - 1] == '\n' || line[length - 1] == '\r')) {
++        line[--length] = '\0';
++      }
++      REXGPU_ERROR("VulkanAllocDiag: process {}", static_cast<const char*>(line));
++    }
++  }
++  std::fclose(status_file);
++}
++
++// One-shot device heap / budget dump, plus the process status, emitted on the
++// first image allocation failure of the process.
++void LogMemoryBudgetOnce(const VulkanDevice* const vulkan_device) {
++  static std::atomic<bool> dump_done{false};
++  bool expected = false;
++  if (!dump_done.compare_exchange_strong(expected, true)) {
++    return;
++  }
++  REXGPU_ERROR("VulkanAllocDiag: === first host image allocation failure: one-shot dump ===");
++  LogProcessStatusOnce();
++
++  const VulkanInstance::Functions& ifn = vulkan_device->vulkan_instance()->functions();
++  const VkPhysicalDevice physical_device = vulkan_device->physical_device();
++  VkPhysicalDeviceMemoryProperties2 memory_properties_2;
++  memory_properties_2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_PROPERTIES_2;
++  memory_properties_2.pNext = nullptr;
++  VkPhysicalDeviceMemoryBudgetPropertiesEXT memory_budget;
++  memory_budget.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_MEMORY_BUDGET_PROPERTIES_EXT;
++  memory_budget.pNext = nullptr;
++  const bool has_memory_budget = vulkan_device->extensions().ext_EXT_memory_budget &&
++                                 ifn.vkGetPhysicalDeviceMemoryProperties2 != nullptr;
++  if (has_memory_budget) {
++    memory_properties_2.pNext = &memory_budget;
++    ifn.vkGetPhysicalDeviceMemoryProperties2(physical_device, &memory_properties_2);
++  } else {
++    ifn.vkGetPhysicalDeviceMemoryProperties(physical_device,
++                                            &memory_properties_2.memoryProperties);
++  }
++  const VkPhysicalDeviceMemoryProperties& memory_properties =
++      memory_properties_2.memoryProperties;
++  REXGPU_ERROR(
++      "VulkanAllocDiag: device '{}' heaps={} memoryTypes={} memory_budget={}",
++      static_cast<const char*>(vulkan_device->properties().deviceName),
++      uint32_t(memory_properties.memoryHeapCount), uint32_t(memory_properties.memoryTypeCount),
++      has_memory_budget);
++  for (uint32_t heap_index = 0; heap_index < memory_properties.memoryHeapCount; ++heap_index) {
++    const VkMemoryHeap& heap = memory_properties.memoryHeaps[heap_index];
++    if (has_memory_budget) {
++      const VkDeviceSize heap_budget = memory_budget.heapBudget[heap_index];
++      const VkDeviceSize heap_usage = memory_budget.heapUsage[heap_index];
++      REXGPU_ERROR(
++          "VulkanAllocDiag: heap[{}] flags=0x{:X} size={} budget={} usage={} "
++          "budget_minus_usage={}",
++          heap_index, uint32_t(heap.flags), heap.size, heap_budget, heap_usage,
++          heap_budget > heap_usage ? heap_budget - heap_usage : 0);
++    } else {
++      REXGPU_ERROR("VulkanAllocDiag: heap[{}] flags=0x{:X} size={} budget=unavailable", heap_index,
++                   uint32_t(heap.flags), heap.size);
++    }
++  }
++  for (uint32_t memory_type_index = 0; memory_type_index < memory_properties.memoryTypeCount;
++       ++memory_type_index) {
++    const VkMemoryType& memory_type = memory_properties.memoryTypes[memory_type_index];
++    REXGPU_ERROR("VulkanAllocDiag: memoryType[{}] flags=0x{:X} heap={}", memory_type_index,
++                 uint32_t(memory_type.propertyFlags), uint32_t(memory_type.heapIndex));
++  }
++  REXGPU_ERROR("VulkanAllocDiag: === end one-shot dump ===");
++}
++
++AllocationFailureLogState create_image_failure_log_state;
++AllocationFailureLogState choose_memory_type_failure_log_state;
++AllocationFailureLogState allocate_memory_failure_log_state;
++AllocationFailureLogState bind_image_memory_failure_log_state;
++
++}  // namespace
++
+ void FlushMappedMemoryRange(const VulkanDevice* const vulkan_device, const VkDeviceMemory memory,
+                             const uint32_t memory_type, const VkDeviceSize offset,
+                             const VkDeviceSize memory_size, const VkDeviceSize size) {
+@@ -122,7 +311,21 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+   const VkDevice device = vulkan_device->device();
+ 
+   VkImage image;
+-  if (dfn.vkCreateImage(device, &create_info, nullptr, &image) != VK_SUCCESS) {
++  const VkResult create_image_result = dfn.vkCreateImage(device, &create_info, nullptr, &image);
++  if (create_image_result != VK_SUCCESS) {
++    uint32_t failure_ordinal;
++    if (ShouldLogAllocationFailure(create_image_failure_log_state, &failure_ordinal)) {
++      REXGPU_ERROR(
++          "VulkanAllocDiag: vkCreateImage failed #{} result={} ({}) extent={}x{}x{} "
++          "mipLevels={} arrayLayers={} samples=0x{:X} format={} usage=0x{:X} tiling={} "
++          "flags=0x{:X}",
++          failure_ordinal, int32_t(create_image_result), VkResultName(create_image_result),
++          create_info.extent.width, create_info.extent.height, create_info.extent.depth,
++          create_info.mipLevels, create_info.arrayLayers, uint32_t(create_info.samples),
++          uint32_t(create_info.format), uint32_t(create_info.usage), uint32_t(create_info.tiling),
++          uint32_t(create_info.flags));
++    }
++    LogMemoryBudgetOnce(vulkan_device);
+     return false;
+   }
+ 
+@@ -131,6 +334,13 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+   uint32_t memory_type = ChooseMemoryType(vulkan_device->memory_types(),
+                                           memory_requirements.memoryTypeBits, memory_purpose);
+   if (memory_type == UINT32_MAX) {
++    uint32_t failure_ordinal;
++    if (ShouldLogAllocationFailure(choose_memory_type_failure_log_state, &failure_ordinal)) {
++      REXGPU_ERROR(
++          "VulkanAllocDiag: ChooseMemoryType failed #{} supported_types=0x{:X} purpose={}",
++          failure_ordinal, memory_requirements.memoryTypeBits, uint32_t(memory_purpose));
++    }
++    LogMemoryBudgetOnce(vulkan_device);
+     dfn.vkDestroyImage(device, image, nullptr);
+     return false;
+   }
+@@ -150,12 +360,35 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+     memory_dedicated_allocate_info.buffer = VK_NULL_HANDLE;
+   }
+   VkDeviceMemory memory;
+-  if (dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory) != VK_SUCCESS) {
++  const VkResult allocate_memory_result =
++      dfn.vkAllocateMemory(device, &memory_allocate_info, nullptr, &memory);
++  if (allocate_memory_result != VK_SUCCESS) {
++    uint32_t failure_ordinal;
++    if (ShouldLogAllocationFailure(allocate_memory_failure_log_state, &failure_ordinal)) {
++      REXGPU_ERROR(
++          "VulkanAllocDiag: vkAllocateMemory failed #{} result={} ({}) allocationSize={} "
++          "memoryTypeIndex={} heapIndex={} memoryTypeBits=0x{:X}",
++          failure_ordinal, int32_t(allocate_memory_result), VkResultName(allocate_memory_result),
++          memory_allocate_info.allocationSize, memory_type,
++          GetMemoryHeapIndex(vulkan_device, memory_type), memory_requirements.memoryTypeBits);
++    }
++    LogMemoryBudgetOnce(vulkan_device);
+     dfn.vkDestroyImage(device, image, nullptr);
+     return false;
+   }
+ 
+-  if (dfn.vkBindImageMemory(device, image, memory, 0) != VK_SUCCESS) {
++  const VkResult bind_image_memory_result = dfn.vkBindImageMemory(device, image, memory, 0);
++  if (bind_image_memory_result != VK_SUCCESS) {
++    uint32_t failure_ordinal;
++    if (ShouldLogAllocationFailure(bind_image_memory_failure_log_state, &failure_ordinal)) {
++      REXGPU_ERROR(
++          "VulkanAllocDiag: vkBindImageMemory failed #{} result={} ({}) allocationSize={} "
++          "memoryTypeIndex={} heapIndex={}",
++          failure_ordinal, int32_t(bind_image_memory_result),
++          VkResultName(bind_image_memory_result), memory_allocate_info.allocationSize, memory_type,
++          GetMemoryHeapIndex(vulkan_device, memory_type));
++    }
++    LogMemoryBudgetOnce(vulkan_device);
+     dfn.vkDestroyImage(device, image, nullptr);
+     dfn.vkFreeMemory(device, memory, nullptr);
+     return false;
+-- 
+2.43.0
+

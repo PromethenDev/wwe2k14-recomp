@@ -1,0 +1,58 @@
+From b1ac112331ea54ba1d22cd815e0b34977ecd1d62 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 18:31:14 -0700
+Subject: [PATCH 39/97] logging: flush on error (was warn) plus a
+ once-per-second background flush
+
+Every warning forced a disk flush; guest warning bursts (~1000 DLC sound-
+bank lookup warnings in 2 s on the owner's laptop, next to 48-51 fps
+seconds) became stalls, worst on Windows. Errors/critical still flush
+immediately (crash evidence); warnings reach the file within ~1 s.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/logging/types.h | 6 ++++--
+ src/core/logging.cpp        | 3 +++
+ 2 files changed, 7 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/logging/types.h b/include/rex/logging/types.h
+index 201db06..d43bcee 100644
+--- a/include/rex/logging/types.h
++++ b/include/rex/logging/types.h
+@@ -95,8 +95,10 @@ struct LogConfig {
+   /** spdlog pattern string for the file sink. */
+   std::string file_pattern = "[%Y-%m-%d %H:%M:%S.%e] [%l] [%n] [t%t] %v";
+ 
+-  /** Messages at or above this level trigger an immediate flush. */
+-  spdlog::level::level_enum flush_level = spdlog::level::warn;
++  /** Messages at or above this level trigger an immediate flush. Lower levels are flushed
++   *  by a once-per-second background flush (InitLogging): flushing on every warning turned
++   *  guest warning bursts (~1000 lines/s) into multi-hundred-ms stalls on Windows. */
++  spdlog::level::level_enum flush_level = spdlog::level::err;
+ 
+   /**
+    * Per-category log level overrides.
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 2480558..63e3a4e 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
+ #include <mutex>
+ #include <unordered_map>
+ #include <vector>
+@@ -154,6 +155,8 @@ void InitLogging(const LogConfig& config) {
+   spdlog::set_default_logger(g_registry[0].logger);
+ 
+   g_initialized = true;
++  // Warnings and below reach the file within a second (errors flush immediately).
++  spdlog::flush_every(std::chrono::seconds(1));
+ 
+   // Create loggers for any categories registered during static init
+   // (they have a name but no logger since sinks didn't exist yet).
+-- 
+2.43.0
+

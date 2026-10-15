@@ -1,0 +1,614 @@
+From dafa3a1ca283fb83243915c2673d47a0cd7451b4 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 11:13:16 -0700
+Subject: [PATCH 18/97] diagnostics: census CPU/GPU attribution fields
+ (per-thread CPU, swap wait, GPU busy)
+
+Adds [rate-census-cpu] per-second lines (top-5 thread CPU%, VdSwap thread
+CPU%) and swap_wait/gpu_busy/gpu_wait fields. Off unless WWE13_RATE_CENSUS=1.
+Note: gpu_busy_ms reads ~1000 even when idle-waiting; not a reliable signal.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/rate_census.h     |  28 ++
+ src/core/rate_census.cpp                  | 356 +++++++++++++++++++++-
+ src/graphics/command_processor.cpp        |   4 +
+ src/graphics/vulkan/command_processor.cpp |   2 +
+ src/kernel/xboxkrnl/xboxkrnl_video.cpp    |   3 +
+ 5 files changed, 382 insertions(+), 11 deletions(-)
+
+diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
+index f8c9ec9..2c95aea 100644
+--- a/include/rex/diagnostics/rate_census.h
++++ b/include/rex/diagnostics/rate_census.h
+@@ -6,9 +6,29 @@
+ #pragma once
+ 
+ #include <cstdint>
++#include <optional>
+ 
+ namespace rex::diagnostics::rate_census {
+ 
++struct Sample {
++  uint64_t t_ms = 0;
++  double vblank = 0.0;
++  double irq0 = 0.0;
++  double irq1 = 0.0;
++  double vdswap = 0.0;
++  double present = 0.0;
++  double guest_ticks_per_s = 0.0;
++  double guest_ms_per_s = 0.0;
++  uint64_t vblank_interval_ticks = 0;
++  double refresh_hz = 0.0;
++  double gpu_busy_ms = 0.0;
++  double gpu_wait_ms = 0.0;
++  uint64_t gpu_wait_count = 0;
++  double swap_wait_ms = 0.0;
++  uint32_t vdswap_tid = 0;
++  double vdswap_thread_cpu_pct = 0.0;
++};
++
+ // Starts the census when WWE13_RATE_CENSUS is exactly "1". The environment is
+ // sampled once by this call; event recording is otherwise a no-op when the
+ // census is disabled.
+@@ -17,9 +37,17 @@ void Start(uint64_t vblank_interval_ticks, double refresh_rate_hz);
+ // Stops the reporting thread. Safe to call when Start was never enabled.
+ void Stop();
+ 
++// Returns the most recent complete one-second sample, if one has been
++// published. The sample is updated by the census thread once per second.
++std::optional<Sample> GetLatestSample();
++
+ void RecordVblank();
+ void RecordInterrupt(uint32_t source);
+ void RecordVdSwap();
+ void RecordPresent();
++void RecordGpuBusyStart();
++void RecordGpuBusyEnd();
++void RecordGpuWaitStart();
++void RecordGpuWaitEnd();
+ 
+ }  // namespace rex::diagnostics::rate_census
+diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
+index 4122a13..e690576 100644
+--- a/src/core/rate_census.cpp
++++ b/src/core/rate_census.cpp
+@@ -5,17 +5,31 @@
+ 
+ #include <rex/diagnostics/rate_census.h>
+ 
++#include <algorithm>
+ #include <atomic>
+ #include <chrono>
+ #include <cstdlib>
++#include <filesystem>
++#include <fstream>
+ #include <mutex>
++#include <sstream>
++#include <string>
+ #include <string_view>
++#include <unordered_map>
++#include <vector>
+ #include <thread>
+ 
++#include <fmt/format.h>
++
+ #include <rex/chrono/clock.h>
+ #include <rex/logging.h>
++#include <rex/platform.h>
+ #include <rex/thread.h>
+ 
++#if REX_PLATFORM_LINUX
++#include <unistd.h>
++#endif
++
+ namespace rex::diagnostics::rate_census {
+ namespace {
+ 
+@@ -25,6 +39,12 @@ struct Counters {
+   std::atomic<uint64_t> irq1{0};
+   std::atomic<uint64_t> vdswap{0};
+   std::atomic<uint64_t> present{0};
++  std::atomic<uint64_t> gpu_busy_ns{0};
++  std::atomic<uint64_t> gpu_wait_ns{0};
++  std::atomic<uint64_t> gpu_wait_count{0};
++  std::atomic<uint64_t> swap_wait_ns{0};
++  std::atomic<uint32_t> vdswap_tid{0};
++  std::atomic<uint64_t> swap_start_ns{0};
+ };
+ 
+ struct Snapshot {
+@@ -33,8 +53,190 @@ struct Snapshot {
+   uint64_t irq1;
+   uint64_t vdswap;
+   uint64_t present;
++  uint64_t gpu_busy_ns;
++  uint64_t gpu_wait_ns;
++  uint64_t gpu_wait_count;
++  uint64_t swap_wait_ns;
++  uint32_t vdswap_tid;
++};
++
++uint64_t QueryHostNanoseconds() {
++  return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::nanoseconds>(
++                                  std::chrono::steady_clock::now().time_since_epoch())
++                                  .count());
++}
++
++struct ThreadTicks {
++  std::string name;
++  uint64_t utime = 0;
++  uint64_t stime = 0;
+ };
+ 
++using ThreadTickMap = std::unordered_map<uint32_t, ThreadTicks>;
++
++bool ParseThreadStat(const std::filesystem::path& path, ThreadTicks& ticks_out) {
++#if !REX_PLATFORM_LINUX
++  (void)path;
++  (void)ticks_out;
++  return false;
++#else
++  std::ifstream stream(path);
++  std::string line;
++  if (!stream || !std::getline(stream, line)) {
++    return false;
++  }
++
++  const size_t name_start = line.find('(');
++  const size_t name_end = line.rfind(") ");
++  if (name_start == std::string::npos || name_end <= name_start) {
++    return false;
++  }
++
++  std::istringstream fields(line.substr(name_end + 2));
++  std::string state;
++  if (!(fields >> state)) {
++    return false;
++  }
++
++  uint64_t utime = 0;
++  uint64_t stime = 0;
++  for (int field = 4; field <= 15; ++field) {
++    std::string value;
++    if (!(fields >> value)) {
++      return false;
++    }
++    if (field == 14) {
++      try {
++        utime = std::stoull(value);
++      } catch (const std::exception&) {
++        return false;
++      }
++    } else if (field == 15) {
++      try {
++        stime = std::stoull(value);
++      } catch (const std::exception&) {
++        return false;
++      }
++    }
++  }
++
++  ticks_out.name = line.substr(name_start + 1, name_end - name_start - 1);
++  ticks_out.utime = utime;
++  ticks_out.stime = stime;
++  return true;
++#endif
++}
++
++ThreadTickMap ReadThreadTicks() {
++  ThreadTickMap result;
++#if REX_PLATFORM_LINUX
++  std::error_code error;
++  const std::filesystem::path task_root("/proc/self/task");
++  for (const auto& entry : std::filesystem::directory_iterator(task_root, error)) {
++    if (error) {
++      break;
++    }
++    uint32_t tid = 0;
++    try {
++      tid = static_cast<uint32_t>(std::stoul(entry.path().filename().string()));
++    } catch (const std::exception&) {
++      continue;
++    }
++    ThreadTicks ticks;
++    if (ParseThreadStat(entry.path() / "stat", ticks)) {
++      result.emplace(tid, std::move(ticks));
++    }
++  }
++#endif
++  return result;
++}
++
++struct ThreadCpu {
++  uint32_t tid = 0;
++  std::string name;
++  double percent = 0.0;
++};
++
++struct ThreadCpuReport {
++  std::vector<ThreadCpu> top;
++  ThreadCpu vdswap;
++};
++
++ThreadCpuReport CalculateThreadCpu(const ThreadTickMap& previous,
++                                   const ThreadTickMap& current, uint64_t elapsed_ms,
++                                   uint32_t vdswap_tid) {
++  ThreadCpuReport report;
++  if (elapsed_ms == 0) {
++    return report;
++  }
++
++#if REX_PLATFORM_LINUX
++  const long clock_ticks = std::max<long>(1, sysconf(_SC_CLK_TCK));
++#else
++  constexpr long clock_ticks = 100;
++#endif
++  for (const auto& [tid, ticks] : current) {
++    const auto previous_it = previous.find(tid);
++    if (previous_it == previous.end()) {
++      continue;
++    }
++    const uint64_t current_ticks = ticks.utime + ticks.stime;
++    const uint64_t previous_ticks = previous_it->second.utime + previous_it->second.stime;
++    if (current_ticks < previous_ticks) {
++      continue;
++    }
++    const uint64_t delta_ticks = current_ticks - previous_ticks;
++    ThreadCpu cpu{
++        tid,
++        ticks.name,
++        static_cast<double>(delta_ticks) * 100.0 * 1000.0 /
++            (static_cast<double>(clock_ticks) * static_cast<double>(elapsed_ms)),
++    };
++    report.top.push_back(std::move(cpu));
++  }
++
++  if (vdswap_tid != 0) {
++    const auto top_it = std::find_if(report.top.begin(), report.top.end(),
++                                     [vdswap_tid](const ThreadCpu& cpu) {
++                                       return cpu.tid == vdswap_tid;
++                                     });
++    if (top_it != report.top.end()) {
++      report.vdswap = *top_it;
++    } else {
++      const auto current_it = current.find(vdswap_tid);
++      if (current_it != current.end()) {
++        report.vdswap.tid = vdswap_tid;
++        report.vdswap.name = current_it->second.name;
++      }
++    }
++  }
++
++  std::sort(report.top.begin(), report.top.end(), [](const ThreadCpu& left, const ThreadCpu& right) {
++    if (left.percent != right.percent) {
++      return left.percent > right.percent;
++    }
++    return left.tid < right.tid;
++  });
++  if (report.top.size() > 5) {
++    report.top.resize(5);
++  }
++  return report;
++}
++
++std::string FormatThreadCpu(const std::vector<ThreadCpu>& threads) {
++  if (threads.empty()) {
++    return "none";
++  }
++  std::string result;
++  for (const ThreadCpu& thread : threads) {
++    if (!result.empty()) {
++      result += '|';
++    }
++    result += fmt::format("{}:{:.3f}", thread.name, thread.percent);
++  }
++  return result;
++}
++
+ class RateCensus {
+  public:
+   ~RateCensus() { Stop(); }
+@@ -47,8 +249,11 @@ class RateCensus {
+     started_ = true;
+ 
+     static const bool env_enabled = [] {
+-      const char* value = std::getenv("WWE13_RATE_CENSUS");
+-      return value != nullptr && std::string_view(value) == "1";
++      const auto is_one = [](const char* name) {
++        const char* value = std::getenv(name);
++        return value != nullptr && std::string_view(value) == "1";
++      };
++      return is_one("WWE13_RATE_CENSUS");
+     }();
+     if (!env_enabled) {
+       return;
+@@ -78,6 +283,11 @@ class RateCensus {
+     enabled_.store(false, std::memory_order_release);
+   }
+ 
++  std::optional<Sample> GetLatestSample() const {
++    std::lock_guard<std::mutex> lock(sample_mutex_);
++    return latest_sample_;
++  }
++
+   void RecordVblank() {
+     if (enabled_.load(std::memory_order_relaxed)) {
+       counters_.vblank.fetch_add(1, std::memory_order_relaxed);
+@@ -98,13 +308,77 @@ class RateCensus {
+   void RecordVdSwap() {
+     if (enabled_.load(std::memory_order_relaxed)) {
+       counters_.vdswap.fetch_add(1, std::memory_order_relaxed);
++      const uint32_t tid = rex::thread::current_thread_system_id();
++      uint32_t first_tid = 0;
++      counters_.vdswap_tid.compare_exchange_strong(first_tid, tid,
++                                                    std::memory_order_relaxed);
++      counters_.swap_start_ns.store(QueryHostNanoseconds(), std::memory_order_release);
+     }
+   }
+ 
+   void RecordPresent() {
+     if (enabled_.load(std::memory_order_relaxed)) {
+       counters_.present.fetch_add(1, std::memory_order_relaxed);
++      const uint64_t swap_start = counters_.swap_start_ns.exchange(0, std::memory_order_acq_rel);
++      const uint64_t now = QueryHostNanoseconds();
++      if (swap_start != 0 && now > swap_start) {
++        counters_.swap_wait_ns.fetch_add(now - swap_start, std::memory_order_relaxed);
++      }
++    }
++  }
++
++  void RecordGpuBusyStart() {
++    if (enabled_.load(std::memory_order_relaxed) && !gpu_busy_active_) {
++      gpu_busy_active_ = true;
++      gpu_busy_start_ns_ = QueryHostNanoseconds();
++    }
++  }
++
++  void RecordGpuBusyEnd() {
++    if (!gpu_busy_active_) {
++      return;
++    }
++    const uint64_t now = QueryHostNanoseconds();
++    if (now > gpu_busy_start_ns_) {
++      counters_.gpu_busy_ns.fetch_add(now - gpu_busy_start_ns_, std::memory_order_relaxed);
+     }
++    gpu_busy_active_ = false;
++    gpu_busy_start_ns_ = 0;
++  }
++
++  void RecordGpuWaitStart() {
++    if (!enabled_.load(std::memory_order_relaxed) || gpu_wait_active_) {
++      return;
++    }
++    const uint64_t now = QueryHostNanoseconds();
++    gpu_wait_active_ = true;
++    gpu_wait_start_ns_ = now;
++    counters_.gpu_wait_count.fetch_add(1, std::memory_order_relaxed);
++    if (gpu_busy_active_) {
++      if (now > gpu_busy_start_ns_) {
++        counters_.gpu_busy_ns.fetch_add(now - gpu_busy_start_ns_, std::memory_order_relaxed);
++      }
++      gpu_busy_active_ = false;
++      gpu_busy_start_ns_ = 0;
++      gpu_busy_paused_ = true;
++    }
++  }
++
++  void RecordGpuWaitEnd() {
++    if (!gpu_wait_active_) {
++      return;
++    }
++    const uint64_t now = QueryHostNanoseconds();
++    if (now > gpu_wait_start_ns_) {
++      counters_.gpu_wait_ns.fetch_add(now - gpu_wait_start_ns_, std::memory_order_relaxed);
++    }
++    gpu_wait_active_ = false;
++    gpu_wait_start_ns_ = 0;
++    if (gpu_busy_paused_ && enabled_.load(std::memory_order_relaxed)) {
++      gpu_busy_active_ = true;
++      gpu_busy_start_ns_ = now;
++    }
++    gpu_busy_paused_ = false;
+   }
+ 
+  private:
+@@ -115,6 +389,11 @@ class RateCensus {
+         counters_.irq1.load(std::memory_order_relaxed),
+         counters_.vdswap.load(std::memory_order_relaxed),
+         counters_.present.load(std::memory_order_relaxed),
++        counters_.gpu_busy_ns.load(std::memory_order_relaxed),
++        counters_.gpu_wait_ns.load(std::memory_order_relaxed),
++        counters_.gpu_wait_count.load(std::memory_order_relaxed),
++        counters_.swap_wait_ns.load(std::memory_order_relaxed),
++        counters_.vdswap_tid.load(std::memory_order_relaxed),
+     };
+   }
+ 
+@@ -132,6 +411,7 @@ class RateCensus {
+     uint64_t last_guest_ticks = rex::chrono::Clock::QueryGuestTickCount();
+     uint64_t last_guest_ms = rex::chrono::Clock::QueryGuestUptimeMillis();
+     Snapshot last = ReadCounters();
++    ThreadTickMap previous_thread_ticks = ReadThreadTicks();
+     auto next_sample = std::chrono::steady_clock::now() + std::chrono::seconds(1);
+ 
+     while (running_.load(std::memory_order_acquire)) {
+@@ -150,23 +430,60 @@ class RateCensus {
+         continue;
+       }
+ 
++      const ThreadTickMap current_thread_ticks = ReadThreadTicks();
++      const ThreadCpuReport thread_cpu = CalculateThreadCpu(
++          previous_thread_ticks, current_thread_ticks, elapsed_ms, current.vdswap_tid);
++      Sample sample;
++      sample.t_ms = host_ms;
++      sample.vblank = PerSecond(current.vblank - last.vblank, elapsed_ms);
++      sample.irq0 = PerSecond(current.irq0 - last.irq0, elapsed_ms);
++      sample.irq1 = PerSecond(current.irq1 - last.irq1, elapsed_ms);
++      sample.vdswap = PerSecond(current.vdswap - last.vdswap, elapsed_ms);
++      sample.present = PerSecond(current.present - last.present, elapsed_ms);
++      sample.guest_ticks_per_s = PerSecond(guest_ticks - last_guest_ticks, elapsed_ms);
++      sample.guest_ms_per_s = PerSecond(guest_ms - last_guest_ms, elapsed_ms);
++      sample.vblank_interval_ticks = vblank_interval_ticks_;
++      sample.refresh_hz = refresh_rate_hz_;
++      sample.gpu_busy_ms =
++          static_cast<double>(current.gpu_busy_ns - last.gpu_busy_ns) / 1'000'000.0 *
++          1000.0 / static_cast<double>(elapsed_ms);
++      sample.gpu_wait_ms =
++          static_cast<double>(current.gpu_wait_ns - last.gpu_wait_ns) / 1'000'000.0 *
++          1000.0 / static_cast<double>(elapsed_ms);
++      sample.gpu_wait_count = current.gpu_wait_count - last.gpu_wait_count;
++      sample.swap_wait_ms =
++          static_cast<double>(current.swap_wait_ns - last.swap_wait_ns) / 1'000'000.0 *
++          1000.0 / static_cast<double>(elapsed_ms);
++      sample.vdswap_tid = current.vdswap_tid;
++      sample.vdswap_thread_cpu_pct = thread_cpu.vdswap.percent;
++      {
++        std::lock_guard<std::mutex> lock(sample_mutex_);
++        latest_sample_ = sample;
++      }
++
+       REXLOG_INFO(
+           "[rate-census] t_ms={} vblank={:.3f} irq0={:.3f} irq1={:.3f} "
+           "vdswap={:.3f} present={:.3f} guest_ticks_per_s={:.3f} "
+-          "guest_ms_per_s={:.3f} vblank_interval_ticks={} refresh_hz={:.3f}",
+-          host_ms, PerSecond(current.vblank - last.vblank, elapsed_ms),
+-          PerSecond(current.irq0 - last.irq0, elapsed_ms),
+-          PerSecond(current.irq1 - last.irq1, elapsed_ms),
+-          PerSecond(current.vdswap - last.vdswap, elapsed_ms),
+-          PerSecond(current.present - last.present, elapsed_ms),
+-          PerSecond(guest_ticks - last_guest_ticks, elapsed_ms),
+-          PerSecond(guest_ms - last_guest_ms, elapsed_ms), vblank_interval_ticks_,
+-          refresh_rate_hz_);
++          "guest_ms_per_s={:.3f} vblank_interval_ticks={} refresh_hz={:.3f} "
++          "gpu_busy_ms={:.3f} gpu_wait_ms={:.3f} gpu_wait_count={} "
++          "swap_wait_ms={:.3f} vdswap_tid={} vdswap_thread_cpu_pct={:.3f}",
++          sample.t_ms, sample.vblank, sample.irq0, sample.irq1, sample.vdswap,
++          sample.present, sample.guest_ticks_per_s, sample.guest_ms_per_s,
++          sample.vblank_interval_ticks, sample.refresh_hz, sample.gpu_busy_ms,
++          sample.gpu_wait_ms, sample.gpu_wait_count, sample.swap_wait_ms,
++          sample.vdswap_tid, sample.vdswap_thread_cpu_pct);
++      REXLOG_INFO(
++          "[rate-census-cpu] t_ms={} vdswap_tid={} vdswap_thread={} "
++          "vdswap_thread_cpu_pct={:.3f} top={}",
++          sample.t_ms, sample.vdswap_tid,
++          thread_cpu.vdswap.name.empty() ? "unknown" : thread_cpu.vdswap.name,
++          sample.vdswap_thread_cpu_pct, FormatThreadCpu(thread_cpu.top));
+ 
+       last_host_ms = host_ms;
+       last_guest_ticks = guest_ticks;
+       last_guest_ms = guest_ms;
+       last = current;
++      previous_thread_ticks = current_thread_ticks;
+     }
+   }
+ 
+@@ -174,10 +491,17 @@ class RateCensus {
+   std::atomic<bool> enabled_{false};
+   std::atomic<bool> running_{false};
+   std::mutex lifecycle_mutex_;
++  mutable std::mutex sample_mutex_;
+   bool started_ = false;
+   std::thread logger_thread_;
++  std::optional<Sample> latest_sample_;
+   uint64_t vblank_interval_ticks_ = 0;
+   double refresh_rate_hz_ = 0.0;
++  bool gpu_busy_active_ = false;
++  uint64_t gpu_busy_start_ns_ = 0;
++  bool gpu_busy_paused_ = false;
++  bool gpu_wait_active_ = false;
++  uint64_t gpu_wait_start_ns_ = 0;
+ };
+ 
+ RateCensus g_rate_census;
+@@ -190,6 +514,8 @@ void Start(uint64_t vblank_interval_ticks, double refresh_rate_hz) {
+ 
+ void Stop() { g_rate_census.Stop(); }
+ 
++std::optional<Sample> GetLatestSample() { return g_rate_census.GetLatestSample(); }
++
+ void RecordVblank() { g_rate_census.RecordVblank(); }
+ 
+ void RecordInterrupt(uint32_t source) { g_rate_census.RecordInterrupt(source); }
+@@ -198,4 +524,12 @@ void RecordVdSwap() { g_rate_census.RecordVdSwap(); }
+ 
+ void RecordPresent() { g_rate_census.RecordPresent(); }
+ 
++void RecordGpuBusyStart() { g_rate_census.RecordGpuBusyStart(); }
++
++void RecordGpuBusyEnd() { g_rate_census.RecordGpuBusyEnd(); }
++
++void RecordGpuWaitStart() { g_rate_census.RecordGpuWaitStart(); }
++
++void RecordGpuWaitEnd() { g_rate_census.RecordGpuWaitEnd(); }
++
+ }  // namespace rex::diagnostics::rate_census
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 55666da..997f3f7 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <chrono>
+ #include <cinttypes>
+ #include <cmath>
+ #include <cstring>
+@@ -24,6 +25,7 @@
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
++#include <rex/diagnostics/rate_census.h>
+ #include <rex/graphics/pipeline/texture/info.h>
+ #include <rex/graphics/sampler_info.h>
+ #include <rex/graphics/xenos.h>
+@@ -313,6 +315,7 @@ void CommandProcessor::WorkerThreadMain() {
+     assert_true(read_ptr_index_ != write_ptr_index);
+ 
+     // Execute. Note that we handle wraparound transparently.
++    diagnostics::rate_census::RecordGpuBusyStart();
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+ 
+     // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+@@ -321,6 +324,7 @@ void CommandProcessor::WorkerThreadMain() {
+       memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+                                        read_ptr_index_);
+     }
++    diagnostics::rate_census::RecordGpuBusyEnd();
+ 
+     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
+     // but no games seem to actually use it.
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index eb188b7..3834809 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -5359,9 +5359,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+     // defined by vkQueueSubmit additionally include in the first
+     // synchronization scope all commands that occur earlier in submission
+     // order."
++    diagnostics::rate_census::RecordGpuWaitStart();
+     VkResult wait_result =
+         dfn.vkWaitForFences(device, uint32_t(await_submission - submission_completed_),
+                             submissions_in_flight_fences_.data(), VK_TRUE, UINT64_MAX);
++    diagnostics::rate_census::RecordGpuWaitEnd();
+     if (wait_result == VK_SUCCESS) {
+       fences_awaited += await_submission - submission_completed_;
+     } else {
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+index 53f2b8e..c1c6c76 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
+@@ -455,6 +455,9 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer
+                   ppc_pu32_t frontbuffer_ptr,  // ptr to frontbuffer address
+                   ppc_pu32_t texture_format_ptr, ppc_pu32_t color_space_ptr, ppc_pu32_t width,
+                   ppc_pu32_t height) {
++  // The census pairs this timestamp with the command-processor presentation
++  // entry point. This is the measurable VdSwap -> presenter handoff latency;
++  // VdSwap itself does not synchronously call the presenter.
+   diagnostics::rate_census::RecordVdSwap();
+ 
+   // All of these parameters are REQUIRED.
+-- 
+2.43.0
+

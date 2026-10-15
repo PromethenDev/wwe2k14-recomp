@@ -1,0 +1,44 @@
+From 31c0a45f7432245e049f9f9c341972ab38180ab7 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 18:53:07 -0700
+Subject: [PATCH 10/97] vulkan: add descriptors mode to
+ debug_periodic_cache_clear
+
+Clears only the transient descriptor pools, to separate stale cached
+descriptor sets from stale texture contents.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/command_processor.cpp | 9 ++++++---
+ 1 file changed, 6 insertions(+), 3 deletions(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 6b4d4bc..65488ef 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -50,9 +50,10 @@
+ 
+ REXCVAR_DEFINE_STRING(debug_periodic_cache_clear, "", "GPU/Vulkan",
+                       "Diagnostic: every debug_periodic_cache_clear_frames frames, clear one "
+-                      "cache: texture, render_target, or memory (shared-memory watches, "
+-                      "primitive cache, vertex residency)")
+-    .allowed({"", "texture", "render_target", "memory"});
++                      "cache: texture, descriptors (transient descriptor pools only), "
++                      "render_target, or memory (shared-memory watches, primitive cache, "
++                      "vertex residency)")
++    .allowed({"", "texture", "descriptors", "render_target", "memory"});
+ REXCVAR_DEFINE_INT32(debug_periodic_cache_clear_frames, 30, "GPU/Vulkan",
+                      "Frame period for debug_periodic_cache_clear");
+ 
+@@ -5881,6 +5882,8 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+         // Cached transient descriptor sets may reference the destroyed views.
+         ClearTransientDescriptorPools();
+         texture_cache_->ClearCache();
++      } else if (periodic_clear == "descriptors") {
++        ClearTransientDescriptorPools();
+       } else if (periodic_clear == "render_target") {
+         render_target_cache_->ClearCache();
+       } else if (periodic_clear == "memory") {
+-- 
+2.43.0
+

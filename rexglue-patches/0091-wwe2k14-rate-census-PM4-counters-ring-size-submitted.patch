@@ -1,0 +1,136 @@
+From 040fc8100d98f818c196688d9c8d9f86f1532aa8 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 13:32:14 -0700
+Subject: [PATCH 91/97] wwe2k14: rate-census PM4 counters (ring size,
+ submitted/read-advance dwords/s, CP execute-thread busy %); census-only
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/command_processor.h |  3 ++
+ src/graphics/command_processor.cpp       | 57 ++++++++++++++++++++++++
+ 2 files changed, 60 insertions(+)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 3a47a8f..12175c1 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -325,6 +325,9 @@ class CommandProcessor {
+   uint32_t read_ptr_writeback_stats_last_index_ = 0;
+   uint64_t read_ptr_writeback_stats_writes_ = 0;
+   uint64_t read_ptr_writeback_stats_advances_ = 0;
++  uint64_t read_ptr_writeback_stats_advance_dwords_ = 0;
++  uint64_t read_ptr_writeback_stats_submitted_dwords_ = 0;
++  uint64_t read_ptr_writeback_stats_cp_cpu_ns_ = 0;
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 765cd23..22ab518 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -18,6 +18,10 @@
+ #include <cstring>
+ #include <string_view>
+ 
++#if defined(__linux__)
++#include <time.h>
++#endif
++
+ #include <fmt/format.h>
+ 
+ #include <rex/cvar.h>
+@@ -104,6 +108,16 @@ bool Wwe13NoMsaaProbeEnabled() {
+ 
+ std::atomic_flag wwe13_no_msaa_probe_logged = ATOMIC_FLAG_INIT;
+ 
++uint64_t CurrentThreadCpuNanoseconds() {
++#if defined(__linux__) && defined(CLOCK_THREAD_CPUTIME_ID)
++  struct timespec value {};
++  if (clock_gettime(CLOCK_THREAD_CPUTIME_ID, &value) == 0) {
++    return uint64_t(value.tv_sec) * UINT64_C(1000000000) + uint64_t(value.tv_nsec);
++  }
++#endif
++  return 0;
++}
++
+ ReadbackResolveMode ParseReadbackResolveMode(std::string_view value) {
+   if (value == "fast") {
+     return ReadbackResolveMode::kFast;
+@@ -393,7 +407,16 @@ void CommandProcessor::WorkerThreadMain() {
+ 
+     // Execute. Note that we handle wraparound transparently.
+     diagnostics::rate_census::RecordGpuBusyStart();
++    const bool census_enabled = diagnostics::rate_census::IsEnabled();
++    const uint64_t thread_cpu_start_ns =
++        census_enabled ? CurrentThreadCpuNanoseconds() : uint64_t(0);
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
++    if (census_enabled) {
++      const uint64_t thread_cpu_end_ns = CurrentThreadCpuNanoseconds();
++      if (thread_cpu_end_ns >= thread_cpu_start_ns) {
++        read_ptr_writeback_stats_cp_cpu_ns_ += thread_cpu_end_ns - thread_cpu_start_ns;
++      }
++    }
+ 
+     WriteBackReadPointer(read_ptr_index_);
+     diagnostics::rate_census::RecordGpuBusyEnd();
+@@ -806,6 +829,15 @@ void CommandProcessor::WriteBackReadPointer(uint32_t index) {
+     read_ptr_writeback_stats_last_index_ = index;
+   }
+   ++read_ptr_writeback_stats_writes_;
++  const uint32_t ring_size_dwords = primary_buffer_size_ / sizeof(uint32_t);
++  if (ring_size_dwords && index < ring_size_dwords &&
++      read_ptr_writeback_stats_last_index_ < ring_size_dwords) {
++    const uint32_t advance_dwords =
++        index >= read_ptr_writeback_stats_last_index_
++            ? index - read_ptr_writeback_stats_last_index_
++            : ring_size_dwords - read_ptr_writeback_stats_last_index_ + index;
++    read_ptr_writeback_stats_advance_dwords_ += advance_dwords;
++  }
+   if (index != read_ptr_writeback_stats_last_index_) {
+     ++read_ptr_writeback_stats_advances_;
+   }
+@@ -821,9 +853,24 @@ void CommandProcessor::WriteBackReadPointer(uint32_t index) {
+               read_ptr_writeback_ptr_, read_ptr_writeback_stats_writes_,
+               read_ptr_writeback_stats_advances_, index, read_ptr_update_freq_,
+               REXCVAR_GET(cp_read_pointer_writeback_per_block));
++  const double elapsed_seconds = static_cast<double>(elapsed_ms) / 1000.0;
++  const double cp_busy_pct =
++      static_cast<double>(read_ptr_writeback_stats_cp_cpu_ns_) * 100.0 /
++      (static_cast<double>(elapsed_ms) * 1000000.0);
++  REXLOG_INFO(
++      "[rate-census-pm4] elapsed_ms={} ring_size_dw={} submitted_dw={} submitted_dw_per_s={:.2f} "
++      "read_advance_dw={} read_advance_dw_per_s={:.2f} cp_execute_thread_busy_pct={:.3f}",
++      elapsed_ms, ring_size_dwords, read_ptr_writeback_stats_submitted_dwords_,
++      static_cast<double>(read_ptr_writeback_stats_submitted_dwords_) / elapsed_seconds,
++      read_ptr_writeback_stats_advance_dwords_,
++      static_cast<double>(read_ptr_writeback_stats_advance_dwords_) / elapsed_seconds,
++      cp_busy_pct);
+   read_ptr_writeback_stats_start_ = now;
+   read_ptr_writeback_stats_writes_ = 0;
+   read_ptr_writeback_stats_advances_ = 0;
++  read_ptr_writeback_stats_advance_dwords_ = 0;
++  read_ptr_writeback_stats_submitted_dwords_ = 0;
++  read_ptr_writeback_stats_cp_cpu_ns_ = 0;
+ }
+ 
+ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+@@ -853,6 +900,16 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+   reader.set_write_offset(write_index * sizeof(uint32_t));
+   const uint32_t ring_size_dwords = primary_buffer_size_ / sizeof(uint32_t);
++  if (diagnostics::rate_census::IsEnabled()) {
++    uint32_t submitted_dwords = 0;
++    if (write_index >= read_index) {
++      submitted_dwords = write_index - read_index;
++    } else if (ring_size_dwords && read_index < ring_size_dwords &&
++               write_index < ring_size_dwords) {
++      submitted_dwords = ring_size_dwords - read_index + write_index;
++    }
++    read_ptr_writeback_stats_submitted_dwords_ += submitted_dwords;
++  }
+   const bool writeback_per_block = REXCVAR_GET(cp_read_pointer_writeback_per_block) &&
+                                    read_ptr_writeback_ptr_ && read_ptr_update_freq_ &&
+                                    ring_size_dwords;
+-- 
+2.43.0
+

@@ -1,0 +1,313 @@
+From 008ac8dd271c06deb35b44993dec1a9c757626e1 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 09:58:41 -0700
+Subject: [PATCH 31/97] graphics: on-demand GPU->CPU visibility for resolved
+ data
+
+CommandProcessor::MakeGpuWritesVisibleToCpu(guest_address, length) copies back, synchronously
+and only when asked, the pages of a range whose current data exists only on the GPU (the shared
+memory's valid-and-GPU-written page bits), so newer CPU writes are never overwritten. Callable
+from any thread: a mutex/condition-variable request slot is serviced by the worker thread
+between command batches and while idle (pending_fns_ is not thread-safe), with a timeout so a
+worker blocked on the caller cannot deadlock. Vulkan implements it with a transfer from the
+shared memory buffer; draw-resolution scaling is not handled (returns false).
+
+For titles whose CPU code reads render-to-texture results. readback_resolve=full makes WWE '13's
+composited wrestler textures correct but halves its in-ring frame rate (60 -> 33/s); the title
+now requests readback only for the surfaces it untiles.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/command_processor.h      | 24 ++++++
+ include/rex/graphics/shared_memory.h          |  4 +
+ .../rex/graphics/vulkan/command_processor.h   |  1 +
+ src/graphics/command_processor.cpp            | 57 +++++++++++++-
+ src/graphics/shared_memory.cpp                | 23 ++++++
+ src/graphics/vulkan/command_processor.cpp     | 77 +++++++++++++++++++
+ 6 files changed, 185 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index cb74a27..ebe0695 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -12,6 +12,8 @@
+ #pragma once
+ 
+ #include <atomic>
++#include <chrono>
++#include <condition_variable>
+ #include <cstring>
+ #include <functional>
+ #include <memory>
+@@ -97,6 +99,14 @@ class CommandProcessor {
+ 
+   void CallInThread(std::function<void()> fn);
+ 
++  // Makes data the GPU wrote (resolves) into [guest_address, guest_address + length) visible in
++  // guest memory, for titles whose CPU code reads render-to-texture results (WWE '13 untiles and
++  // converts composited wrestler textures). Only pages still holding GPU-written data are copied.
++  // Callable from any thread; the worker thread services the request between command batches.
++  // Returns false if nothing was done (timeout, unsupported backend, non-physical address).
++  bool MakeGpuWritesVisibleToCpu(uint32_t guest_address, uint32_t length,
++                                 std::chrono::milliseconds timeout = std::chrono::milliseconds(2000));
++
+   virtual void ClearCaches();
+   virtual void InvalidateGpuMemory();
+ 
+@@ -282,6 +292,20 @@ class CommandProcessor {
+ 
+   std::queue<std::function<void()>> pending_fns_;
+ 
++  // Backend hook for MakeGpuWritesVisibleToCpu, run on the worker thread.
++  virtual bool ReadbackGpuWrittenRange(uint32_t physical_address, uint32_t length) {
++    return false;
++  }
++  void ServiceCpuVisibilityRequest();
++  std::mutex cpu_visibility_caller_mutex_;
++  std::mutex cpu_visibility_mutex_;
++  std::condition_variable cpu_visibility_cv_;
++  std::atomic<bool> cpu_visibility_pending_{false};
++  uint32_t cpu_visibility_start_ = 0;
++  uint32_t cpu_visibility_length_ = 0;
++  bool cpu_visibility_done_ = false;
++  bool cpu_visibility_result_ = false;
++
+   // MicroEngine binary from PM4_ME_INIT
+   std::vector<uint32_t> me_bin_;
+ 
+diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
+index b05df6a..208359b 100644
+--- a/include/rex/graphics/shared_memory.h
++++ b/include/rex/graphics/shared_memory.h
+@@ -95,6 +95,10 @@ class SharedMemory {
+   // the pages they touch, the CPU data is properly loaded to the unmodified
+   // regions in those pages.
+   void RangeWrittenByGpu(uint32_t start, uint32_t length);
++  // Appends [start, length) runs of pages in the range whose current data exists only on the GPU
++  // (written by the GPU and not modified by the CPU since).
++  void GetGpuWrittenRuns(uint32_t start, uint32_t length,
++                         std::vector<std::pair<uint32_t, uint32_t>>& runs);
+ 
+  protected:
+   SharedMemory(memory::Memory& memory);
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index bfd90dd..e5fbfcd 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -476,6 +476,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+   void ClearTransientDescriptorPools();
+   void InvalidateTextureDescriptorSetReuse();
+   bool IssueCopy_ReadbackResolvePath();
++  bool ReadbackGpuWrittenRange(uint32_t physical_address, uint32_t length) override;
+   bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
+   bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
+ 
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 2749a56..d21aa64 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -242,6 +242,56 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
+   }
+ }
+ 
++bool CommandProcessor::MakeGpuWritesVisibleToCpu(uint32_t guest_address, uint32_t length,
++                                                 std::chrono::milliseconds timeout) {
++  if (!length || !worker_running_) {
++    return false;
++  }
++  auto* heap = memory_->LookupHeap(guest_address);
++  if (!heap || heap->heap_type() != memory::HeapType::kGuestPhysical) {
++    return false;
++  }
++  uint32_t physical_address =
++      static_cast<memory::PhysicalHeap*>(heap)->GetPhysicalAddress(guest_address);
++  if (system::XThread::IsInThread(worker_thread_.get())) {
++    return ReadbackGpuWrittenRange(physical_address, length);
++  }
++  std::lock_guard<std::mutex> caller_lock(cpu_visibility_caller_mutex_);
++  std::unique_lock<std::mutex> lock(cpu_visibility_mutex_);
++  cpu_visibility_start_ = physical_address;
++  cpu_visibility_length_ = length;
++  cpu_visibility_done_ = false;
++  cpu_visibility_pending_.store(true, std::memory_order_release);
++  write_ptr_index_event_->Set();
++  if (!cpu_visibility_cv_.wait_for(lock, timeout, [this] { return cpu_visibility_done_; })) {
++    // The worker may be waiting on this thread (e.g. WAIT_REG_MEM); give up rather than
++    // deadlock. A later service of the stale request is harmless.
++    REXGPU_WARN("MakeGpuWritesVisibleToCpu({:08X}, {}) timed out", guest_address, length);
++    return false;
++  }
++  return cpu_visibility_result_;
++}
++
++void CommandProcessor::ServiceCpuVisibilityRequest() {
++  uint32_t start, length;
++  {
++    std::lock_guard<std::mutex> lock(cpu_visibility_mutex_);
++    if (!cpu_visibility_pending_.load(std::memory_order_relaxed)) {
++      return;
++    }
++    start = cpu_visibility_start_;
++    length = cpu_visibility_length_;
++  }
++  bool result = ReadbackGpuWrittenRange(start, length);
++  {
++    std::lock_guard<std::mutex> lock(cpu_visibility_mutex_);
++    cpu_visibility_pending_.store(false, std::memory_order_release);
++    cpu_visibility_result_ = result;
++    cpu_visibility_done_ = true;
++  }
++  cpu_visibility_cv_.notify_all();
++}
++
+ void CommandProcessor::ClearCaches() {}
+ 
+ void CommandProcessor::InvalidateGpuMemory() {}
+@@ -287,6 +337,9 @@ void CommandProcessor::WorkerThreadMain() {
+   }
+ 
+   while (worker_running_) {
++    if (cpu_visibility_pending_.load(std::memory_order_acquire)) {
++      ServiceCpuVisibilityRequest();
++    }
+     while (!pending_fns_.empty()) {
+       auto fn = std::move(pending_fns_.front());
+       pending_fns_.pop();
+@@ -313,9 +366,11 @@ void CommandProcessor::WorkerThreadMain() {
+         loop_count++;
+         write_ptr_index = write_ptr_index_.load();
+       } while (worker_running_ && pending_fns_.empty() &&
++               !cpu_visibility_pending_.load(std::memory_order_acquire) &&
+                (write_ptr_index == 0xBAADF00D || read_ptr_index_ == write_ptr_index));
+       ReturnFromWait();
+-      if (!worker_running_ || !pending_fns_.empty()) {
++      if (!worker_running_ || !pending_fns_.empty() ||
++          cpu_visibility_pending_.load(std::memory_order_acquire)) {
+         continue;
+       }
+     }
+diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
+index 333becb..078ddd0 100644
+--- a/src/graphics/shared_memory.cpp
++++ b/src/graphics/shared_memory.cpp
+@@ -310,6 +310,29 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
+   }
+ }
+ 
++void SharedMemory::GetGpuWrittenRuns(uint32_t start, uint32_t length,
++                                     std::vector<std::pair<uint32_t, uint32_t>>& runs) {
++  if (length == 0 || start >= kBufferSize) {
++    return;
++  }
++  length = std::min(length, kBufferSize - start);
++  uint32_t page_first = start >> page_size_log2_;
++  uint32_t page_last = (start + length - 1) >> page_size_log2_;
++  auto global_lock = global_critical_region_.Acquire();
++  uint32_t run_first = UINT32_MAX;
++  for (uint32_t page = page_first; page <= page_last + 1; ++page) {
++    bool gpu_written =
++        page <= page_last &&
++        (system_page_flags_valid_and_gpu_written_[page >> 6] >> (page & 63)) & 1;
++    if (gpu_written && run_first == UINT32_MAX) {
++      run_first = page;
++    } else if (!gpu_written && run_first != UINT32_MAX) {
++      runs.emplace_back(run_first << page_size_log2_, (page - run_first) << page_size_log2_);
++      run_first = UINT32_MAX;
++    }
++  }
++}
++
+ void SharedMemory::RangeWrittenByGpu(uint32_t start, uint32_t length) {
+   if (length == 0 || start >= kBufferSize) {
+     return;
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 286ccd0..7446d0b 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -5296,6 +5296,83 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {
+   return true;
+ }
+ 
++bool VulkanCommandProcessor::ReadbackGpuWrittenRange(uint32_t physical_address,
++                                                     uint32_t length) {
++  if (texture_cache_->IsDrawResolutionScaled()) {
++    // Resolved data lives in the scaled resolve buffer; not handled here.
++    REXGPU_WARN("ReadbackGpuWrittenRange: draw resolution scaling is not supported");
++    return false;
++  }
++  std::vector<std::pair<uint32_t, uint32_t>> runs;
++  shared_memory_->GetGpuWrittenRuns(physical_address, length, runs);
++  if (runs.empty()) {
++    return true;
++  }
++  uint32_t total = 0;
++  for (const auto& run : runs) {
++    total += run.second;
++  }
++
++  const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  VkBuffer buffer = VK_NULL_HANDLE;
++  VkDeviceMemory buffer_memory = VK_NULL_HANDLE;
++  if (!ui::vulkan::util::CreateDedicatedAllocationBuffer(
++          vulkan_device, total, VK_BUFFER_USAGE_TRANSFER_DST_BIT,
++          ui::vulkan::util::MemoryPurpose::kReadback, buffer, buffer_memory)) {
++    REXGPU_ERROR("ReadbackGpuWrittenRange: failed to create a {} KB readback buffer", total >> 10);
++    return false;
++  }
++  void* mapping = nullptr;
++  bool ok = dfn.vkMapMemory(device, buffer_memory, 0, VK_WHOLE_SIZE, 0, &mapping) == VK_SUCCESS;
++  if (ok) {
++    ok = BeginSubmission(true);
++  }
++  if (ok) {
++    shared_memory_->Use(VulkanSharedMemory::Usage::kRead);
++    SubmitBarriers(true);
++    uint32_t offset = 0;
++    for (const auto& run : runs) {
++      VkBufferCopy region = {};
++      region.srcOffset = run.first;
++      region.dstOffset = offset;
++      region.size = run.second;
++      deferred_command_buffer_.CmdVkCopyBuffer(shared_memory_->buffer(), buffer, 1, &region);
++      offset += run.second;
++    }
++    PushBufferMemoryBarrier(buffer, 0, total, VK_PIPELINE_STAGE_TRANSFER_BIT,
++                            VK_PIPELINE_STAGE_HOST_BIT, VK_ACCESS_TRANSFER_WRITE_BIT,
++                            VK_ACCESS_HOST_READ_BIT);
++    ok = AwaitAllQueueOperationsCompletion();
++  }
++  if (ok) {
++    VkMappedMemoryRange range = {};
++    range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++    range.memory = buffer_memory;
++    range.size = VK_WHOLE_SIZE;
++    dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
++    uint32_t offset = 0;
++    for (const auto& run : runs) {
++      // Writing guest memory fires the CPU-write watches, so these pages are re-uploaded from the
++      // (now identical) CPU copy if the GPU needs them again.
++      uint8_t* destination = memory_->TranslatePhysical(run.first);
++      if (destination) {
++        std::memcpy(destination, static_cast<const uint8_t*>(mapping) + offset, run.second);
++      }
++      offset += run.second;
++    }
++  }
++  if (mapping) {
++    dfn.vkUnmapMemory(device, buffer_memory);
++  }
++  dfn.vkDestroyBuffer(device, buffer, nullptr);
++  dfn.vkFreeMemory(device, buffer_memory, nullptr);
++  REXGPU_INFO("ReadbackGpuWrittenRange: {:08X}+{}: {} runs, {} KB{}", physical_address, length,
++              runs.size(), total >> 10, ok ? "" : " (FAILED)");
++  return ok;
++}
++
+ void VulkanCommandProcessor::EvictOldReadbackBuffers(
+     std::unordered_map<uint64_t, ReadbackBuffer>& buffer_map) {
+   if (buffer_map.empty()) {
+-- 
+2.43.0
+

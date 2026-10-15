@@ -1,0 +1,340 @@
+From 30422f3c820b45f99dcb37b87df36e83e90dec20 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 13:37:15 -0700
+Subject: [PATCH 54/97] graphics: an empty resolve region is a successful
+ zero-pixel no-op (was a failed draw + error per call); bounded diagnostic of
+ the inputs
+
+WWE 13 issues EDRAM copies whose rectangle has zero height in the guest's own vertices (24 signatures per match, all
+'degenerate vertex coverage', no clear bits), so hardware copies nothing. GetResolveInfo now returns true with 0x0 and
+the backends' existing zero-size early return is taken; non-empty resolves are unchanged. Reviewer: ACCEPT.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/util/draw.cpp | 233 ++++++++++++++++++++++++++++++++++---
+ 1 file changed, 220 insertions(+), 13 deletions(-)
+
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index 200afc0..70c8a7e 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -10,7 +10,13 @@
+  */
+ 
+ #include <algorithm>
++#include <array>
++#include <bit>
+ #include <cmath>
++#include <mutex>
++#include <string>
++
++#include <fmt/format.h>
+ 
+ #include <rex/assert.h>
+ #include <rex/cvar.h>
+@@ -762,6 +768,47 @@ const ResolveCopyShaderInfo resolve_copy_shader_info[size_t(ResolveCopyShaderInd
+     {"Resolve Copy Full 128bpp", true, 2, 4, 4, 4, 3},
+ };
+ 
++namespace {
++
++using EmptyResolveDiagnosticSignature = std::array<uint32_t, 80>;
++
++// Empty resolves can recur once per frame. Keep diagnostics for only a small
++// number of distinct inputs, rather than logging every occurrence forever.
++bool ShouldLogEmptyResolveDiagnostic(const EmptyResolveDiagnosticSignature& signature) {
++  constexpr size_t kMaxSignatures = 32;
++  static std::mutex mutex;
++  static std::array<EmptyResolveDiagnosticSignature, kMaxSignatures> signatures;
++  static size_t signature_count = 0;
++
++  std::lock_guard<std::mutex> lock(mutex);
++  for (size_t i = 0; i < signature_count; ++i) {
++    if (signatures[i] == signature) {
++      return false;
++    }
++  }
++  if (signature_count == signatures.size()) {
++    return false;
++  }
++  signatures[signature_count++] = signature;
++  return true;
++}
++
++using ResolveRect = std::array<int32_t, 4>;
++
++ResolveRect MakeResolveRect(int32_t x0, int32_t y0, int32_t x1, int32_t y1) {
++  return {x0, y0, x1, y1};
++}
++
++bool IsResolveRectEmpty(const ResolveRect& rect) {
++  return rect[0] >= rect[2] || rect[1] >= rect[3];
++}
++
++std::string FormatResolveRect(const ResolveRect& rect) {
++  return fmt::format("({},{}..{},{})", rect[0], rect[1], rect[2], rect[3]);
++}
++
++}  // namespace
++
+ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+                     TraceWriter& trace_writer, uint32_t draw_resolution_scale_x,
+                     uint32_t draw_resolution_scale_y, bool fixed_rg16_truncated_to_minus_1_to_1,
+@@ -797,12 +844,15 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   const float* vertices_guest =
+       reinterpret_cast<const float*>(memory.TranslatePhysical(fetch.address * sizeof(uint32_t)));
+   // Most vertices have a negative half-pixel offset applied, which we reverse.
++  auto pa_su_vtx_cntl = regs.Get<reg::PA_SU_VTX_CNTL>();
+   float half_pixel_offset =
+-      regs.Get<reg::PA_SU_VTX_CNTL>().pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
++      pa_su_vtx_cntl.pix_center == xenos::PixelCenter::kD3DZero ? 0.5f : 0.0f;
++  std::array<float, 6> vertices_guest_values;
+   int32_t vertices_fixed[6];
+   for (size_t i = 0; i < rex::countof(vertices_fixed); ++i) {
+-    vertices_fixed[i] = ui::FloatToD3D11Fixed16p8(xenos::GpuSwap(vertices_guest[i], fetch.endian) +
+-                                                  half_pixel_offset);
++    vertices_guest_values[i] = xenos::GpuSwap(vertices_guest[i], fetch.endian);
++    vertices_fixed[i] =
++        ui::FloatToD3D11Fixed16p8(vertices_guest_values[i] + half_pixel_offset);
+   }
+   // Inclusive.
+   int32_t x0 = std::min(std::min(vertices_fixed[0], vertices_fixed[2]), vertices_fixed[4]);
+@@ -816,29 +866,35 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   // Bottom-right - exclude .5.
+   x1 = (x1 + 127) >> 8;
+   y1 = (y1 + 127) >> 8;
++  const ResolveRect rect_from_vertices = MakeResolveRect(x0, y0, x1, y1);
+ 
+   auto pa_sc_window_offset = regs.Get<reg::PA_SC_WINDOW_OFFSET>();
++  auto pa_su_sc_mode_cntl = regs.Get<reg::PA_SU_SC_MODE_CNTL>();
+ 
+   // Apply the window offset to the vertices.
+-  if (regs.Get<reg::PA_SU_SC_MODE_CNTL>().vtx_window_offset_enable) {
++  if (pa_su_sc_mode_cntl.vtx_window_offset_enable) {
+     x0 += pa_sc_window_offset.window_x_offset;
+     y0 += pa_sc_window_offset.window_y_offset;
+     x1 += pa_sc_window_offset.window_x_offset;
+     y1 += pa_sc_window_offset.window_y_offset;
+   }
++  const ResolveRect rect_after_window_offset = MakeResolveRect(x0, y0, x1, y1);
+ 
+   // Apply the scissor and prevent negative origin (behind the EDRAM base).
++  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   Scissor scissor;
+   // False because clamping to the surface pitch will be done later (it will be
+   // aligned to the resolve alignment here, for resolving from render targets
+   // with a pitch that is not a multiple of 8).
+   GetScissor(regs, scissor, false);
++  const ResolveRect rect_before_scissor = MakeResolveRect(x0, y0, x1, y1);
+   int32_t scissor_right = int32_t(scissor.offset[0] + scissor.extent[0]);
+   int32_t scissor_bottom = int32_t(scissor.offset[1] + scissor.extent[1]);
+   x0 = std::clamp(x0, int32_t(scissor.offset[0]), scissor_right);
+   y0 = std::clamp(y0, int32_t(scissor.offset[1]), scissor_bottom);
+   x1 = std::clamp(x1, int32_t(scissor.offset[0]), scissor_right);
+   y1 = std::clamp(y1, int32_t(scissor.offset[1]), scissor_bottom);
++  const ResolveRect rect_after_scissor = MakeResolveRect(x0, y0, x1, y1);
+ 
+   assert_true(x0 <= x1 && y0 <= y1);
+ 
+@@ -848,12 +904,13 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   // force-align the rectangle by expanding (D3D9 expands to the right/bottom
+   // for some reason, haven't found how left/top is rounded, but logically it
+   // would make sense to expand to the left/top too).
++  const ResolveRect rect_before_resolve_alignment = MakeResolveRect(x0, y0, x1, y1);
+   x0 &= ~int32_t(xenos::kResolveAlignmentPixels - 1);
+   y0 &= ~int32_t(xenos::kResolveAlignmentPixels - 1);
+   x1 = rex::align(x1, int32_t(xenos::kResolveAlignmentPixels));
+   y1 = rex::align(y1, int32_t(xenos::kResolveAlignmentPixels));
++  const ResolveRect rect_after_resolve_alignment = MakeResolveRect(x0, y0, x1, y1);
+ 
+-  auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   if (rb_surface_info.msaa_samples > xenos::MsaaSamples::k4X) {
+     // Safety check because a lot of code assumes up to 4x.
+     assert_always();
+@@ -868,25 +925,175 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   // assumed to be the largest resolvable size).
+   int32_t surface_pitch_aligned =
+       int32_t(rb_surface_info.surface_pitch & ~uint32_t(xenos::kResolveAlignmentPixels - 1));
+-  if (x1 > surface_pitch_aligned) {
+-    REXGPU_ERROR("Resolve region {} <= x < {} is outside the surface pitch {}", x0, x1,
+-                 surface_pitch_aligned);
++  const ResolveRect rect_before_surface_pitch_clamp = MakeResolveRect(x0, y0, x1, y1);
++  bool outside_surface_pitch = x1 > surface_pitch_aligned;
++  int32_t x0_before_surface_pitch_clamp = x0;
++  int32_t x1_before_surface_pitch_clamp = x1;
++  if (outside_surface_pitch) {
+     x0 = std::min(x0, surface_pitch_aligned);
+     x1 = std::min(x1, surface_pitch_aligned);
+   }
++  const ResolveRect rect_after_surface_pitch_clamp = MakeResolveRect(x0, y0, x1, y1);
+   assert_true(x1 - x0 <= int32_t(xenos::kMaxResolveSize));
+ 
+   // Clamp the height to a sane value (to make sure it can fit in the packed
+   // shader constant).
+-  if (y1 - y0 > int32_t(xenos::kMaxResolveSize)) {
+-    REXGPU_ERROR("Resolve region {} <= y < {} is taller than {}", y0, y1, xenos::kMaxResolveSize);
++  const ResolveRect rect_before_height_clamp = MakeResolveRect(x0, y0, x1, y1);
++  bool taller_than_max_resolve_size = y1 - y0 > int32_t(xenos::kMaxResolveSize);
++  int32_t y0_before_height_clamp = y0;
++  int32_t y1_before_height_clamp = y1;
++  if (taller_than_max_resolve_size) {
+     y1 = y0 + int32_t(xenos::kMaxResolveSize);
+   }
++  const ResolveRect rect_after_height_clamp = MakeResolveRect(x0, y0, x1, y1);
+ 
+-  assert_true(x0 < x1 && y0 < y1);
++  assert_true(x0 <= x1 && y0 <= y1);
+   if (x0 >= x1 || y0 >= y1) {
+-    REXGPU_ERROR("Resolve region is empty");
+-    return false;
++    const auto pa_sc_window_scissor_tl = regs.Get<reg::PA_SC_WINDOW_SCISSOR_TL>();
++    const auto pa_sc_window_scissor_br = regs.Get<reg::PA_SC_WINDOW_SCISSOR_BR>();
++    const auto pa_sc_screen_scissor_tl = regs.Get<reg::PA_SC_SCREEN_SCISSOR_TL>();
++    const auto pa_sc_screen_scissor_br = regs.Get<reg::PA_SC_SCREEN_SCISSOR_BR>();
++    const auto rb_copy_dest_pitch = regs.Get<reg::RB_COPY_DEST_PITCH>();
++    const auto rb_copy_dest_info = regs.Get<reg::RB_COPY_DEST_INFO>();
++    const uint32_t rb_copy_dest_base = regs[XE_GPU_REG_RB_COPY_DEST_BASE];
++
++    const char* empty_at = "other clamp or bounds stage (see coordinates)";
++    if (!IsResolveRectEmpty(rect_before_scissor) && IsResolveRectEmpty(rect_after_scissor)) {
++      empty_at = "scissor clamp";
++    } else if (!IsResolveRectEmpty(rect_before_resolve_alignment) &&
++               IsResolveRectEmpty(rect_after_resolve_alignment)) {
++      empty_at = "resolve alignment";
++    } else if (!IsResolveRectEmpty(rect_before_surface_pitch_clamp) &&
++               IsResolveRectEmpty(rect_after_surface_pitch_clamp)) {
++      empty_at = "surface-pitch clamp";
++    } else if (!IsResolveRectEmpty(rect_before_height_clamp) &&
++               IsResolveRectEmpty(rect_after_height_clamp)) {
++      empty_at = "height clamp";
++    } else if (IsResolveRectEmpty(rect_from_vertices)) {
++      empty_at = "degenerate vertex coverage";
++    } else if (IsResolveRectEmpty(rect_after_window_offset)) {
++      empty_at = "window-offset stage";
++    } else if (IsResolveRectEmpty(rect_after_scissor)) {
++      empty_at = "scissor bounds (already empty at scissor input)";
++    } else if (IsResolveRectEmpty(rect_after_resolve_alignment)) {
++      empty_at = "resolve-aligned bounds";
++    } else if (IsResolveRectEmpty(rect_after_surface_pitch_clamp)) {
++      empty_at = "surface-pitch-clamped bounds";
++    }
++
++    EmptyResolveDiagnosticSignature signature = {};
++    size_t signature_index = 0;
++    auto append_signature_value = [&](uint32_t value) {
++      assert_true(signature_index < signature.size());
++      signature[signature_index++] = value;
++    };
++    auto append_signature_rect = [&](const ResolveRect& rect) {
++      for (int32_t coordinate : rect) {
++        append_signature_value(uint32_t(coordinate));
++      }
++    };
++    for (float vertex : vertices_guest_values) {
++      append_signature_value(std::bit_cast<uint32_t>(vertex));
++    }
++    append_signature_value(pa_su_vtx_cntl.value);
++    append_signature_value(uint32_t(pa_su_vtx_cntl.pix_center));
++    append_signature_value(pa_su_sc_mode_cntl.value);
++    append_signature_value(uint32_t(pa_su_sc_mode_cntl.vtx_window_offset_enable));
++    append_signature_value(pa_sc_window_offset.value);
++    append_signature_value(uint32_t(pa_sc_window_offset.window_x_offset));
++    append_signature_value(uint32_t(pa_sc_window_offset.window_y_offset));
++    append_signature_value(pa_sc_window_scissor_tl.value);
++    append_signature_value(pa_sc_window_scissor_br.value);
++    append_signature_value(pa_sc_screen_scissor_tl.value);
++    append_signature_value(pa_sc_screen_scissor_br.value);
++    append_signature_value(scissor.offset[0]);
++    append_signature_value(scissor.offset[1]);
++    append_signature_value(scissor.extent[0]);
++    append_signature_value(scissor.extent[1]);
++    append_signature_value(rb_surface_info.value);
++    append_signature_value(rb_surface_info.surface_pitch);
++    append_signature_value(uint32_t(rb_surface_info.msaa_samples));
++    append_signature_value(rb_copy_control.value);
++    append_signature_value(uint32_t(rb_copy_control.copy_command));
++    append_signature_value(uint32_t(rb_copy_control.color_clear_enable));
++    append_signature_value(uint32_t(rb_copy_control.depth_clear_enable));
++    append_signature_value(rb_copy_dest_base);
++    append_signature_value(rb_copy_dest_pitch.value);
++    append_signature_value(rb_copy_dest_pitch.copy_dest_pitch);
++    append_signature_value(rb_copy_dest_pitch.copy_dest_height);
++    append_signature_value(rb_copy_dest_info.value);
++    append_signature_rect(rect_from_vertices);
++    append_signature_rect(rect_after_window_offset);
++    append_signature_rect(rect_before_scissor);
++    append_signature_rect(rect_after_scissor);
++    append_signature_rect(rect_before_resolve_alignment);
++    append_signature_rect(rect_after_resolve_alignment);
++    append_signature_rect(rect_before_surface_pitch_clamp);
++    append_signature_rect(rect_after_surface_pitch_clamp);
++    append_signature_rect(rect_before_height_clamp);
++    append_signature_rect(rect_after_height_clamp);
++
++    // Keep the unused tail canonical as part of the fixed-size signature.
++    assert_true(signature_index <= signature.size());
++    if (ShouldLogEmptyResolveDiagnostic(signature)) {
++      std::string message = fmt::format(
++          "Empty resolve is a zero-pixel no-op; region became empty at {}. "
++          "guest_vertices=[{:.9g},{:.9g},{:.9g},{:.9g},{:.9g},{:.9g}] "
++          "pix_center={} (PA_SU_VTX_CNTL={:08X}) "
++          "window_offset=({}, {}) enabled={} (PA_SC_WINDOW_OFFSET={:08X}, "
++          "PA_SU_SC_MODE_CNTL={:08X}) "
++          "scissor=offset({}, {}) extent({}, {}) PA_SC_WINDOW_SCISSOR_TL/BR={:08X}/{:08X} "
++          "PA_SC_SCREEN_SCISSOR_TL/BR={:08X}/{:08X} "
++          "surface_pitch={} msaa={} (RB_SURFACE_INFO={:08X}) "
++          "copy_command={} color_clear={} depth_clear={} (RB_COPY_CONTROL={:08X}) "
++          "RB_COPY_DEST_BASE={:08X} RB_COPY_DEST_PITCH={:08X} (pitch={} height={}) "
++          "RB_COPY_DEST_INFO={:08X}; "
++          "bounds vertices={} window_offset:{}->{} scissor:{}->{} alignment:{}->{} "
++          "surface_pitch:{}->{} height_limit:{}->{}",
++          empty_at, vertices_guest_values[0], vertices_guest_values[1],
++          vertices_guest_values[2], vertices_guest_values[3], vertices_guest_values[4],
++          vertices_guest_values[5], uint32_t(pa_su_vtx_cntl.pix_center),
++          pa_su_vtx_cntl.value, int32_t(pa_sc_window_offset.window_x_offset),
++          int32_t(pa_sc_window_offset.window_y_offset),
++          uint32_t(pa_su_sc_mode_cntl.vtx_window_offset_enable), pa_sc_window_offset.value,
++          pa_su_sc_mode_cntl.value, scissor.offset[0], scissor.offset[1], scissor.extent[0],
++          scissor.extent[1], pa_sc_window_scissor_tl.value, pa_sc_window_scissor_br.value,
++          pa_sc_screen_scissor_tl.value, pa_sc_screen_scissor_br.value,
++          uint32_t(rb_surface_info.surface_pitch), uint32_t(rb_surface_info.msaa_samples),
++          rb_surface_info.value, uint32_t(rb_copy_control.copy_command),
++          uint32_t(rb_copy_control.color_clear_enable),
++          uint32_t(rb_copy_control.depth_clear_enable), rb_copy_control.value,
++          rb_copy_dest_base, rb_copy_dest_pitch.value,
++          uint32_t(rb_copy_dest_pitch.copy_dest_pitch),
++          uint32_t(rb_copy_dest_pitch.copy_dest_height), rb_copy_dest_info.value,
++          FormatResolveRect(rect_from_vertices), FormatResolveRect(rect_from_vertices),
++          FormatResolveRect(rect_after_window_offset), FormatResolveRect(rect_before_scissor),
++          FormatResolveRect(rect_after_scissor),
++          FormatResolveRect(rect_before_resolve_alignment),
++          FormatResolveRect(rect_after_resolve_alignment),
++          FormatResolveRect(rect_before_surface_pitch_clamp),
++          FormatResolveRect(rect_after_surface_pitch_clamp),
++          FormatResolveRect(rect_before_height_clamp), FormatResolveRect(rect_after_height_clamp));
++      REXGPU_WARN("{}", message);
++    }
++    // Backends treat either zero dimension as "nothing to copy/clear". Keep
++    // both explicit so this remains a valid, initialized ResolveInfo no-op.
++    info_out.coordinate_info.width_div_8 = 0;
++    info_out.height_div_8 = 0;
++    return true;
++  }
++
++  // Preserve the existing diagnostics for non-empty but out-of-bounds regions.
++  // Defer them until emptiness is known so a clipped zero-pixel no-op is not
++  // reported as an error.
++  if (outside_surface_pitch) {
++    REXGPU_ERROR("Resolve region {} <= x < {} is outside the surface pitch {}",
++                 x0_before_surface_pitch_clamp, x1_before_surface_pitch_clamp,
++                 surface_pitch_aligned);
++  }
++  if (taller_than_max_resolve_size) {
++    REXGPU_ERROR("Resolve region {} <= y < {} is taller than {}", y0_before_height_clamp,
++                 y1_before_height_clamp, xenos::kMaxResolveSize);
+   }
+ 
+   info_out.coordinate_info.width_div_8 = uint32_t(x1 - x0) >> xenos::kResolveAlignmentPixelsLog2;
+-- 
+2.43.0
+

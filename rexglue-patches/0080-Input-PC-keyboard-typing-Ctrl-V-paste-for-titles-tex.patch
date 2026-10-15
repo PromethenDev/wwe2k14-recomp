@@ -1,0 +1,717 @@
+From b7d5504c93ece7fdf73571f6252522d07fcc7e61 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 15:33:22 -0700
+Subject: [PATCH 80/97] Input: PC keyboard typing + Ctrl+V paste for titles'
+ text entry
+
+- MnK: typed characters (OnKeyChar) become VK_PACKET+unicode keystrokes for titles that read
+  XamInputGetKeystroke; Ctrl+V reads the clipboard (new rex::ui::GetClipboardText, Win32 + GTK).
+- TextEntryTarget hook (rex::input): a title can register a pad-driven on-screen keyboard; while it
+  is active, MnK stops mapping printable keys to pad buttons and types each queued character by
+  calling SelectChar() and pulsing A (50 ms down / 50 ms up); Space=Y, Backspace=X, Enter=Start,
+  Escape=B.
+- InputSystem::GetKeystroke polls every driver (an EMPTY gamepad no longer hides MnK keystrokes).
+- Default-off --debug_keystroke_poll_log counter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/input/input_driver.h         |  10 +
+ include/rex/input/input_system.h         |   7 +
+ include/rex/input/mnk/mnk_input_driver.h |  18 +-
+ include/rex/input/text_entry.h           |  15 ++
+ include/rex/ui/clipboard.h               |  11 ++
+ src/input/input_system.cpp               |  10 +-
+ src/input/mnk/mnk_input_driver.cpp       | 240 ++++++++++++++++++++++-
+ src/kernel/xam/xam_input.cpp             |  32 ++-
+ src/ui/window_gtk.cpp                    |  29 +++
+ src/ui/window_win.cpp                    |  30 +++
+ 10 files changed, 390 insertions(+), 12 deletions(-)
+ create mode 100644 include/rex/input/text_entry.h
+ create mode 100644 include/rex/ui/clipboard.h
+
+diff --git a/include/rex/input/input_driver.h b/include/rex/input/input_driver.h
+index b579ef4..935abcf 100644
+--- a/include/rex/input/input_driver.h
++++ b/include/rex/input/input_driver.h
+@@ -11,9 +11,11 @@
+  */
+ 
+ #include <cstddef>
++#include <atomic>
+ #include <functional>
+ 
+ #include <rex/input/input.h>
++#include <rex/input/text_entry.h>
+ #include <rex/kernel.h>
+ #include <rex/ui/window.h>
+ 
+@@ -40,6 +42,10 @@ class InputDriver {
+ 
+   virtual void OnWindowAvailable(rex::ui::Window* /*window*/) {}
+ 
++  void SetTextEntryTarget(TextEntryTarget* target) {
++    text_entry_target_.store(target, std::memory_order_release);
++  }
++
+   void set_is_active_callback(std::function<bool()> is_active_callback) {
+     is_active_callback_ = is_active_callback;
+   }
+@@ -52,11 +58,15 @@ class InputDriver {
+   size_t window_z_order() const { return window_z_order_; }
+ 
+   bool is_active() const { return !is_active_callback_ || is_active_callback_(); }
++  TextEntryTarget* text_entry_target() const {
++    return text_entry_target_.load(std::memory_order_acquire);
++  }
+ 
+  private:
+   rex::ui::Window* window_;
+   size_t window_z_order_;
+   std::function<bool()> is_active_callback_ = nullptr;
++  std::atomic<TextEntryTarget*> text_entry_target_{nullptr};
+ };
+ 
+ }  // namespace rex::input
+diff --git a/include/rex/input/input_system.h b/include/rex/input/input_system.h
+index 8f34d97..edf9e00 100644
+--- a/include/rex/input/input_system.h
++++ b/include/rex/input/input_system.h
+@@ -10,11 +10,13 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <memory>
+ #include <vector>
+ 
+ #include <rex/input/input.h>
+ #include <rex/input/input_driver.h>
++#include <rex/input/text_entry.h>
+ #include <rex/system/interfaces/input.h>
+ 
+ namespace rex::ui {
+@@ -36,6 +38,10 @@ class InputSystem : public system::IInputSystem {
+   void AddDriver(std::unique_ptr<InputDriver> driver);
+   void AttachWindow(rex::ui::Window* window);
+   void SetActiveCallback(std::function<bool()> callback);
++  void SetTextEntryTarget(TextEntryTarget* target);
++  TextEntryTarget* GetTextEntryTarget() const {
++    return text_entry_target_.load(std::memory_order_acquire);
++  }
+ 
+   X_RESULT GetCapabilities(uint32_t user_index, uint32_t flags, X_INPUT_CAPABILITIES* out_caps);
+   X_RESULT GetState(uint32_t user_index, X_INPUT_STATE* out_state);
+@@ -44,6 +50,7 @@ class InputSystem : public system::IInputSystem {
+ 
+  private:
+   rex::ui::Window* window_ = nullptr;
++  std::atomic<TextEntryTarget*> text_entry_target_{nullptr};
+ 
+   std::vector<std::unique_ptr<InputDriver>> drivers_;
+ };
+diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
+index 13fca03..26d811d 100644
+--- a/include/rex/input/mnk/mnk_input_driver.h
++++ b/include/rex/input/mnk/mnk_input_driver.h
+@@ -14,6 +14,7 @@
+ #include <rex/ui/window_listener.h>
+ 
+ #include <cstdint>
++#include <chrono>
+ #include <mutex>
+ #include <queue>
+ #include <string>
+@@ -41,6 +42,7 @@ class MnkInputDriver final : public InputDriver,
+   // WindowInputListener
+   void OnKeyDown(rex::ui::KeyEvent& e) override;
+   void OnKeyUp(rex::ui::KeyEvent& e) override;
++  void OnKeyChar(rex::ui::KeyEvent& e) override;
+   void OnMouseDown(rex::ui::MouseEvent& e) override;
+   void OnMouseUp(rex::ui::MouseEvent& e) override;
+   void OnMouseMove(rex::ui::MouseEvent& e) override;
+@@ -56,12 +58,22 @@ class MnkInputDriver final : public InputDriver,
+   void CenterCursor();
+   void UpdateMouseCapture();
+   void SetKeyState(uint16_t vk, bool down);
+-  void EnqueueKeystroke(uint16_t vk_pad, bool down);
++  void EnqueueKeystroke(uint16_t virtual_key, bool down, uint16_t unicode = 0,
++                        bool repeat = false);
++  void EnqueueTextCharacter(char16_t character);
++  void EnqueueTextButton(uint16_t button);
++
++  struct TextEntryInput {
++    enum class Type { kCharacter, kButton } type;
++    char16_t character = 0;
++    uint16_t button = 0;
++  };
+ 
+   rex::ui::Window* attached_window_ = nullptr;
+ 
+   std::mutex state_mutex_;
+   bool key_down_[256] = {};
++  bool paste_key_down_ = false;
+ 
+   // Mouse delta tracking
+   int32_t mouse_dx_ = 0;
+@@ -74,6 +86,10 @@ class MnkInputDriver final : public InputDriver,
+ 
+   // Keystroke queue
+   std::queue<X_INPUT_KEYSTROKE> keystroke_queue_;
++  // Independent queue for the game's pad-driven on-screen keyboard.
++  std::queue<TextEntryInput> text_entry_queue_;
++  uint16_t text_entry_held_button_ = 0;
++  std::chrono::steady_clock::time_point text_entry_phase_end_{};
+ 
+   // Packet number incremented on state change
+   uint32_t packet_number_ = 0;
+diff --git a/include/rex/input/text_entry.h b/include/rex/input/text_entry.h
+new file mode 100644
+index 0000000..595e736
+--- /dev/null
++++ b/include/rex/input/text_entry.h
+@@ -0,0 +1,15 @@
++#pragma once
++
++#include <cstdint>
++
++namespace rex::input {
++
++class TextEntryTarget {
++ public:
++  virtual ~TextEntryTarget() = default;
++
++  virtual bool IsActive() = 0;
++  virtual bool SelectChar(char16_t character) = 0;
++};
++
++}  // namespace rex::input
+diff --git a/include/rex/ui/clipboard.h b/include/rex/ui/clipboard.h
+new file mode 100644
+index 0000000..f0ac0ef
+--- /dev/null
++++ b/include/rex/ui/clipboard.h
+@@ -0,0 +1,11 @@
++#pragma once
++
++#include <optional>
++#include <string>
++
++namespace rex::ui {
++
++// Returns clipboard text as UTF-16, or nullopt when text cannot be retrieved.
++std::optional<std::u16string> GetClipboardText();
++
++}  // namespace rex::ui
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index e132acb..7c41e1a 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -41,6 +41,7 @@ void InputSystem::Shutdown() {
+ }
+ 
+ void InputSystem::AddDriver(std::unique_ptr<InputDriver> driver) {
++  driver->SetTextEntryTarget(GetTextEntryTarget());
+   drivers_.push_back(std::move(driver));
+ }
+ 
+@@ -57,6 +58,13 @@ void InputSystem::SetActiveCallback(std::function<bool()> callback) {
+   }
+ }
+ 
++void InputSystem::SetTextEntryTarget(TextEntryTarget* target) {
++  text_entry_target_.store(target, std::memory_order_release);
++  for (auto& driver : drivers_) {
++    driver->SetTextEntryTarget(target);
++  }
++}
++
+ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
+@@ -152,7 +160,7 @@ X_RESULT InputSystem::GetKeystroke(uint32_t user_index, uint32_t flags,
+     if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
+       any_connected = true;
+     }
+-    if (result == X_ERROR_SUCCESS || result == X_ERROR_EMPTY) {
++    if (result == X_ERROR_SUCCESS) {
+       return result;
+     }
+   }
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 3410a0c..5cb694f 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -10,9 +10,12 @@
+  */
+ #include <rex/input/mnk/mnk_input_driver.h>
+ 
++#include <chrono>
++
+ #include <rex/cvar.h>
+ #include <rex/input/input.h>
+ #include <rex/logging.h>
++#include <rex/ui/clipboard.h>
+ #include <rex/ui/keybinds.h>
+ #include <rex/ui/virtual_key.h>
+ #include <rex/ui/window.h>
+@@ -62,6 +65,29 @@ namespace rex::input::mnk {
+ 
+ using rex::ui::VirtualKey;
+ 
++namespace {
++
++constexpr size_t kMaxKeystrokeQueueSize = 256;
++constexpr size_t kMaxPasteCharacterCount = 128;
++constexpr size_t kMaxTextEntryQueueSize = 512;
++constexpr std::chrono::milliseconds kTextEntryHold{50};
++constexpr std::chrono::milliseconds kTextEntryGap{50};
++
++bool IsFilteredTextCharacter(uint16_t unicode) {
++  // Match OnKeyChar's single-line text filtering, including UTF-16 surrogate
++  // halves which are not independently useful as guest text input.
++  return unicode < 0x20 || (unicode >= 0x7F && unicode <= 0x9F) ||
++         (unicode >= 0xD800 && unicode <= 0xDFFF);
++}
++
++bool IsControlKeyDown(const bool (&key_down)[256]) {
++  return key_down[static_cast<uint16_t>(VirtualKey::kControl)] ||
++         key_down[static_cast<uint16_t>(VirtualKey::kLControl)] ||
++         key_down[static_cast<uint16_t>(VirtualKey::kRControl)];
++}
++
++}  // namespace
++
+ MnkInputDriver::MnkInputDriver(rex::ui::Window* window, size_t window_z_order)
+     : InputDriver(window, window_z_order) {}
+ 
+@@ -171,6 +197,12 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+   UpdateMouseCapture();
+ 
+   if (!is_active() || !has_focus_) {
++    std::lock_guard lock(state_mutex_);
++    while (!text_entry_queue_.empty()) {
++      text_entry_queue_.pop();
++    }
++    text_entry_held_button_ = 0;
++    text_entry_phase_end_ = {};
+     if (out_state) {
+       std::memset(out_state, 0, sizeof(*out_state));
+       out_state->packet_number = packet_number_;
+@@ -180,6 +212,72 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+ 
+   std::lock_guard lock(state_mutex_);
+ 
++  TextEntryTarget* const text_entry_target = this->text_entry_target();
++  const bool text_entry_active = text_entry_target && text_entry_target->IsActive();
++  if (!text_entry_active) {
++    while (!text_entry_queue_.empty()) {
++      text_entry_queue_.pop();
++    }
++    text_entry_held_button_ = 0;
++    text_entry_phase_end_ = {};
++  } else {
++    uint16_t buttons = 0;
++    if (key_down_[static_cast<uint16_t>(VirtualKey::kUp)])
++      buttons |= X_INPUT_GAMEPAD_DPAD_UP;
++    if (key_down_[static_cast<uint16_t>(VirtualKey::kDown)])
++      buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
++    if (key_down_[static_cast<uint16_t>(VirtualKey::kLeft)])
++      buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
++    if (key_down_[static_cast<uint16_t>(VirtualKey::kRight)])
++      buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
++
++    // Each action is a pad press held for kTextEntryHold and followed by kTextEntryGap with no
++    // action, so the title sees a clean down/up edge however often it polls per frame.
++    const auto now = std::chrono::steady_clock::now();
++    if (text_entry_held_button_ != 0) {
++      if (now < text_entry_phase_end_) {
++        buttons |= text_entry_held_button_;
++      } else {
++        text_entry_held_button_ = 0;
++        text_entry_phase_end_ = now + kTextEntryGap;
++      }
++    } else if (now >= text_entry_phase_end_) {
++      uint16_t action_button = 0;
++      while (!text_entry_queue_.empty() && action_button == 0) {
++        const TextEntryInput input = text_entry_queue_.front();
++        text_entry_queue_.pop();
++        if (input.type == TextEntryInput::Type::kButton) {
++          action_button = input.button;
++          continue;
++        }
++        if (input.character == u' ') {
++          action_button = X_INPUT_GAMEPAD_Y;
++          continue;
++        }
++        char16_t upper = input.character;
++        if (upper >= u'a' && upper <= u'z') {
++          upper = static_cast<char16_t>(upper - (u'a' - u'A'));
++        }
++        if (text_entry_target->SelectChar(upper)) {
++          action_button = X_INPUT_GAMEPAD_A;
++        }
++      }
++      if (action_button != 0) {
++        buttons |= action_button;
++        text_entry_held_button_ = action_button;
++        text_entry_phase_end_ = now + kTextEntryHold;
++      }
++    }
++
++    ++packet_number_;
++    if (out_state) {
++      std::memset(out_state, 0, sizeof(*out_state));
++      out_state->packet_number = packet_number_;
++      out_state->gamepad.buttons = buttons;
++    }
++    return X_ERROR_SUCCESS;
++  }
++
+   uint16_t buttons = 0;
+   if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
+     buttons |= X_INPUT_GAMEPAD_A;
+@@ -285,16 +383,38 @@ X_RESULT MnkInputDriver::GetKeystroke(uint32_t user_index, uint32_t flags,
+   return X_ERROR_SUCCESS;
+ }
+ 
+-void MnkInputDriver::EnqueueKeystroke(uint16_t vk_pad, bool down) {
++void MnkInputDriver::EnqueueKeystroke(uint16_t virtual_key, bool down, uint16_t unicode,
++                                      bool repeat) {
+   X_INPUT_KEYSTROKE ks = {};
+-  ks.virtual_key = vk_pad;
+-  ks.unicode = 0;
++  ks.virtual_key = virtual_key;
++  ks.unicode = unicode;
+   ks.flags = down ? X_INPUT_KEYSTROKE_KEYDOWN : X_INPUT_KEYSTROKE_KEYUP;
++  if (down && repeat) {
++    ks.flags = static_cast<uint16_t>(ks.flags) | X_INPUT_KEYSTROKE_REPEAT;
++  }
+   ks.user_index = static_cast<uint8_t>(UserIndex());
+   ks.hid_code = 0;
++  if (keystroke_queue_.size() >= kMaxKeystrokeQueueSize) {
++    keystroke_queue_.pop();
++  }
+   keystroke_queue_.push(ks);
+ }
+ 
++void MnkInputDriver::EnqueueTextCharacter(char16_t character) {
++  if (text_entry_queue_.size() >= kMaxTextEntryQueueSize) {
++    text_entry_queue_.pop();
++  }
++  text_entry_queue_.push(
++      TextEntryInput{TextEntryInput::Type::kCharacter, character, 0});
++}
++
++void MnkInputDriver::EnqueueTextButton(uint16_t button) {
++  if (text_entry_queue_.size() >= kMaxTextEntryQueueSize) {
++    text_entry_queue_.pop();
++  }
++  text_entry_queue_.push(TextEntryInput{TextEntryInput::Type::kButton, 0, button});
++}
++
+ void MnkInputDriver::CenterCursor() {
+   if (!attached_window_)
+     return;
+@@ -357,25 +477,126 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+   if (!IsEnabled() || !has_focus_)
+     return;
+-  std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+-  SetKeyState(vk, true);
+-  if (IsUiKeystrokeKey(vk)) {
+-    EnqueueKeystroke(vk, true);
++  bool ctrl_v = false;
++  bool paste = false;
++  {
++    std::lock_guard lock(state_mutex_);
++    ctrl_v = vk == static_cast<uint16_t>(VirtualKey::kV) &&
++             (e.is_ctrl_pressed() || IsControlKeyDown(key_down_));
++    paste = ctrl_v && !paste_key_down_;
++    if (vk == static_cast<uint16_t>(VirtualKey::kV)) {
++      paste_key_down_ = ctrl_v;
++    }
++    // Do not let a Ctrl+V paste temporarily activate a user-configured V pad
++    // binding, or emit V itself as a UI keystroke. Repeated Ctrl+V keydowns are
++    // ignored until the matching key-up so a held shortcut pastes only once.
++    SetKeyState(vk, !ctrl_v);
++    if (!ctrl_v && IsUiKeystrokeKey(vk)) {
++      EnqueueKeystroke(vk, true);
++    }
++    if (!ctrl_v && !e.prev_state()) {
++      switch (static_cast<VirtualKey>(vk)) {
++        case VirtualKey::kBack:
++          EnqueueTextButton(X_INPUT_GAMEPAD_X);
++          break;
++        case VirtualKey::kReturn:
++          EnqueueTextButton(X_INPUT_GAMEPAD_START);
++          break;
++        case VirtualKey::kEscape:
++          EnqueueTextButton(X_INPUT_GAMEPAD_B);
++          break;
++        default:
++          break;
++      }
++    }
++  }
++
++  if (!paste) {
++    return;
++  }
++
++  // On GTK, this handler runs on the UI thread that receives key events.
++  const auto clipboard_text = rex::ui::GetClipboardText();
++  if (!clipboard_text) {
++    return;
++  }
++
++  std::lock_guard lock(state_mutex_);
++  if (!has_focus_ || !IsEnabled()) {
++    return;
++  }
++  const size_t character_count = std::min(clipboard_text->size(), kMaxPasteCharacterCount);
++  for (size_t i = 0; i < character_count; ++i) {
++    const uint16_t unicode = static_cast<uint16_t>((*clipboard_text)[i]);
++    if (IsFilteredTextCharacter(unicode)) {
++      continue;
++    }
++    EnqueueTextCharacter(static_cast<char16_t>(unicode));
++    if (unicode == static_cast<uint16_t>(VirtualKey::kSpace)) {
++      // Match typed Space: the guest inserts it through the VK_SPACE action.
++      EnqueueKeystroke(static_cast<uint16_t>(VirtualKey::kSpace), true);
++    } else {
++      EnqueueKeystroke(static_cast<uint16_t>(VirtualKey::kPacket), true, unicode);
++    }
+   }
+ }
+ 
+ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+-  if (!IsEnabled())
+-    return;
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
++  if (vk == static_cast<uint16_t>(VirtualKey::kV)) {
++    paste_key_down_ = false;
++  }
++  if (!IsEnabled())
++    return;
+   SetKeyState(vk, false);
+   if (IsUiKeystrokeKey(vk)) {
+     EnqueueKeystroke(vk, false);
+   }
+ }
+ 
++void MnkInputDriver::OnKeyChar(rex::ui::KeyEvent& e) {
++  if (!IsEnabled())
++    return;
++
++  const uint16_t unicode = static_cast<uint16_t>(e.virtual_key());
++  if (IsFilteredTextCharacter(unicode)) {
++    return;
++  }
++
++  std::lock_guard lock(state_mutex_);
++  if (!has_focus_)
++    return;
++
++  // GTK (verified under XTest) produces a printable 'v' character event for Ctrl+V instead
++  // of the usual U+0016 control character. Neither form should type the shortcut.
++  if ((unicode == u'v' || unicode == u'V') &&
++      (e.is_ctrl_pressed() || IsControlKeyDown(key_down_))) {
++    return;
++  }
++
++  const auto repeat_count = std::clamp(e.repeat_count(), 1,
++                                       static_cast<int>(kMaxKeystrokeQueueSize));
++  for (int i = 0; i < repeat_count; ++i) {
++    EnqueueTextCharacter(static_cast<char16_t>(unicode));
++  }
++
++  // VK_SPACE already has a dedicated KEYDOWN path in the guest's UI dispatcher,
++  // which inserts one space. Keep that legacy keystroke path, while the separate
++  // text-entry queue above uses Space to pulse Y.
++  if (unicode == static_cast<uint16_t>(VirtualKey::kSpace))
++    return;
++
++  // WWE '13 reserves VK 3..40 for UI actions. VK_PACKET keeps translated
++  // printable text on the guest's unicode insertion path, including punctuation
++  // whose character value overlaps one of those action VKs.
++  for (int i = 0; i < repeat_count; ++i) {
++    EnqueueKeystroke(static_cast<uint16_t>(VirtualKey::kPacket), true, unicode,
++                     e.prev_state() || i > 0);
++  }
++}
++
+ void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
+   if (!IsEnabled() || !REXCVAR_GET(mnk_mouse) || !has_focus_)
+     return;
+@@ -430,6 +651,7 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+   std::lock_guard lock(state_mutex_);
+   has_focus_ = false;
+   std::memset(key_down_, 0, sizeof(key_down_));
++  paste_key_down_ = false;
+   mouse_dx_ = 0;
+   mouse_dy_ = 0;
+   if (mouse_captured_ && attached_window_) {
+diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
+index 2db5561..9c0e026 100644
+--- a/src/kernel/xam/xam_input.cpp
++++ b/src/kernel/xam/xam_input.cpp
+@@ -9,6 +9,9 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <rex/cvar.h>
++#include <rex/chrono/clock.h>
+ #include <rex/input/input.h>
+ #include <rex/input/input_system.h>
+ #include <rex/kernel/xam/private.h>
+@@ -140,6 +143,30 @@ ppc_u32_result_t XamInputSetState_entry(ppc_u32_t user_index, ppc_u32_t unk,
+   return is->SetState(actual_user_index, vibration);
+ }
+ 
++REXCVAR_DEFINE_BOOL(debug_keystroke_poll_log, false, "Input",
++                    "Diagnostic: once per second, log how often the title polled XamInputGetKeystroke(Ex)");
++
++static void DebugCountKeystrokePoll(uint32_t flags, X_RESULT result) {
++  if (!REXCVAR_GET(debug_keystroke_poll_log)) {
++    return;
++  }
++  static std::atomic<uint32_t> polls{0}, hits{0};
++  static std::atomic<uint64_t> window_start{0};
++  polls.fetch_add(1, std::memory_order_relaxed);
++  if (result == X_ERROR_SUCCESS) {
++    hits.fetch_add(1, std::memory_order_relaxed);
++  }
++  uint64_t now = rex::chrono::Clock::QueryHostUptimeMillis();
++  uint64_t start = window_start.load(std::memory_order_relaxed);
++  if (!start) {
++    window_start.store(now, std::memory_order_relaxed);
++  } else if (now - start >= 1000 &&
++             window_start.compare_exchange_strong(start, now, std::memory_order_relaxed)) {
++    REXKRNL_INFO("[keystroke-poll] t={} polls={} keystrokes={} flags={:X}", now,
++                 polls.exchange(0), hits.exchange(0), flags);
++  }
++}
++
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputgetkeystroke(v=vs.85).aspx
+ ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flags,
+                                             ppc_ptr_t<X_INPUT_KEYSTROKE> keystroke) {
+@@ -163,7 +190,9 @@ ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flag
+   }
+ 
+   auto* is = input_system();
+-  return is->GetKeystroke(actual_user_index, flags, keystroke);
++  X_RESULT result = is->GetKeystroke(actual_user_index, flags, keystroke);
++  DebugCountKeystrokePoll(flags, result);
++  return result;
+ }
+ 
+ // Same as non-ex, just takes a pointer to user index.
+@@ -186,6 +215,7 @@ ppc_u32_result_t XamInputGetKeystrokeEx_entry(ppc_pu32_t user_index_ptr, ppc_u32
+ 
+   auto* is = input_system();
+   auto result = is->GetKeystroke(user_index, flags, keystroke);
++  DebugCountKeystrokePoll(flags, result);
+   if (XSUCCEEDED(result)) {
+     *user_index_ptr = keystroke->user_index;
+   }
+diff --git a/src/ui/window_gtk.cpp b/src/ui/window_gtk.cpp
+index f729067..29a4108 100644
+--- a/src/ui/window_gtk.cpp
++++ b/src/ui/window_gtk.cpp
+@@ -18,6 +18,7 @@
+ #include <rex/graphics/video_mode_util.h>
+ #include <rex/logging.h>
+ #include <rex/platform.h>
++#include <rex/ui/clipboard.h>
+ #include <rex/ui/flags.h>
+ #include <rex/ui/surface_gnulinux.h>
+ #include <rex/ui/virtual_key.h>
+@@ -302,6 +303,34 @@ VirtualKey TranslateGdkKeyvalToVirtualKey(guint keyval) {
+ namespace rex {
+ namespace ui {
+ 
++std::optional<std::u16string> GetClipboardText() {
++  GtkClipboard* clipboard = gtk_clipboard_get(GDK_SELECTION_CLIPBOARD);
++  if (!clipboard) {
++    return std::nullopt;
++  }
++
++  gchar* clipboard_text = gtk_clipboard_wait_for_text(clipboard);
++  if (!clipboard_text) {
++    return std::nullopt;
++  }
++
++  glong utf16_length = 0;
++  gunichar2* utf16_text =
++      g_utf8_to_utf16(clipboard_text, -1, nullptr, &utf16_length, nullptr);
++  g_free(clipboard_text);
++  if (!utf16_text) {
++    return std::nullopt;
++  }
++
++  std::u16string text;
++  text.reserve(static_cast<size_t>(utf16_length));
++  for (glong i = 0; i < utf16_length; ++i) {
++    text.push_back(static_cast<char16_t>(utf16_text[i]));
++  }
++  g_free(utf16_text);
++  return text;
++}
++
+ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
+                                        const std::string_view title, uint32_t desired_logical_width,
+                                        uint32_t desired_logical_height) {
+diff --git a/src/ui/window_win.cpp b/src/ui/window_win.cpp
+index 4caec69..2a38ebd 100644
+--- a/src/ui/window_win.cpp
++++ b/src/ui/window_win.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/video_mode_util.h>
+ #include <rex/logging.h>
++#include <rex/ui/clipboard.h>
+ #include <rex/ui/flags.h>
+ #include <rex/ui/surface_win.h>
+ #include <rex/ui/window_win.h>
+@@ -100,6 +101,35 @@ HMONITOR GetMonitorByIndex(int32_t index) {
+ namespace rex {
+ namespace ui {
+ 
++std::optional<std::u16string> GetClipboardText() {
++  if (!OpenClipboard(nullptr)) {
++    return std::nullopt;
++  }
++
++  HANDLE clipboard_data = GetClipboardData(CF_UNICODETEXT);
++  if (!clipboard_data) {
++    CloseClipboard();
++    return std::nullopt;
++  }
++
++  const auto* clipboard_text = static_cast<const wchar_t*>(GlobalLock(clipboard_data));
++  if (!clipboard_text) {
++    CloseClipboard();
++    return std::nullopt;
++  }
++
++  static_assert(sizeof(wchar_t) == sizeof(char16_t));
++  const SIZE_T text_capacity = GlobalSize(clipboard_data) / sizeof(wchar_t);
++  std::u16string text;
++  for (SIZE_T i = 0; i < text_capacity && clipboard_text[i] != L'\0'; ++i) {
++    text.push_back(static_cast<char16_t>(clipboard_text[i]));
++  }
++
++  GlobalUnlock(clipboard_data);
++  CloseClipboard();
++  return text;
++}
++
+ std::unique_ptr<Window> Window::Create(WindowedAppContext& app_context,
+                                        const std::string_view title, uint32_t desired_logical_width,
+                                        uint32_t desired_logical_height) {
+-- 
+2.43.0
+

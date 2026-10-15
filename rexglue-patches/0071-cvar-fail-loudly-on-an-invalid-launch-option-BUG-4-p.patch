@@ -1,0 +1,193 @@
+From 12abb6ff1280d8ec1c065eac042c1f684a9da819 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 30 Sep 2026 15:18:24 -0700
+Subject: [PATCH 71/97] cvar: fail loudly on an invalid launch option (BUG-4) -
+ parse errors and invalid values stop the app before any setup (Windows
+ MessageBox / Linux stderr, exit 1); --help still exits 0
+
+Verified: game 1530584e rejects --resolution_scale=abc with the player-facing message, exit 1,
+user-data root never created; normal launch reaches in-ring play (linux-gate PASS in 51 s);
+24 cvar ctests pass.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/cvar.h                 |  8 +++++++-
+ src/core/cvar.cpp                  | 20 ++++++++++++++------
+ src/rexglue/main.cpp               | 12 +++++++++++-
+ src/ui/windowed_app_main_posix.cpp | 13 ++++++++++++-
+ src/ui/windowed_app_main_win.cpp   | 16 +++++++++++++++-
+ 5 files changed, 59 insertions(+), 10 deletions(-)
+
+diff --git a/include/rex/cvar.h b/include/rex/cvar.h
+index 82d23a8..424ba65 100644
+--- a/include/rex/cvar.h
++++ b/include/rex/cvar.h
+@@ -103,7 +103,13 @@ namespace rex::cvar {
+ // Initialization API
+ //=============================================================================
+ 
+-std::vector<std::string> Init(int argc, char** argv);
++struct InitResult {
++  std::vector<std::string> remaining;
++  std::optional<std::string> parse_error;
++  bool exit_requested = false;
++};
++
++InitResult Init(int argc, char** argv);
+ void LoadConfig(const std::filesystem::path& config_path);
+ void ApplyEnvironment();
+ void FinalizeInit();
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 314b388..23b4091 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -345,7 +345,8 @@ void UnregisterChangeCallbacks(std::string_view name) {
+ // Initialization
+ //=============================================================================
+ 
+-std::vector<std::string> Init(int argc, char** argv) {
++InitResult Init(int argc, char** argv) {
++  InitResult result;
+   CLI::App app{"", ""};
+   app.allow_extras();
+ 
+@@ -357,20 +358,27 @@ std::vector<std::string> Init(int argc, char** argv) {
+           entry.description);
+     } else {
+       app.add_option_function<std::string>(
+-          "--" + entry.name, [&entry](const std::string& val) { entry.setter(val); },
++          "--" + entry.name,
++          [&entry](const std::string& val) {
++            if (!entry.setter(val)) {
++              throw CLI::ConversionError("Invalid value '" + val + "' for --" + entry.name);
++            }
++          },
+           entry.description);
+     }
+   }
+ 
+   try {
+     app.parse(argc, argv);
++    result.remaining = app.remaining();
++  } catch (const CLI::Success& e) {
++    app.exit(e);
++    result.exit_requested = true;
+   } catch (const CLI::ParseError& e) {
+-    // TODO(tomc): dumb workaround for the stupid chicken and its egg.
+-    //             dont call rex logging funcs here for now.
+-    fprintf(stderr, "cvar: CLI11  parse error: %s\n", e.what());
++    result.parse_error = e.what();
+   }
+ 
+-  return app.remaining();
++  return result;
+ }
+ 
+ void LoadConfig(const std::filesystem::path& config_path) {
+diff --git a/src/rexglue/main.cpp b/src/rexglue/main.cpp
+index 23720e6..7241b3f 100644
+--- a/src/rexglue/main.cpp
++++ b/src/rexglue/main.cpp
+@@ -13,8 +13,10 @@
+ #include "commands/test_recompiler.h"
+ 
+ #include <chrono>
++#include <cstdio>
+ #include <iostream>
+ #include <map>
++#include <utility>
+ 
+ #include <rex/cvar.h>
+ #include <rex/logging.h>
+@@ -59,7 +61,15 @@ void PrintUsage() {
+ }
+ 
+ int main(int argc, char** argv) {
+-  auto remaining = rex::cvar::Init(argc, argv);
++  auto init_result = rex::cvar::Init(argc, argv);
++  if (init_result.parse_error) {
++    std::fprintf(stderr, "rexglue: invalid launch option: %s\n", init_result.parse_error->c_str());
++    return 1;
++  }
++  if (init_result.exit_requested) {
++    return 0;
++  }
++  auto remaining = std::move(init_result.remaining);
+   rex::cvar::ApplyEnvironment();
+ 
+   std::string command;
+diff --git a/src/ui/windowed_app_main_posix.cpp b/src/ui/windowed_app_main_posix.cpp
+index ea122f0..d917779 100644
+--- a/src/ui/windowed_app_main_posix.cpp
++++ b/src/ui/windowed_app_main_posix.cpp
+@@ -15,6 +15,7 @@
+ #include <map>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include <spdlog/common.h>
+@@ -46,7 +47,17 @@ extern "C" int main(int argc_pre_gtk, char** argv_pre_gtk) {
+     return EXIT_FAILURE;
+   }
+ 
+-  auto remaining = rex::cvar::Init(argc_post_gtk, argv_post_gtk);
++  auto init_result = rex::cvar::Init(argc_post_gtk, argv_post_gtk);
++  if (init_result.parse_error) {
++    std::fprintf(stderr,
++                 "WWE '13 could not start: invalid launch option: %s. Check your shortcut or launcher settings.\n",
++                 init_result.parse_error->c_str());
++    return EXIT_FAILURE;
++  }
++  if (init_result.exit_requested) {
++    return EXIT_SUCCESS;
++  }
++  auto remaining = std::move(init_result.remaining);
+   rex::cvar::ApplyEnvironment();
+ 
+   int result;
+diff --git a/src/ui/windowed_app_main_win.cpp b/src/ui/windowed_app_main_win.cpp
+index 1005821..b46e23b 100644
+--- a/src/ui/windowed_app_main_win.cpp
++++ b/src/ui/windowed_app_main_win.cpp
+@@ -14,6 +14,7 @@
+ #include <map>
+ #include <memory>
+ #include <string>
++#include <utility>
+ #include <vector>
+ 
+ #include <rex/cvar.h>
+@@ -22,6 +23,8 @@
+ #include <rex/ui/windowed_app.h>
+ #include <rex/ui/windowed_app_context_win.h>
+ 
++#include <windows.h>
++
+ REXCVAR_DEFINE_BOOL(enable_console, true, "UI/Window", "Enable console window on Windows");
+ REXCVAR_DECLARE(bool, debug_ui);
+ 
+@@ -66,7 +69,18 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+   for (auto& s : utf8_args) {
+     argv_ptrs.push_back(s.data());
+   }
+-  auto remaining = rex::cvar::Init(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
++  auto init_result = rex::cvar::Init(static_cast<int>(argv_ptrs.size()), argv_ptrs.data());
++  if (init_result.parse_error) {
++    std::string message = "WWE '13 could not start: invalid launch option: " +
++                          *init_result.parse_error +
++                          ". Check your shortcut or launcher settings.";
++    MessageBoxA(nullptr, message.c_str(), "WWE '13", MB_OK | MB_ICONERROR);
++    return EXIT_FAILURE;
++  }
++  if (init_result.exit_requested) {
++    return EXIT_SUCCESS;
++  }
++  auto remaining = std::move(init_result.remaining);
+   rex::cvar::ApplyEnvironment();
+ 
+   // Allocate a console for debugging if enabled
+-- 
+2.43.0
+

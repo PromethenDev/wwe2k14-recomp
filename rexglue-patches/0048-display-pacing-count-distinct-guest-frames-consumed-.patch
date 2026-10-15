@@ -1,0 +1,91 @@
+From 402c04b8adc5ebb7b39d119fcb49b4657d948958 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 18:27:44 -0700
+Subject: [PATCH 48/97] display pacing: count distinct guest frames consumed
+ per display vblank, not host presents
+
+On the laptop the presenter presents on every display refresh (60/s) even at 30 guest frames/s, so presents
+per vblank read 1 during 30 fps entrances. ConsumeGuestOutput now counts images newer than the previously
+consumed one; [display-pacing] classifies vblanks by that count and also logs presents and guest_frames.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ui/presenter.h       |  4 ++++
+ src/graphics/graphics_system.cpp | 12 ++++++------
+ src/ui/presenter.cpp             |  4 ++++
+ 3 files changed, 14 insertions(+), 6 deletions(-)
+
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index 45f45d5..c61ff45 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -362,9 +362,13 @@ class Presenter {
+   uint32_t GetHostDisplayRefreshHz();
+   // Successful host presents of the guest output so far (for display pacing statistics).
+   uint64_t host_present_count() const { return host_present_count_.load(std::memory_order_relaxed); }
++  // Guest output images consumed for painting that were newer than the previously consumed one (distinct guest
++  // frames reaching the host surface; host presents also repaint the same image).
++  uint64_t guest_frames_consumed() const { return guest_frames_consumed_.load(std::memory_order_relaxed); }
+ 
+  protected:
+   std::atomic<uint64_t> host_present_count_{0};
++  std::atomic<uint64_t> guest_frames_consumed_{0};
+ 
+   enum class PaintResult {
+     kPresented,
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 173495a..20c9dd3 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -414,7 +414,7 @@ void GraphicsSystem::DisplayPacingThread() {
+   using Clock = std::chrono::steady_clock;
+   auto window_start = Clock::now();
+   auto last_vblank = Clock::time_point();
+-  uint64_t last_presents = presenter()->host_present_count();
++  uint64_t last_frames = presenter()->guest_frames_consumed();
+   uint64_t vblanks = 0, repeats = 0, singles = 0, multiples = 0, long_gaps = 0;
+   double max_gap_ms = 0.0;
+   while (display_pacing_running_) {
+@@ -424,9 +424,9 @@ void GraphicsSystem::DisplayPacingThread() {
+       continue;
+     }
+     const auto now = Clock::now();
+-    const uint64_t presents = presenter()->host_present_count();
+-    const uint64_t new_frames = presents - last_presents;
+-    last_presents = presents;
++    const uint64_t frames = presenter()->guest_frames_consumed();
++    const uint64_t new_frames = frames - last_frames;
++    last_frames = frames;
+     if (last_vblank != Clock::time_point()) {
+       const double gap_ms = std::chrono::duration<double, std::milli>(now - last_vblank).count();
+       max_gap_ms = std::max(max_gap_ms, gap_ms);
+@@ -450,9 +450,9 @@ void GraphicsSystem::DisplayPacingThread() {
+     if (now - window_start >= std::chrono::seconds(1)) {
+       last_host_refresh_hz_.store(presenter()->GetHostDisplayRefreshHz(), std::memory_order_relaxed);
+       REXGPU_INFO("[display-pacing] hz={} vblanks={} new0={} new1={} new2p={} late_wakeups={} max_gap_ms={:.2f} "
+-                  "presents={}",
++                  "presents={} guest_frames={}",
+                   last_host_refresh_hz_.load(std::memory_order_relaxed), vblanks, repeats, singles, multiples,
+-                  long_gaps, max_gap_ms, presents);
++                  long_gaps, max_gap_ms, presenter()->host_present_count(), frames);
+       vblanks = repeats = singles = multiples = long_gaps = 0;
+       max_gap_ms = 0.0;
+       window_start = now;
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 4ee2811..5192d78 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -844,6 +844,10 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(
+         (old_acquired_and_ready & ~uint32_t(3)) | (old_acquired_and_ready >> 2);
+   }
+   uint32_t mailbox_index = desired_acquired_and_ready & 3;
++  if ((old_acquired_and_ready & 3) != mailbox_index) {
++    // A guest frame newer than the one consumed last time (display pacing statistics).
++    guest_frames_consumed_.fetch_add(1, std::memory_order_relaxed);
++  }
+   // Give the current acquired image to the caller, or UINT32_MAX if it's
+   // inactive.
+   const GuestOutputProperties& properties = guest_output_properties_[mailbox_index];
+-- 
+2.43.0
+

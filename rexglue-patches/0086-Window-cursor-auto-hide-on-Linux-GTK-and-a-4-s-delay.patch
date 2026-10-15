@@ -1,0 +1,165 @@
+From a1ffe32dcca9dd7512434027d740ced35cc58bb8 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 07:18:22 -0700
+Subject: [PATCH 86/97] Window: cursor auto-hide on Linux (GTK) and a 4 s delay
+
+GTKWindow now implements CursorVisibility (kVisible / kHidden / kAutoHidden): in auto-hide the pointer over the game
+area is hidden after kDefaultCursorAutoHideMilliseconds without real mouse movement, clicks or scrolling, and shown
+again on the next one (synthetic motion events with an unchanged position are ignored). The timer is removed when the
+window closes. kDefaultCursorAutoHideMilliseconds 3333 -> 4000 (Windows uses the same value).
+---
+ include/rex/ui/window.h     |  2 +-
+ include/rex/ui/window_gtk.h | 12 ++++++
+ src/ui/window_gtk.cpp       | 78 +++++++++++++++++++++++++++++++++++++
+ 3 files changed, 91 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
+index 4bf2d7c..aceeade 100644
+--- a/include/rex/ui/window.h
++++ b/include/rex/ui/window.h
+@@ -415,7 +415,7 @@ class Window {
+   // but it's too long especially for highly dynamic games.
+   // Implementations may use different values according to the platform's UX
+   // conventions.
+-  static constexpr uint32_t kDefaultCursorAutoHideMilliseconds = 3333;
++  static constexpr uint32_t kDefaultCursorAutoHideMilliseconds = 4000;
+ 
+   Window(WindowedAppContext& app_context, const std::string_view title,
+          uint32_t desired_logical_width, uint32_t desired_logical_height);
+diff --git a/include/rex/ui/window_gtk.h b/include/rex/ui/window_gtk.h
+index 433fda3..f78fd27 100644
+--- a/include/rex/ui/window_gtk.h
++++ b/include/rex/ui/window_gtk.h
+@@ -44,6 +44,7 @@ class GTKWindow : public Window {
+   void ApplyNewFullscreen() override;
+   void ApplyNewTitle() override;
+   void ApplyNewMainMenu(MenuItem* old_main_menu) override;
++  void ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) override;
+   // Mouse capture seems to happen implicitly compared to Windows.
+   void FocusImpl() override;
+ 
+@@ -71,6 +72,17 @@ class GTKWindow : public Window {
+                                                gpointer user_data);
+   static gboolean DrawHandler(GtkWidget* widget, cairo_t* cr, gpointer data);
+ 
++  // Cursor auto-hide (CursorVisibility::kAutoHidden): hidden after kDefaultCursorAutoHideMilliseconds without
++  // mouse movement or clicks over the drawing area, shown again on the next real movement or click.
++  void SetDrawingAreaCursorHidden(bool hidden);
++  void RestartCursorAutoHideTimer();
++  void StopCursorAutoHideTimer();
++  static gboolean CursorAutoHideTimeout(gpointer user_data);
++  guint cursor_auto_hide_source_ = 0;
++  bool cursor_last_position_valid_ = false;
++  double cursor_last_x_ = 0.0;
++  double cursor_last_y_ = 0.0;
++
+   // Non-owning (initially floating) references to the widgets.
+   GtkWidget* window_ = nullptr;
+   GtkWidget* box_ = nullptr;
+diff --git a/src/ui/window_gtk.cpp b/src/ui/window_gtk.cpp
+index 29a4108..c7fabb5 100644
+--- a/src/ui/window_gtk.cpp
++++ b/src/ui/window_gtk.cpp
+@@ -346,6 +346,7 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view tit
+ 
+ GTKWindow::~GTKWindow() {
+   EnterDestructor();
++  StopCursorAutoHideTimer();
+   if (window_) {
+     // Set window_ to null to ignore events from now on since this ui::GTKWindow
+     // is entering an indeterminate state.
+@@ -786,6 +787,7 @@ gboolean GTKWindow::WindowEventHandler(GdkEvent* event) {
+       // at some point in closing anyway.
+       GtkWidget* window = window_;
+       window_ = nullptr;
++      StopCursorAutoHideTimer();
+       // Destroying the top-level window also destroys its children.
+       drawing_area_ = nullptr;
+       box_ = nullptr;
+@@ -834,7 +836,83 @@ gboolean GTKWindow::WindowEventHandlerThunk(GtkWidget* widget, GdkEvent* event,
+   return window->WindowEventHandler(event);
+ }
+ 
++void GTKWindow::ApplyNewCursorVisibility(CursorVisibility old_cursor_visibility) {
++  (void)old_cursor_visibility;
++  switch (GetCursorVisibility()) {
++    case CursorVisibility::kVisible:
++      StopCursorAutoHideTimer();
++      SetDrawingAreaCursorHidden(false);
++      break;
++    case CursorVisibility::kHidden:
++      StopCursorAutoHideTimer();
++      SetDrawingAreaCursorHidden(true);
++      break;
++    case CursorVisibility::kAutoHidden:
++      // Entering auto-hide hides the cursor at once (Window::SetCursorVisibility contract); movement reveals it.
++      StopCursorAutoHideTimer();
++      cursor_last_position_valid_ = false;
++      SetDrawingAreaCursorHidden(true);
++      break;
++  }
++}
++
++void GTKWindow::SetDrawingAreaCursorHidden(bool hidden) {
++  if (!drawing_area_) {
++    return;
++  }
++  GdkWindow* gdk_window = gtk_widget_get_window(drawing_area_);
++  if (!gdk_window) {
++    return;
++  }
++  if (!hidden) {
++    gdk_window_set_cursor(gdk_window, nullptr);
++    return;
++  }
++  GdkCursor* blank = gdk_cursor_new_for_display(gdk_window_get_display(gdk_window), GDK_BLANK_CURSOR);
++  gdk_window_set_cursor(gdk_window, blank);
++  if (blank) {
++    g_object_unref(blank);
++  }
++}
++
++void GTKWindow::RestartCursorAutoHideTimer() {
++  StopCursorAutoHideTimer();
++  cursor_auto_hide_source_ = g_timeout_add(kDefaultCursorAutoHideMilliseconds, CursorAutoHideTimeout, this);
++}
++
++void GTKWindow::StopCursorAutoHideTimer() {
++  if (cursor_auto_hide_source_) {
++    g_source_remove(cursor_auto_hide_source_);
++    cursor_auto_hide_source_ = 0;
++  }
++}
++
++gboolean GTKWindow::CursorAutoHideTimeout(gpointer user_data) {
++  auto* window = static_cast<GTKWindow*>(user_data);
++  window->cursor_auto_hide_source_ = 0;
++  if (window->GetCursorVisibility() == CursorVisibility::kAutoHidden) {
++    window->SetDrawingAreaCursorHidden(true);
++  }
++  return G_SOURCE_REMOVE;
++}
++
+ gboolean GTKWindow::DrawingAreaEventHandler(GdkEvent* event) {
++  if (GetCursorVisibility() == CursorVisibility::kAutoHidden) {
++    bool reveal = event->type == GDK_BUTTON_PRESS || event->type == GDK_SCROLL;
++    if (event->type == GDK_MOTION_NOTIFY) {
++      // Motion events also arrive without the user moving the mouse (window changes): only real movement reveals.
++      const auto* motion_event = reinterpret_cast<const GdkEventMotion*>(event);
++      reveal = !cursor_last_position_valid_ || motion_event->x_root != cursor_last_x_ ||
++               motion_event->y_root != cursor_last_y_;
++      cursor_last_position_valid_ = true;
++      cursor_last_x_ = motion_event->x_root;
++      cursor_last_y_ = motion_event->y_root;
++    }
++    if (reveal) {
++      SetDrawingAreaCursorHidden(false);
++      RestartCursorAutoHideTimer();
++    }
++  }
+   switch (event->type) {
+     case GDK_MOTION_NOTIFY:
+     case GDK_BUTTON_PRESS:
+-- 
+2.43.0
+

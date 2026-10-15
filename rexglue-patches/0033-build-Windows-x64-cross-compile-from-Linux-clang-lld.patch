@@ -1,0 +1,206 @@
+From 097f61a85c11ec3eb7848722e6a88acef6b98437 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 13:42:58 -0700
+Subject: [PATCH 33/97] build: Windows x64 cross-compile from Linux (clang +
+ lld-link + xwin)
+
+- cmake/toolchains/win-amd64-xwin.cmake: clang/clang++ targeting
+  x86_64-pc-windows-msvc, lld-link, llvm-ar, static MSVC runtime. The xwin
+  SDK/CRT headers go after clang's resource headers (-internal-isystem, as
+  clang-cl's /imsvc); otherwise the CRT stddef.h/mmintrin.h shadow clang's
+  (non-constant offsetof, union __m64). Refuses a user CMAKE_<LANG>_FLAGS,
+  which would silently drop those headers; CPU flags via XWIN_CPU_FLAGS.
+- platform_win.h: lowercase objbase.h/sdkddkver.h (no case alias in xwin).
+- ui: link shcore (lowercase) and dxgi on every Windows build; the Win32
+  presenter needs CreateDXGIFactory1 even with D3D12 off.
+- mmio_handler: the read-watch diagnostic is Linux-only; on Windows
+  ReadWatchArm logs once and does nothing. Linux path unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ cmake/toolchains/win-amd64-xwin.cmake | 96 +++++++++++++++++++++++++++
+ src/core/platform_win.h               |  4 +-
+ src/system/mmio_handler.cpp           | 13 ++++
+ src/ui/CMakeLists.txt                 |  5 +-
+ 4 files changed, 115 insertions(+), 3 deletions(-)
+ create mode 100644 cmake/toolchains/win-amd64-xwin.cmake
+
+diff --git a/cmake/toolchains/win-amd64-xwin.cmake b/cmake/toolchains/win-amd64-xwin.cmake
+new file mode 100644
+index 0000000..79f4415
+--- /dev/null
++++ b/cmake/toolchains/win-amd64-xwin.cmake
+@@ -0,0 +1,96 @@
++# Cross-compile ReXGlue (and games built on it) for Windows x64 from Linux.
++#
++# Compiler: LLVM clang/clang++ (GNU-style driver, MSVC ABI), same driver as the
++# native win-amd64 preset. Linker: lld-link. Windows SDK + MSVC CRT: an xwin
++# splat (`xwin --accept-license splat --output <dir>`).
++#
++# Inputs (cache or environment):
++#   XWIN_DIR   xwin splat output (default: $ENV{XWIN_DIR} or $HOME/xwin)
++#   LLVM_BIN   directory with clang, lld-link, llvm-lib, llvm-rc, llvm-mt
++#              (default: $ENV{LLVM_BIN} or /usr/lib/llvm-20/bin)
++
++set(CMAKE_SYSTEM_NAME Windows)
++set(CMAKE_SYSTEM_VERSION 10.0)
++set(CMAKE_SYSTEM_PROCESSOR AMD64)
++
++if(NOT XWIN_DIR)
++  if(DEFINED ENV{XWIN_DIR})
++    set(XWIN_DIR "$ENV{XWIN_DIR}")
++  else()
++    set(XWIN_DIR "$ENV{HOME}/xwin")
++  endif()
++endif()
++if(NOT LLVM_BIN)
++  if(DEFINED ENV{LLVM_BIN})
++    set(LLVM_BIN "$ENV{LLVM_BIN}")
++  else()
++    set(LLVM_BIN "/usr/lib/llvm-20/bin")
++  endif()
++endif()
++set(XWIN_DIR "${XWIN_DIR}" CACHE PATH "xwin splat directory")
++set(LLVM_BIN "${LLVM_BIN}" CACHE PATH "LLVM tools directory")
++# try_compile() projects re-read this file; forward the two inputs to them.
++list(APPEND CMAKE_TRY_COMPILE_PLATFORM_VARIABLES XWIN_DIR LLVM_BIN)
++
++if(NOT EXISTS "${XWIN_DIR}/sdk/include/um/windows.h")
++  message(FATAL_ERROR "Windows SDK not found in XWIN_DIR='${XWIN_DIR}' (run xwin splat)")
++endif()
++
++set(_triple x86_64-pc-windows-msvc)
++set(CMAKE_C_COMPILER   "${LLVM_BIN}/clang")
++set(CMAKE_CXX_COMPILER "${LLVM_BIN}/clang++")
++set(CMAKE_C_COMPILER_TARGET   ${_triple})
++set(CMAKE_CXX_COMPILER_TARGET ${_triple})
++set(CMAKE_ASM_COMPILER_TARGET ${_triple})
++set(CMAKE_LINKER "${LLVM_BIN}/lld-link")
++# The GNU-style driver makes CMake call the archiver ar-style (qc); lld-link reads these archives.
++set(CMAKE_AR     "${LLVM_BIN}/llvm-ar")
++set(CMAKE_RANLIB "${LLVM_BIN}/llvm-ranlib")
++set(CMAKE_RC_COMPILER "${LLVM_BIN}/llvm-rc")
++set(CMAKE_MT     "${LLVM_BIN}/llvm-mt")
++
++set(_inc
++  "${XWIN_DIR}/crt/include"
++  "${XWIN_DIR}/sdk/include/ucrt"
++  "${XWIN_DIR}/sdk/include/um"
++  "${XWIN_DIR}/sdk/include/shared"
++  "${XWIN_DIR}/sdk/include/winrt")
++# The SDK/CRT headers must come AFTER clang's resource headers (what clang-cl's
++# /imsvc does), otherwise the CRT's stddef.h (non-constant offsetof) and
++# mmintrin.h (union __m64) shadow clang's. -I/-isystem search before the
++# resource dir; -internal-isystem appends after it.
++set(XWIN_CPU_FLAGS "-march=x86-64-v3" CACHE STRING "Target CPU flags")
++set(_cflags "${XWIN_CPU_FLAGS}")
++foreach(_d IN LISTS _inc)
++  string(APPEND _cflags " -Xclang -internal-isystem -Xclang \"${_d}\"")
++endforeach()
++# *_FLAGS_INIT is replaced by a user -DCMAKE_<LANG>_FLAGS; fail loudly then.
++foreach(_lang C CXX)
++  if(DEFINED CACHE{CMAKE_${_lang}_FLAGS} AND NOT "$CACHE{CMAKE_${_lang}_FLAGS}" MATCHES "internal-isystem")
++    message(FATAL_ERROR "Do not set CMAKE_${_lang}_FLAGS with this toolchain (it drops the Windows SDK headers); use XWIN_CPU_FLAGS")
++  endif()
++endforeach()
++set(CMAKE_C_FLAGS_INIT   "${_cflags}")
++set(CMAKE_CXX_FLAGS_INIT "${_cflags}")
++set(CMAKE_RC_STANDARD_INCLUDE_DIRECTORIES ${_inc})
++
++set(_lflags "-fuse-ld=lld")
++foreach(_d crt/lib/x86_64 sdk/lib/um/x86_64 sdk/lib/ucrt/x86_64)
++  string(APPEND _lflags " -L\"${XWIN_DIR}/${_d}\"")
++endforeach()
++set(CMAKE_EXE_LINKER_FLAGS_INIT    "${_lflags}")
++set(CMAKE_SHARED_LINKER_FLAGS_INIT "${_lflags}")
++set(CMAKE_MODULE_LINKER_FLAGS_INIT "${_lflags}")
++
++# Static MSVC runtime: the exe needs no VC++ redistributable on the target.
++set(CMAKE_MSVC_RUNTIME_LIBRARY "MultiThreaded$<$<CONFIG:Debug>:Debug>" CACHE STRING "")
++
++# Find libraries/headers only in the target environment, programs on the host.
++set(CMAKE_FIND_ROOT_PATH "${XWIN_DIR}")
++set(CMAKE_FIND_ROOT_PATH_MODE_PROGRAM NEVER)
++set(CMAKE_FIND_ROOT_PATH_MODE_LIBRARY ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_INCLUDE ONLY)
++set(CMAKE_FIND_ROOT_PATH_MODE_PACKAGE BOTH)
++
++# xwin ships release CRT libs only (no libcmtd.lib); probe with a release config.
++set(CMAKE_TRY_COMPILE_CONFIGURATION RelWithDebInfo)
+diff --git a/src/core/platform_win.h b/src/core/platform_win.h
+index 44be14e..22da1c0 100644
+--- a/src/core/platform_win.h
++++ b/src/core/platform_win.h
+@@ -21,8 +21,8 @@
+ #include <windows.h>
+ #include <windowsx.h>
+ 
+-#include <ObjBase.h>
+-#include <SDKDDKVer.h>
++#include <objbase.h>
++#include <sdkddkver.h>
+ #include <bcrypt.h>
+ #include <dwmapi.h>
+ #include <shellapi.h>
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index 813abab..fe095af 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -9,9 +9,11 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#if defined(__linux__)
+ #include <execinfo.h>
+ #include <sys/mman.h>
+ #include <unistd.h>
++#endif
+ 
+ #include <algorithm>
+ #include <cstdio>
+@@ -496,6 +498,7 @@ bool MMIOHandler::TryDecodeLoadStore(const uint8_t* p, DecodedLoadStore& decoded
+ 
+ // Diagnostic read watch (see ReadWatchArm in mmio_handler.h). Guest views of a physical range are
+ // made inaccessible; the first guest access logs the host PC and call chain, then restores access.
++#if defined(__linux__)
+ namespace {
+ struct ReadWatch {
+   uint8_t* views[3];
+@@ -555,6 +558,16 @@ static bool ReadWatchOnFault(arch::Exception* ex) {
+   }
+   return false;
+ }
++#else
++void ReadWatchArm(uint8_t*, uint32_t, uint32_t) {
++  static std::once_flag logged;
++  std::call_once(logged, [] {
++    REXLOG_WARN("[readwatch] diagnostic is unsupported on this platform");
++  });
++}
++
++static bool ReadWatchOnFault(arch::Exception*) { return false; }
++#endif
+ 
+ bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
+   return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
+diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
+index 0ed53f2..bae5da5 100644
+--- a/src/ui/CMakeLists.txt
++++ b/src/ui/CMakeLists.txt
+@@ -132,9 +132,12 @@ endif()
+ 
+ # Platform-specific dependencies
+ if(WIN32)
++    # Lowercase names: the Windows linker ignores case, a Linux cross build (xwin) does not.
++    # dxgi: the Win32 presenter uses CreateDXGIFactory1 for vblank even without D3D12.
+     target_link_libraries(rexui PUBLIC
+         dwmapi
+-        Shcore
++        shcore
++        dxgi
+     )
+ else()
+     find_package(PkgConfig REQUIRED)
+-- 
+2.43.0
+

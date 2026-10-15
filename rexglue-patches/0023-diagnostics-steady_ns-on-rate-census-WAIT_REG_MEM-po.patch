@@ -1,0 +1,291 @@
+From 2b6f64160e1071b71a8541d7b9cad213ae99c2f1 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 15:19:05 -0700
+Subject: [PATCH 23/97] diagnostics: steady_ns on [rate-census]; WAIT_REG_MEM
+ poll-iteration census
+
+[rate-census] lines carry steady_ns (steady_clock) so profiler samples can be
+mapped to census seconds without the verbose-only frame-time lines.
+WAIT_REG_MEM census (from the cycle-202 Director scouting session): per wait,
+poll iterations and sleep payload are accumulated locally and recorded once
+when the wait matches (no per-iteration census work); per-second stats of
+iterations, payload and duration per poll target. Census-gated; no change
+when WWE13_RATE_CENSUS is unset.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/rate_census.h |   7 +-
+ src/core/rate_census.cpp              | 105 ++++++++++++++++++++------
+ src/graphics/command_processor.cpp    |  33 +++++---
+ 3 files changed, 110 insertions(+), 35 deletions(-)
+
+diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
+index ffde2f5..250f2eb 100644
+--- a/include/rex/diagnostics/rate_census.h
++++ b/include/rex/diagnostics/rate_census.h
+@@ -71,8 +71,11 @@ uint64_t NowNs();
+ void CpPhaseEnter(CpPhase phase, uint64_t now_ns);
+ void CpPhaseExit(uint64_t now_ns);
+ // Records one unsatisfied WAIT_REG_MEM: poll target (register index, or
+-// physical address with is_memory), and the total time it blocked.
+-void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns);
++// physical address with is_memory), total time it blocked, the per-iteration
++// sleep payload in milliseconds, and the number and sum of poll iterations.
++void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns,
++                      uint64_t payload_ms, uint64_t iterations,
++                      uint64_t payload_ms_sum);
+ // Global critical region contention (called by global_critical_region when the
+ // census is on): owner is the host tid holding the lock (0 if unknown).
+ // OnGlobalLockContended may send SIGPROF to the owner (WWE13_LOCK_OWNER_SAMPLE=1,
+diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
+index 3caab3e..9563ff0 100644
+--- a/src/core/rate_census.cpp
++++ b/src/core/rate_census.cpp
+@@ -63,6 +63,12 @@ struct WaitTarget {
+   uint32_t key = 0;  // Poll address; bit 31 set for memory polls.
+   uint64_t ns = 0;
+   uint64_t count = 0;
++  uint64_t iter_total = 0;
++  uint64_t payload_ms_total = 0;      // Per-wait payload operand, summed.
++  uint64_t payload_ms_sum_total = 0;  // Payload * iterations, summed.
++  uint64_t payload_ms_max = 0;
++  uint64_t payload_ms_sum_max = 0;
++  uint64_t duration_ns_max = 0;
+ };
+ 
+ struct Counters {
+@@ -460,23 +466,31 @@ class RateCensus {
+     cp_phase_start_ns_ = now_ns;
+   }
+ 
+-  void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns) {
++  void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns,
++                        uint64_t payload_ms, uint64_t iterations,
++                        uint64_t payload_ms_sum) {
+     if (!enabled_.load(std::memory_order_relaxed)) {
+       return;
+     }
+     counters_.cp_wait_reg_mem_count.fetch_add(1, std::memory_order_relaxed);
+     const uint32_t key = (poll_addr & 0x7FFFFFFFu) | (is_memory ? 0x80000000u : 0u);
+     std::lock_guard<std::mutex> lock(wait_targets_mutex_);
+-    for (WaitTarget& target : wait_targets_) {
+-      if (target.key == key) {
+-        target.ns += wait_ns;
+-        ++target.count;
++    auto target_it = wait_targets_.find(key);
++    if (target_it == wait_targets_.end()) {
++      if (wait_targets_.size() >= 64) {
+         return;
+       }
++      target_it = wait_targets_.emplace(key, WaitTarget{key}).first;
+     }
+-    if (wait_targets_.size() < 64) {
+-      wait_targets_.push_back({key, wait_ns, 1});
+-    }
++    WaitTarget& target = target_it->second;
++    target.ns += wait_ns;
++    ++target.count;
++    target.iter_total += iterations;
++    target.payload_ms_total += payload_ms;
++    target.payload_ms_sum_total += payload_ms_sum;
++    target.payload_ms_max = std::max(target.payload_ms_max, payload_ms);
++    target.payload_ms_sum_max = std::max(target.payload_ms_sum_max, payload_ms_sum);
++    target.duration_ns_max = std::max(target.duration_ns_max, wait_ns);
+   }
+ 
+   void OnGlobalLockContended(uint32_t owner_tid) {
+@@ -551,22 +565,31 @@ class RateCensus {
+     }
+   }
+ 
+-  std::string TakeWaitTargets(uint64_t elapsed_ms) {
++  std::vector<WaitTarget> TakeWaitTargets() {
+     std::vector<WaitTarget> targets;
+     {
+       std::lock_guard<std::mutex> lock(wait_targets_mutex_);
+-      targets.swap(wait_targets_);
+-    }
+-    if (targets.empty()) {
+-      return "none";
++      targets.reserve(wait_targets_.size());
++      for (const auto& [key, target] : wait_targets_) {
++        (void)key;
++        targets.push_back(target);
++      }
++      wait_targets_.clear();
+     }
+     std::sort(targets.begin(), targets.end(),
+               [](const WaitTarget& a, const WaitTarget& b) { return a.ns > b.ns; });
+-    if (targets.size() > 4) {
+-      targets.resize(4);
++    return targets;
++  }
++
++  std::string FormatWaitTargets(const std::vector<WaitTarget>& targets,
++                                uint64_t elapsed_ms) const {
++    if (targets.empty()) {
++      return "none";
+     }
+     std::string result;
+-    for (const WaitTarget& target : targets) {
++    const size_t target_count = std::min<size_t>(targets.size(), 4);
++    for (size_t i = 0; i < target_count; ++i) {
++      const WaitTarget& target = targets[i];
+       if (!result.empty()) {
+         result += '|';
+       }
+@@ -578,6 +601,37 @@ class RateCensus {
+     return result;
+   }
+ 
++  std::string FormatWaitStats(const std::vector<WaitTarget>& targets) const {
++    if (targets.empty()) {
++      return "addr=none waits=0 iter_total=0 payload_ms_mean=0 payload_ms_max=0 "
++             "payload_ms_sum_mean=0 payload_ms_sum_max=0 dur_ms_mean=0 dur_ms_max=0";
++    }
++
++    std::string result;
++    for (const WaitTarget& target : targets) {
++      if (!result.empty()) {
++        result += '|';
++      }
++      const bool is_memory = (target.key & 0x80000000u) != 0;
++      const uint32_t address = target.key & 0x7FFFFFFFu;
++      const std::string address_text =
++          is_memory ? fmt::format("{:08X}", address) : fmt::format("reg{:X}", address);
++      const double wait_count = static_cast<double>(target.count);
++      result += fmt::format(
++          "addr={} waits={} iter_total={} payload_ms_mean={:.3f} payload_ms_max={} "
++          "payload_ms_sum_mean={:.3f} payload_ms_sum_max={} dur_ms_mean={:.3f} "
++          "dur_ms_max={:.3f}",
++          address_text, target.count, target.iter_total,
++          wait_count != 0.0 ? static_cast<double>(target.payload_ms_total) / wait_count : 0.0,
++          target.payload_ms_max,
++          wait_count != 0.0 ? static_cast<double>(target.payload_ms_sum_total) / wait_count : 0.0,
++          target.payload_ms_sum_max,
++          wait_count != 0.0 ? static_cast<double>(target.ns) / 1'000'000.0 / wait_count : 0.0,
++          static_cast<double>(target.duration_ns_max) / 1'000'000.0);
++    }
++    return result;
++  }
++
+   Snapshot ReadCounters() const {
+     Snapshot snapshot = ReadScalarCounters();
+     for (size_t i = 0; i < kCpPhaseCount; ++i) {
+@@ -669,7 +723,8 @@ class RateCensus {
+                                 1'000'000.0 * 1000.0 / static_cast<double>(elapsed_ms);
+       }
+       sample.cp_wait_reg_mem_count = current.cp_wait_reg_mem_count - last.cp_wait_reg_mem_count;
+-      const std::string wait_targets = TakeWaitTargets(elapsed_ms);
++      const std::vector<WaitTarget> wait_records = TakeWaitTargets();
++      const std::string wait_targets = FormatWaitTargets(wait_records, elapsed_ms);
+       const std::string lock_waits = TakeLockWaits(elapsed_ms);
+       uint64_t intervals[4];
+       for (size_t i = 0; i < 4; ++i) {
+@@ -686,13 +741,14 @@ class RateCensus {
+         latest_sample_ = sample;
+       }
+ 
++      const uint64_t steady_ns = QueryHostNanoseconds();
+       REXLOG_INFO(
+-          "[rate-census] t_ms={} vblank={:.3f} irq0={:.3f} irq1={:.3f} "
++          "[rate-census] steady_ns={} t_ms={} vblank={:.3f} irq0={:.3f} irq1={:.3f} "
+           "vdswap={:.3f} present={:.3f} guest_ticks_per_s={:.3f} "
+           "guest_ms_per_s={:.3f} vblank_interval_ticks={} refresh_hz={:.3f} "
+           "gpu_busy_ms={:.3f} gpu_wait_ms={:.3f} gpu_wait_count={} "
+           "swap_wait_ms={:.3f} vdswap_tid={} vdswap_thread_cpu_pct={:.3f}",
+-          sample.t_ms, sample.vblank, sample.irq0, sample.irq1, sample.vdswap,
++          steady_ns, sample.t_ms, sample.vblank, sample.irq0, sample.irq1, sample.vdswap,
+           sample.present, sample.guest_ticks_per_s, sample.guest_ms_per_s,
+           sample.vblank_interval_ticks, sample.refresh_hz, sample.gpu_busy_ms,
+           sample.gpu_wait_ms, sample.gpu_wait_count, sample.swap_wait_ms,
+@@ -713,6 +769,8 @@ class RateCensus {
+           sample.cp_wait_reg_mem_count, phase_calls[size_t(CpPhase::kDraw)],
+           phase_calls[size_t(CpPhase::kCopy)], phase_calls[size_t(CpPhase::kSwap)],
+           phase_calls[size_t(CpPhase::kSubmit)], wait_targets);
++      REXLOG_INFO("[rate-census-wait] t_ms={} {}", sample.t_ms,
++                  FormatWaitStats(wait_records));
+       REXLOG_INFO("[rate-census-lock] t_ms={} waits={}", sample.t_ms, lock_waits);
+       REXLOG_INFO("[rate-census-swap] t_ms={} present_interval0={} interval1={} interval2={} other={}",
+                   sample.t_ms, intervals[0], intervals[1], intervals[2], intervals[3]);
+@@ -750,7 +808,7 @@ class RateCensus {
+   bool owner_sampling_ = false;
+   std::atomic<uint64_t> last_owner_sample_ns_{0};
+   std::mutex wait_targets_mutex_;
+-  std::vector<WaitTarget> wait_targets_;
++  std::unordered_map<uint32_t, WaitTarget> wait_targets_;
+ };
+ 
+ RateCensus g_rate_census;
+@@ -797,8 +855,11 @@ void RecordGlobalLockWait(uint32_t owner_tid, uint64_t wait_ns) {
+   g_rate_census.RecordGlobalLockWait(owner_tid, wait_ns);
+ }
+ 
+-void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns) {
+-  g_rate_census.RecordWaitRegMem(is_memory, poll_addr, wait_ns);
++void RecordWaitRegMem(bool is_memory, uint32_t poll_addr, uint64_t wait_ns,
++                      uint64_t payload_ms, uint64_t iterations,
++                      uint64_t payload_ms_sum) {
++  g_rate_census.RecordWaitRegMem(is_memory, poll_addr, wait_ns, payload_ms,
++                                 iterations, payload_ms_sum);
+ }
+ 
+ }  // namespace rex::diagnostics::rate_census
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 0b3d722..59d12fc 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1152,16 +1152,24 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+ 
+   bool is_memory = (wait_info & 0x10) != 0;
+ 
+-  // Census: time unsatisfied waits (env-gated, no-op otherwise).
+-  bool census_waiting = false;
+-  uint64_t census_wait_start_ns = 0;
++  // Census: time unsatisfied waits and retain the poll payload locally. The
++  // counters are updated once, when the wait matches, so the polling loop has
++  // no census lock or map access on each iteration.
++  const bool census_enabled = diagnostics::rate_census::IsEnabled();
++  const uint64_t census_wait_start_ns =
++      census_enabled ? diagnostics::rate_census::NowNs() : 0;
++  const uint64_t census_payload_ms = wait / 0x100;
++  uint64_t census_wait_iterations = 0;
++  uint64_t census_payload_ms_sum = 0;
+   auto census_end_wait = [&]() {
+-    if (census_waiting) {
++    if (census_wait_iterations != 0) {
+       const uint64_t now = diagnostics::rate_census::NowNs();
+       diagnostics::rate_census::CpPhaseExit(now);
+       diagnostics::rate_census::RecordWaitRegMem(is_memory, poll_reg_addr,
+-                                                 now - census_wait_start_ns);
+-      census_waiting = false;
++                                                 now - census_wait_start_ns,
++                                                 census_payload_ms,
++                                                 census_wait_iterations,
++                                                 census_payload_ms_sum);
+     }
+   };
+ 
+@@ -1207,11 +1215,14 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade
+         break;
+     }
+     if (!matched) {
+-      if (!census_waiting && diagnostics::rate_census::IsEnabled()) {
+-        census_waiting = true;
+-        census_wait_start_ns = diagnostics::rate_census::NowNs();
+-        diagnostics::rate_census::CpPhaseEnter(diagnostics::rate_census::CpPhase::kWaitRegMem,
+-                                               census_wait_start_ns);
++      if (census_enabled) {
++        if (census_wait_iterations == 0) {
++          const uint64_t now = diagnostics::rate_census::NowNs();
++          diagnostics::rate_census::CpPhaseEnter(
++              diagnostics::rate_census::CpPhase::kWaitRegMem, now);
++        }
++        ++census_wait_iterations;
++        census_payload_ms_sum += census_payload_ms;
+       }
+       // Wait.
+       if (wait >= 0x100) {
+-- 
+2.43.0
+

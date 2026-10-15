@@ -1,0 +1,98 @@
+From da17fb6db3987ac73b4a47492cc6befea34feb8f Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 19:09:28 -0700
+Subject: [PATCH 40/97] replay: replay_trace_repeat - replay one captured frame
+ N times and time it
+
+TracePlayer::ReplayCurrentFrame replays the whole current frame without
+clearing caches. With --replay_trace_repeat=N the replay mode logs
+"Replay repeat: N frames in X ms, Y ms per frame" - a repeatable
+GPU-emulation benchmark from F9 captures (owner laptop capture of CM Punk's
+entrance: 26.1 ms/frame on the Linux box). Caveat: replay re-marks all trace
+memory as written each frame and decompresses the trace (~50% of samples),
+so shared-memory upload cost is inflated versus live play.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/trace_player.h |  2 ++
+ src/graphics/trace_player.cpp       |  7 +++++++
+ src/ui/rex_app.cpp                  | 18 ++++++++++++++++++
+ 3 files changed, 27 insertions(+)
+
+diff --git a/include/rex/graphics/trace_player.h b/include/rex/graphics/trace_player.h
+index 7fe8c35..6508853 100644
+--- a/include/rex/graphics/trace_player.h
++++ b/include/rex/graphics/trace_player.h
+@@ -42,6 +42,8 @@ class TracePlayer : public TraceReader {
+ 
+   void SeekFrame(int target_frame);
+   void SeekCommand(int target_command);
++  // Plays the whole current frame again without clearing caches (benchmark loops).
++  void ReplayCurrentFrame();
+ 
+   void WaitOnPlayback();
+ 
+diff --git a/src/graphics/trace_player.cpp b/src/graphics/trace_player.cpp
+index b487aff..2517601 100644
+--- a/src/graphics/trace_player.cpp
++++ b/src/graphics/trace_player.cpp
+@@ -78,6 +78,13 @@ void TracePlayer::SeekCommand(int target_command) {
+   }
+ }
+ 
++void TracePlayer::ReplayCurrentFrame() {
++  auto frame = current_frame();
++  current_command_index_ = int(frame->commands.size()) - 1;
++  PlayTrace(frame->start_ptr, frame->end_ptr - frame->start_ptr, TracePlaybackMode::kBreakOnSwap,
++            false);
++}
++
+ void TracePlayer::WaitOnPlayback() {
+   rex::thread::Wait(playback_event_.get(), true);
+ }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 68c99ca..f99e258 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -11,6 +11,8 @@
+ 
+ #include <rex/rex_app.h>
+ 
++#include <chrono>
++
+ #include <rex/cvar.h>
+ #include <rex/ui/flags.h>
+ #include <rex/kernel/crt/heap.h>
+@@ -47,6 +49,9 @@ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
+ REXCVAR_DEFINE_STRING(replay_trace, "", "GPU",
+                       "Replay this single-frame GPU trace (.xtr) instead of launching the "
+                       "title, write the presented frame to replay_trace_out, then exit");
++REXCVAR_DEFINE_INT32(replay_trace_repeat, 1, "GPU",
++                     "replay_trace: play the frame this many times (after the captured one) and "
++                     "log the average host time per frame - a repeatable GPU-emulation benchmark");
+ REXCVAR_DEFINE_STRING(replay_trace_out, "", "GPU",
+                       "Output image (.ppm) for replay_trace; default: trace path + .ppm");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+@@ -278,6 +283,19 @@ bool ReXApp::OnInitialize() {
+           player->SeekFrame(0);
+           player->SeekCommand(static_cast<int>(player->current_frame()->commands.size() - 1));
+           player->WaitOnPlayback();
++          const int32_t repeat = REXCVAR_GET(replay_trace_repeat);
++          if (repeat > 1) {
++            const auto start = std::chrono::steady_clock::now();
++            for (int32_t i = 1; i < repeat; ++i) {
++              player->ReplayCurrentFrame();
++              player->WaitOnPlayback();
++            }
++            const double total_ms = std::chrono::duration<double, std::milli>(
++                                        std::chrono::steady_clock::now() - start)
++                                        .count();
++            REXLOG_INFO("Replay repeat: {} frames in {:.1f} ms, {:.3f} ms per frame", repeat - 1,
++                        total_ms, total_ms / (repeat - 1));
++          }
+           ui::RawImage image;
+           if (replay_graphics->presenter()->CaptureGuestOutput(image)) {
+             if (FILE* f = std::fopen(out_path.string().c_str(), "wb")) {
+-- 
+2.43.0
+

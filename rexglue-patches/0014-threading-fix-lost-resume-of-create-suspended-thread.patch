@@ -1,0 +1,289 @@
+From ec5274c7519228e0f7ded90568eab2c9b0514bf2 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 23 Sep 2026 09:31:36 -0700
+Subject: [PATCH 14/97] threading: fix lost resume of create-suspended threads
+
+ThreadStartRoutine published kSuspended (waking WaitStarted) before
+setting suspend_count_=1 in a second critical section. A Resume() in
+between saw count 0 and returned false, so the thread waited forever:
+the WWE13 intermittent boot hang (Wwise AK::IOThread never started) and
+load-time freezes (extra never-started guest threads). Set count and
+state in one critical section, wait in the same scope, and drain the
+suspend semaphore token Resume() posts for the start path.
+
+Unit test [thread_start]: 5,000 immediate resumes + yield variant; a
+test-only delay hook (REXGLUE_BUILD_TESTS) makes the old shape fail
+deterministically. Gate: 3 simultaneous boots, 3x1500 s, no hang/freeze.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/CMakeLists.txt            |   4 +
+ src/core/threading_posix.cpp       |  52 ++++++++--
+ tests/unit/CMakeLists.txt          |   1 +
+ tests/unit/core/threading_test.cpp | 148 +++++++++++++++++++++++++++++
+ 4 files changed, 198 insertions(+), 7 deletions(-)
+ create mode 100644 tests/unit/core/threading_test.cpp
+
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index c822ff4..0d6ed35 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -88,6 +88,10 @@ target_link_libraries(rexcore
+         utf8cpp
+ )
+ 
++if(REXGLUE_BUILD_TESTS)
++    target_compile_definitions(rexcore PRIVATE REXGLUE_BUILD_TESTS)
++endif()
++
+ if(REXGLUE_ENABLE_TRACY)
+     target_link_libraries(rexcore PUBLIC TracyClient)
+     target_compile_definitions(rexcore PUBLIC
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index e10e30b..5ad3b57 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -18,6 +18,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <cerrno>
+ #include <cstddef>
+ #include <ctime>
++#include <cstdlib>
+ #include <deque>
+ #include <limits>
+ #include <memory>
+@@ -953,6 +954,22 @@ PosixWaitHandle::~PosixWaitHandle() = default;
+ 
+ thread_local PosixCondition<Thread>* current_thread_condition_ = nullptr;
+ 
++#if defined(REXGLUE_BUILD_TESTS)
++void MaybeDelayThreadStartForTest() {
++  const char* delay = std::getenv("REXGLUE_TEST_THREAD_START_DELAY_US");
++  if (!delay) {
++    return;
++  }
++
++  char* end = nullptr;
++  const auto delay_us = std::strtoul(delay, &end, 10);
++  if (end == delay || *end != '\0') {
++    return;
++  }
++  std::this_thread::sleep_for(std::chrono::microseconds(delay_us));
++}
++#endif
++
+ bool DispatchCurrentThreadUserCallback() {
+   if (!current_thread_condition_) {
+     Thread::GetCurrentThread();
+@@ -1311,15 +1328,36 @@ void* PosixCondition<Thread>::ThreadStartRoutine(void* parameter) {
+   current_thread_condition_ = &thread->handle_;
+   {
+     std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+-    thread->handle_.state_ = create_suspended ? State::kSuspended : State::kRunning;
++    if (create_suspended) {
++      thread->handle_.suspend_count_ = 1;
++      thread->handle_.state_ = State::kSuspended;
++    } else {
++      thread->handle_.state_ = State::kRunning;
++    }
+     thread->handle_.state_signal_.notify_all();
+-  }
+ 
+-  if (create_suspended) {
+-    std::unique_lock<std::mutex> lock(thread->handle_.state_mutex_);
+-    thread->handle_.suspend_count_ = 1;
+-    thread->handle_.state_signal_.wait(lock,
+-                                       [thread] { return thread->handle_.suspend_count_ == 0; });
++#if defined(REXGLUE_BUILD_TESTS)
++    if (create_suspended) {
++      MaybeDelayThreadStartForTest();
++    }
++#endif
++    if (create_suspended) {
++      thread->handle_.state_signal_.wait(lock,
++                                         [thread] { return thread->handle_.suspend_count_ == 0; });
++
++      // Resume() uses this semaphore for the signal-handler suspend path. A
++      // resume of the synthetic create-suspended count wakes the condition
++      // variable above, but must not leave a token for a later signal wait.
++      int result;
++      do {
++        result = sem_trywait(&thread->handle_.suspend_sem_);
++      } while (result == -1 && errno == EINTR);
++      while (result == 0) {
++        do {
++          result = sem_trywait(&thread->handle_.suspend_sem_);
++        } while (result == -1 && errno == EINTR);
++      }
++    }
+   }
+ 
+   start_routine();
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 1ec8d08..7301944 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -12,6 +12,7 @@ add_executable(unit_tests
+     core/byte_order_test.cpp
+     core/chrono_test.cpp
+     core/content_probe_test.cpp
++    core/threading_test.cpp
+     codegen/config_test.cpp
+     codegen/template_registry_test.cpp
+     codegen/jump_table_bias_test.cpp
+diff --git a/tests/unit/core/threading_test.cpp b/tests/unit/core/threading_test.cpp
+new file mode 100644
+index 0000000..72c4c5a
+--- /dev/null
++++ b/tests/unit/core/threading_test.cpp
+@@ -0,0 +1,148 @@
++/**
++ * @file        tests/unit/core/threading_test.cpp
++ * @brief       Unit tests for create-suspended and signal-path thread control.
++ */
++
++#include <atomic>
++#include <chrono>
++#include <cstdint>
++#include <functional>
++#include <thread>
++
++#include <rex/platform.h>
++
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++#include <cstdlib>
++#endif
++
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/thread.h>
++
++namespace {
++
++using namespace std::chrono_literals;
++using rex::thread::Thread;
++using rex::thread::Wait;
++using rex::thread::WaitResult;
++
++constexpr size_t kCreateResumeIterations = 5000;
++constexpr auto kThreadWaitTimeout = 100ms;
++
++void SetStartWindowHook() {
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++  REQUIRE(setenv("REXGLUE_TEST_THREAD_START_DELAY_US", "1000", 1) == 0);
++#endif
++}
++
++void ClearStartWindowHook() {
++#if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
++  REQUIRE(unsetenv("REXGLUE_TEST_THREAD_START_DELAY_US") == 0);
++#endif
++}
++
++bool WaitFor(const std::function<bool()>& predicate) {
++  const auto deadline = std::chrono::steady_clock::now() + kThreadWaitTimeout;
++  while (!predicate()) {
++    if (std::chrono::steady_clock::now() >= deadline) {
++      return false;
++    }
++    std::this_thread::yield();
++  }
++  return true;
++}
++
++void RunCreateSuspendedResumeLoop(bool yield_before_resume) {
++  SetStartWindowHook();
++
++  std::atomic<uint32_t> ran{0};
++  bool all_threads_completed = true;
++  for (size_t i = 0; i < kCreateResumeIterations; ++i) {
++    auto thread = Thread::Create(
++        Thread::CreationParameters{.create_suspended = true}, [&ran] {
++          ran.fetch_add(1, std::memory_order_release);
++        });
++    REQUIRE(thread != nullptr);
++
++    if (yield_before_resume) {
++      rex::thread::MaybeYield();
++    }
++
++    const bool resumed = thread->Resume();
++    const auto wait_result = Wait(thread.get(), false, kThreadWaitTimeout);
++    if (!resumed) {
++      all_threads_completed = false;
++      CHECK(resumed);
++      const bool recovered = WaitFor([&] { return thread->Resume(); });
++      CHECK(recovered);
++      if (recovered) {
++        CHECK(Wait(thread.get(), false, kThreadWaitTimeout) == WaitResult::kSuccess);
++      }
++      break;
++    }
++
++    if (wait_result != WaitResult::kSuccess) {
++      all_threads_completed = false;
++      CHECK(wait_result == WaitResult::kSuccess);
++      const bool recovered = WaitFor([&] { return thread->Resume(); });
++      CHECK(recovered);
++      if (recovered) {
++        CHECK(Wait(thread.get(), false, kThreadWaitTimeout) == WaitResult::kSuccess);
++      }
++      break;
++    }
++    if (ran.load(std::memory_order_acquire) != i + 1) {
++      all_threads_completed = false;
++      CHECK(ran.load(std::memory_order_acquire) == i + 1);
++      break;
++    }
++  }
++
++  CHECK(all_threads_completed);
++  CHECK(ran.load(std::memory_order_acquire) == kCreateResumeIterations);
++  ClearStartWindowHook();
++}
++
++}  // namespace
++
++TEST_CASE("create-suspended thread resumes immediately", "[threading][thread_start]") {
++  RunCreateSuspendedResumeLoop(false);
++}
++
++TEST_CASE("create-suspended thread resumes after a yield", "[threading][thread_start]") {
++  RunCreateSuspendedResumeLoop(true);
++}
++
++TEST_CASE("suspend after create-suspended start uses the semaphore path", "[threading]") {
++  std::atomic<bool> stop{false};
++  std::atomic<bool> entered{false};
++  std::atomic<uint32_t> ticks{0};
++
++  auto thread = Thread::Create(
++      Thread::CreationParameters{.create_suspended = true}, [&] {
++        entered.store(true, std::memory_order_release);
++        while (!stop.load(std::memory_order_acquire)) {
++          ticks.fetch_add(1, std::memory_order_relaxed);
++          rex::thread::MaybeYield();
++        }
++      });
++  REQUIRE(thread != nullptr);
++
++  // Let the create-suspended start wait establish its count before releasing
++  // it. This also makes the old semaphore-token defect deterministic.
++  std::this_thread::sleep_for(5ms);
++  REQUIRE(thread->Resume());
++  REQUIRE(WaitFor([&] { return entered.load(std::memory_order_acquire); }));
++
++  REQUIRE(thread->Suspend());
++  std::this_thread::sleep_for(10ms);
++  const auto paused_ticks = ticks.load(std::memory_order_relaxed);
++  std::this_thread::sleep_for(10ms);
++  CHECK(ticks.load(std::memory_order_relaxed) == paused_ticks);
++
++  REQUIRE(thread->Resume());
++  CHECK(WaitFor([&] { return ticks.load(std::memory_order_relaxed) > paused_ticks; }));
++
++  stop.store(true, std::memory_order_release);
++  REQUIRE(Wait(thread.get(), false, kThreadWaitTimeout) == WaitResult::kSuccess);
++}
+-- 
+2.43.0
+

@@ -1,0 +1,10 @@
+game/
+generated/
+out/
+logs/
+*.xex
+*.xexp
+*.iso
+*.log
+CMakeUserPresets.json
+compile_commands.json

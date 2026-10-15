@@ -1,0 +1,72 @@
+From d2e362ff70790cd00281a04d119e41ff1faeb552 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 08:00:06 -0700
+Subject: [PATCH 17/97] graphics: schedule guest vblank on an absolute deadline
+ (59/s -> 60/s)
+
+The vsync worker reset its baseline to the late 1 ms poll time, so every
+interval overshot and the guest saw ~59 vblanks/s. Schedule against
+next_deadline += interval, resync after a >=3 interval stall instead of
+bursting, and sleep until the deadline. WWE '13 single session: vblank
+59 -> 60.0/s, swaps median 58 -> 60/s, game speed 0.951 -> 0.971.
+3-arm stability gate 485/899/955 s, 0 faults. Reviewer ACCEPT.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/graphics_system.cpp | 36 ++++++++++++++++++++++++++------
+ 1 file changed, 30 insertions(+), 6 deletions(-)
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index c842957..87c49c7 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -143,16 +143,40 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+         uint64_t vsync_interval_ticks =
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+         uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+-        uint64_t last_frame_time = chrono::Clock::QueryGuestTickCount();
++        bool vsync_enabled = REXCVAR_GET(vsync);
++        uint64_t interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
++        uint64_t next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
++        // Avoid replaying missed vblanks after a long stall or suspend.
++        constexpr uint64_t kResyncAfterIntervals = 3;
+         while (vsync_worker_running_) {
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+-          uint64_t interval_ticks =
+-              REXCVAR_GET(vsync) ? vsync_interval_ticks : no_vsync_interval_ticks;
+-          if (current_time - last_frame_time >= interval_ticks) {
++          const bool current_vsync_enabled = REXCVAR_GET(vsync);
++          if (current_vsync_enabled != vsync_enabled) {
++            vsync_enabled = current_vsync_enabled;
++            interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
++            next_deadline = current_time + interval_ticks;
++          } else if (current_time >= next_deadline) {
+             MarkVblank();
+-            last_frame_time = current_time;
++            const uint64_t late_ticks = current_time - next_deadline;
++            if (late_ticks / interval_ticks >= kResyncAfterIntervals) {
++              next_deadline = current_time + interval_ticks;
++            } else {
++              next_deadline += interval_ticks;
++            }
++          }
++
++          if (current_time < next_deadline) {
++            const uint64_t guest_ticks_per_second = std::max(uint64_t(1), guest_tick_frequency);
++            const uint64_t remaining_ticks = next_deadline - current_time;
++            const uint64_t sleep_microseconds =
++                (remaining_ticks / guest_ticks_per_second) * 1000000 +
++                ((remaining_ticks % guest_ticks_per_second) * 1000000) /
++                    guest_ticks_per_second;
++            rex::thread::Sleep(
++                std::chrono::microseconds(std::max(uint64_t(1), sleep_microseconds)));
++          } else {
++            rex::thread::Sleep(std::chrono::microseconds(1));
+           }
+-          rex::thread::Sleep(std::chrono::milliseconds(1));
+         }
+         return 0;
+       }));
+-- 
+2.43.0
+

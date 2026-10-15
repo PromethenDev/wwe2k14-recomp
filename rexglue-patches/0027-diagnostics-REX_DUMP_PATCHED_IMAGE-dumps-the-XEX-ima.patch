@@ -1,0 +1,49 @@
+From 151f8ec90d1130e4b8bfe59c4eaa496dc96f306b Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 22:23:27 -0700
+Subject: [PATCH 27/97] diagnostics: REX_DUMP_PATCHED_IMAGE dumps the XEX image
+ after a title-update patch
+
+Used to compare the WWE '13 title update image with the base image offline
+(function-level address map for porting manifest entries). No effect unless
+the environment variable is set and an .xexp patch is applied.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/user_module.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/system/user_module.cpp b/src/system/user_module.cpp
+index 189a59a..55c6f7d 100644
+--- a/src/system/user_module.cpp
++++ b/src/system/user_module.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdio>
++#include <cstdlib>
+ #include <vector>
+ 
+ #include <rex/cvar.h>
+@@ -119,6 +121,17 @@ X_STATUS UserModule::LoadFromFile(const std::string_view path) {
+         result = patch_module->xex_module()->ApplyPatch(xex_module());
+         if (result) {
+           REXSYS_ERROR("Failed to apply XEX patch, code: {}", result);
++        } else if (const char* dump_path = std::getenv("REX_DUMP_PATCHED_IMAGE")) {
++          // Diagnostic: write the patched image (base address .. image size) for offline
++          // comparison with the unpatched image (title-update porting).
++          auto* xex = xex_module();
++          const uint8_t* image = memory()->TranslateVirtual(xex->base_address());
++          if (FILE* dump = std::fopen(dump_path, "wb")) {
++            std::fwrite(image, 1, xex->image_size(), dump);
++            std::fclose(dump);
++            REXSYS_INFO("Dumped patched XEX image ({} bytes at {:08X}) to {}", xex->image_size(),
++                        xex->base_address(), dump_path);
++          }
+         }
+       } else {
+         REXSYS_ERROR("Failed to load XEX patch, code: {}", result);
+-- 
+2.43.0
+

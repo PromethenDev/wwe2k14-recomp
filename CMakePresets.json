@@ -1,0 +1,35 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "configurePresets": [
+    {
+      "name": "linux-amd64-relwithdebinfo",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/out/build/linux-amd64-relwithdebinfo",
+      "cacheVariables": {
+        "CMAKE_C_COMPILER": "clang",
+        "CMAKE_CXX_COMPILER": "clang++",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/out/install/linux-amd64",
+        "CMAKE_CXX_STANDARD": "23"
+      },
+      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+    },
+    {
+      "name": "win-amd64-cross",
+      "generator": "Ninja Multi-Config",
+      "binaryDir": "${sourceDir}/out/build/win-amd64-cross",
+      "cacheVariables": {
+        "CMAKE_CONFIGURATION_TYPES": "RelWithDebInfo",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../tools/rexglue/cmake/toolchains/win-amd64-xwin.cmake",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/out/install/win-amd64-cross",
+        "CMAKE_WIN32_EXECUTABLE": "ON",
+        "CMAKE_CXX_STANDARD": "23"
+      }
+    }
+  ],
+  "buildPresets": [
+    { "name": "linux-amd64-relwithdebinfo", "configurePreset": "linux-amd64-relwithdebinfo", "configuration": "RelWithDebInfo" },
+    { "name": "win-amd64-cross", "configurePreset": "win-amd64-cross", "configuration": "RelWithDebInfo" }
+  ],
+  "testPresets": []
+}

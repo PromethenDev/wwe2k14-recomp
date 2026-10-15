@@ -1,0 +1,127 @@
+From 063a1cce30be13b8f02bfdc4aa0265c5cc153e9a Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 23:23:54 -0700
+Subject: [PATCH 84/97] XAM saves: non-throwing exists() in the content
+ manager; log a failed content header write
+
+Review v2-sdk.md (bug hunt 2026-10-02): std::filesystem::exists(path) throws on permission-denied status lookups,
+so the previous fix could still terminate before reaching its non-throwing create/open checks. XamContentCreate now
+logs when the header write fails (the package itself was created and stays open, so the result stays success).
+---
+ src/kernel/xam/xam_content.cpp     |  7 ++++++-
+ src/system/xam/content_manager.cpp | 25 +++++++++++++++++--------
+ 2 files changed, 23 insertions(+), 9 deletions(-)
+
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 4289c96..47378e4 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -224,7 +224,12 @@ ppc_u32_result_t xeXamContentCreate(const char* api_name, ppc_u32_t user_index,
+     if (disposition == kDispositionState::Create) {
+       result = content_manager->CreateContent(root_name, xuid, content_data);
+       if (XSUCCEEDED(result)) {
+-        content_manager->WriteContentHeaderFile(xuid, content_data);
++        // The package itself exists and is open, so keep reporting success; a missing header only hides the
++        // content from enumeration until it is written again. Log it instead of failing silently.
++        const X_RESULT header_result = content_manager->WriteContentHeaderFile(xuid, content_data);
++        if (XFAILED(header_result)) {
++          REXKRNL_WARN("XamContentCreate: content header could not be written ({:08X})", header_result);
++        }
+       }
+     } else if (disposition == kDispositionState::Open) {
+       result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index ea5b9bf..50c7d6b 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -24,6 +24,15 @@
+ #include <rex/system/xfile.h>
+ #include <rex/system/xobject.h>
+ 
++namespace {
++// Non-throwing exists(): an unreadable or permission-denied save path counts as absent instead of terminating
++// the game with std::filesystem::filesystem_error (release bug hunt 2026-10-02, review v2-sdk.md).
++bool PathExists(const std::filesystem::path& path) {
++  std::error_code ec;
++  return std::filesystem::exists(path, ec);
++}
++}  // namespace
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+@@ -58,7 +67,7 @@ ContentPackage::~ContentPackage() {
+ }
+ 
+ void ContentPackage::LoadPackageLicenseMask(const std::filesystem::path header_path) {
+-  if (!std::filesystem::exists(header_path)) {
++  if (!PathExists(header_path)) {
+     return;
+   }
+ 
+@@ -174,7 +183,7 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
+     const std::string_view root_name, uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+   auto package_path = ResolvePackagePath(xuid, data);
+-  if (!std::filesystem::exists(package_path)) {
++  if (!PathExists(package_path)) {
+     return nullptr;
+   }
+   auto package = std::make_unique<ContentPackage>(kernel_state_, root_name, data, package_path);
+@@ -183,7 +192,7 @@ std::unique_ptr<ContentPackage> ContentManager::ResolvePackage(
+ 
+ bool ContentManager::ContentExists(uint64_t xuid, const XCONTENT_AGGREGATE_DATA& data) {
+   auto path = ResolvePackagePath(xuid, data);
+-  return std::filesystem::exists(path);
++  return PathExists(path);
+ }
+ 
+ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGATE_DATA data) {
+@@ -199,7 +208,7 @@ X_RESULT ContentManager::WriteContentHeaderFile(uint64_t xuid, XCONTENT_AGGREGAT
+       ResolvePackageHeaderPath(data.file_name(), used_xuid, data.title_id, data.content_type);
+   auto parent_path = header_path.parent_path();
+ 
+-  if (!std::filesystem::exists(parent_path)) {
++  if (!PathExists(parent_path)) {
+     std::error_code ec;  // Non-throwing: a read-only save folder fails the call instead of terminating.
+     if (!std::filesystem::create_directories(parent_path, ec)) {
+       return X_ERROR_ACCESS_DENIED;
+@@ -223,7 +232,7 @@ X_RESULT ContentManager::ReadContentHeaderFile(const std::string_view file_name,
+   auto header_file_path = ResolvePackageHeaderPath(file_name, xuid, title_id, content_type);
+   constexpr uint32_t header_size = sizeof(XCONTENT_AGGREGATE_DATA);
+ 
+-  if (!std::filesystem::exists(header_file_path)) {
++  if (!PathExists(header_file_path)) {
+     return X_ERROR_FILE_NOT_FOUND;
+   }
+ 
+@@ -260,7 +269,7 @@ X_RESULT ContentManager::CreateContent(const std::string_view root_name, uint64_
+   }
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
+-  if (std::filesystem::exists(package_path)) {
++  if (PathExists(package_path)) {
+     return X_ERROR_ALREADY_EXISTS;
+   }
+   std::error_code create_error;  // Non-throwing: see WriteContentHeaderFile.
+@@ -291,7 +300,7 @@ X_RESULT ContentManager::OpenContent(const std::string_view root_name, uint64_t
+   }
+ 
+   auto package_path = ResolvePackagePath(xuid, data);
+-  if (!std::filesystem::exists(package_path)) {
++  if (!PathExists(package_path)) {
+     return X_ERROR_FILE_NOT_FOUND;
+   }
+   auto package = ResolvePackage(root_name, xuid, data);
+@@ -332,7 +341,7 @@ X_RESULT ContentManager::GetContentThumbnail(uint64_t xuid, const XCONTENT_AGGRE
+   auto global_lock = global_critical_region_.Acquire();
+   auto package_path = ResolvePackagePath(xuid, data);
+   auto thumb_path = package_path / kThumbnailFileName;
+-  if (std::filesystem::exists(thumb_path)) {
++  if (PathExists(thumb_path)) {
+     auto file = rex::filesystem::OpenFile(thumb_path, "rb");
+     if (!file) {
+       return X_ERROR_FILE_NOT_FOUND;
+-- 
+2.43.0
+

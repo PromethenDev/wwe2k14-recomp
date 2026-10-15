@@ -1,0 +1,91 @@
+From c9a83cd4000afacd4ddf4d52026049f2363cb887 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 10:20:34 -0700
+Subject: [PATCH 90/97] wwe2k14: opt-in --ppc_db16cyc_pause (default off) maps
+ Xenon db16cyc to x86 PAUSE; unmeasured prototype
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ppc/context.h       | 17 +++++++++++++++++
+ src/codegen/builders/system.cpp |  6 ++++--
+ src/core/CMakeLists.txt         |  1 +
+ src/core/ppc.cpp                |  5 +++++
+ 4 files changed, 27 insertions(+), 2 deletions(-)
+ create mode 100644 src/core/ppc.cpp
+
+diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
+index 0f324ad..1507963 100644
+--- a/include/rex/ppc/context.h
++++ b/include/rex/ppc/context.h
+@@ -23,11 +23,28 @@
+ #include <unordered_map>
+ 
+ #include <rex/chrono/clock.h>  // For mftb timebase access
++#include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/ppc/memory.h>
+ #include <rex/ppc/types.h>
+ #include <rex/thread/mutex.h>
+ 
++#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
++#include <intrin.h>
++#elif defined(__i386__) || defined(__x86_64__)
++#include <immintrin.h>
++#endif
++
++REXCVAR_DECLARE(bool, ppc_db16cyc_pause);
++
++inline void PPC_DB16CYC() noexcept {
++#if defined(_MSC_VER) && (defined(_M_X64) || defined(_M_IX86))
++  if (FLAGS_ppc_db16cyc_pause) _mm_pause();
++#elif defined(__i386__) || defined(__x86_64__)
++  if (FLAGS_ppc_db16cyc_pause) _mm_pause();
++#endif
++}
++
+ // Forward declarations for kernel state access
+ namespace rex::system {
+ class KernelState;
+diff --git a/src/codegen/builders/system.cpp b/src/codegen/builders/system.cpp
+index 9cd26e4..db6bf53 100644
+--- a/src/codegen/builders/system.cpp
++++ b/src/codegen/builders/system.cpp
+@@ -49,8 +49,10 @@ bool build_eieio(BuilderContext& ctx) {
+ }
+ 
+ bool build_db16cyc(BuilderContext& ctx) {
+-  // Xenon-specific 16-cycle delay hint, no effect in recompiled code
+-  (void)ctx;
++  // Xenon's delay hint has no guest-visible state. Preserve its spin-loop
++  // intent with an opt-in host PAUSE, useful on x86 without forcing a scheduler
++  // yield or changing default timing.
++  ctx.println("\tPPC_DB16CYC();");
+   return true;
+ }
+ 
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 363192a..a085a7f 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -14,6 +14,7 @@ add_library(rexcore STATIC
+     logging.cpp
+     memory.cpp
+     mutex.cpp
++    ppc.cpp
+     rate_census.cpp
+     ring_buffer.cpp
+     sha256.cpp
+diff --git a/src/core/ppc.cpp b/src/core/ppc.cpp
+new file mode 100644
+index 0000000..135b905
+--- /dev/null
++++ b/src/core/ppc.cpp
+@@ -0,0 +1,5 @@
++#include <rex/cvar.h>
++
++REXCVAR_DEFINE_BOOL(ppc_db16cyc_pause, false, "CPU",
++                    "Execute Xenon db16cyc delay hints as host PAUSE instructions")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+-- 
+2.43.0
+

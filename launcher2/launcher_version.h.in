@@ -1,0 +1,5 @@
+#pragma once
+
+// Generated from VERSION by cmake/wwe2k14_version.cmake.
+#define WWE2K14_LAUNCHER_VERSION "@WWE2K14_VERSION@"
+#define WWE2K14_LAUNCHER_BUILD_COMMIT "@WWE2K14_VERSION_COMMIT@"

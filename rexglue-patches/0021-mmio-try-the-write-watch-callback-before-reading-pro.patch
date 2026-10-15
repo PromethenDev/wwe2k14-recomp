@@ -1,0 +1,53 @@
+From 3345445b4c1793b330574eb6ce6565bdc97b18d0 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 13:21:46 -0700
+Subject: [PATCH 21/97] mmio: try the write-watch callback before reading
+ /proc/self/maps
+
+Every write-watch fault took the global critical region and then parsed the
+whole /proc/self/maps (QueryProtect) to recheck the page before calling the
+watch callback, holding the lock ~0.4 ms per fault. The callback returns false
+without side effects when no page is watched, and watch flags and protection
+change together under the lock, so it now runs first; the maps recheck is only
+needed for a concurrently cleared watch or a real access violation.
+
+WWE 13 entrance: GPU command thread global-lock wait 52 -> 4 ms/s, command
+thread busy 672 -> 617 ms/s. No fault captures.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/mmio_handler.cpp | 15 ++++++++++++++-
+ 1 file changed, 14 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
+index cf03f1f..e698b0b 100644
+--- a/src/system/mmio_handler.cpp
++++ b/src/system/mmio_handler.cpp
+@@ -526,10 +526,23 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {
+     }
+   }
+   if (!range) {
++    auto lock = global_critical_region_.Acquire();
++    if (access_violation_callback_) {
++      // Try the write-watch callback before reading /proc/self/maps.
++      // PhysicalHeap::TriggerCallbacks returns false without changing state
++      // when no page in the range is watched, and watch flags and host
++      // protection change together under this lock. Keep the recheck below for
++      // a concurrently cleared watch and real access violations; a false
++      // recovery attempt has no side effects to repeat.
++      if (access_violation_callback_(std::move(lock), access_violation_callback_context_,
++                                     fault_host_address, is_write)) {
++        return true;
++      }
++      lock = global_critical_region_.Acquire();
++    }
+     // Recheck if the pages are still protected (race condition - another thread
+     // clears the watch we just hit).
+     // Do this under the lock so we don't introduce another race condition.
+-    auto lock = global_critical_region_.Acquire();
+     memory::PageAccess cur_access;
+     size_t page_length = memory::page_size();
+     memory::QueryProtect(fault_host_address, page_length, cur_access);
+-- 
+2.43.0
+

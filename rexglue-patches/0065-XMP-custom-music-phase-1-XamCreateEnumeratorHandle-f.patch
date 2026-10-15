@@ -1,0 +1,365 @@
+From 798a1321699b6a073e739c19a14cfa74d56c57f7 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 29 Sep 2026 00:09:13 -0700
+Subject: [PATCH 65/97] XMP custom music phase 1: XamCreateEnumeratorHandle for
+ app 0xFA lists <exe>/music (xmp_music_dir) as 820-byte song records; 0x70025
+ ok; 0x7003B logged play request; rate-limited XMP message log
+
+Verified in WWE '13 entrance editor: USER PLAYLIST shows the folder songs, pick survives save/reload.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/kernel/xam/apps/xmp_app.h |  21 ++++
+ include/rex/system/xam/app_manager.h  |   2 +
+ src/kernel/xam/apps/xmp_app.cpp       | 151 ++++++++++++++++++++++++++
+ src/kernel/xam/xam_enum.cpp           |  44 +++++++-
+ src/system/xam/app_manager.cpp        |   5 +
+ 5 files changed, 218 insertions(+), 5 deletions(-)
+
+diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
+index d939d62..7fc63a6 100644
+--- a/include/rex/kernel/xam/apps/xmp_app.h
++++ b/include/rex/kernel/xam/apps/xmp_app.h
+@@ -10,7 +10,10 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
++#include <filesystem>
+ #include <memory>
++#include <mutex>
+ #include <string>
+ #include <unordered_map>
+ #include <vector>
+@@ -19,6 +22,10 @@
+ #include <rex/system/xam/app_manager.h>
+ #include <rex/thread/mutex.h>
+ 
++namespace rex::system {
++class XStaticUntypedEnumerator;
++}
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -86,6 +93,8 @@ class XmpApp : public system::xam::App {
+   X_HRESULT XMPNext();
+   X_HRESULT XMPPrevious();
+ 
++  void AppendCustomMusicItems(system::XStaticUntypedEnumerator* enumerator);
++
+   X_HRESULT DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                 uint32_t buffer_length) override;
+ 
+@@ -95,6 +104,14 @@ class XmpApp : public system::xam::App {
+   static const uint32_t kMsgPlaybackControllerChanged = 0x0A000003;
+ 
+   void OnStateChanged();
++  void EnsureCustomMusicLoaded();
++
++  struct CustomMusicSong {
++    uint32_t handle;
++    std::filesystem::path path;
++    std::u16string name;
++    uint32_t format;
++  };
+ 
+   State state_;
+   PlaybackClient playback_client_;
+@@ -109,6 +126,10 @@ class XmpApp : public system::xam::App {
+   std::unordered_map<uint32_t, Playlist*> playlists_;
+   uint32_t next_playlist_handle_;
+   uint32_t next_song_handle_;
++  std::once_flag custom_music_once_;
++  std::vector<CustomMusicSong> custom_music_songs_;
++  std::atomic<uint64_t> get_status_log_count_{0};
++  std::atomic<uint64_t> get_playback_controller_log_count_{0};
+ };
+ 
+ }  // namespace apps
+diff --git a/include/rex/system/xam/app_manager.h b/include/rex/system/xam/app_manager.h
+index 84be3e4..9a2ecc0 100644
+--- a/include/rex/system/xam/app_manager.h
++++ b/include/rex/system/xam/app_manager.h
+@@ -51,6 +51,8 @@ class AppManager {
+  public:
+   void RegisterApp(std::unique_ptr<App> app);
+ 
++  App* GetApp(uint32_t app_id) const;
++
+   X_HRESULT DispatchMessageSync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+                                 uint32_t buffer_length);
+   X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index 1aab507..0d3338a 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -10,10 +10,23 @@
+  */
+ 
+ #include <rex/kernel/xam/apps/xmp_app.h>
++#include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
++#include <rex/memory/utils.h>
++#include <rex/string.h>
++#include <rex/system/xenumerator.h>
+ #include <rex/system/xthread.h>
+ #include <rex/thread.h>
+ 
++#include <algorithm>
++#include <cctype>
++#include <cstring>
++#include <system_error>
++
++REXCVAR_DEFINE_STRING(xmp_music_dir, "", "XMP",
++                      "Host folder containing custom XMP music (empty uses <exe>/music)");
++
+ namespace rex {
+ namespace kernel {
+ namespace xam {
+@@ -22,6 +35,17 @@ using namespace rex::system::xam;
+ namespace apps {
+ using namespace rex::system;
+ 
++namespace {
++
++std::string LowerAscii(std::string value) {
++  std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
++    return static_cast<char>(std::tolower(character));
++  });
++  return value;
++}
++
++}  // namespace
++
+ XmpApp::XmpApp(KernelState* kernel_state)
+     : App(kernel_state, 0xFA),
+       state_(State::kIdle),
+@@ -202,11 +226,138 @@ void XmpApp::OnStateChanged() {
+   kernel_state_->BroadcastNotification(kMsgStateChanged, static_cast<uint32_t>(state_));
+ }
+ 
++void XmpApp::EnsureCustomMusicLoaded() {
++  std::call_once(custom_music_once_, [this]() {
++    const std::string configured_directory = REXCVAR_GET(xmp_music_dir);
++    std::filesystem::path music_directory =
++        configured_directory.empty() ? rex::filesystem::GetExecutableFolder() / "music"
++                                     : rex::to_path(configured_directory);
++    std::error_code absolute_error;
++    auto absolute_directory = std::filesystem::absolute(music_directory, absolute_error);
++    if (!absolute_error) {
++      music_directory = std::move(absolute_directory);
++    }
++
++    struct Candidate {
++      std::filesystem::path path;
++      std::string filename;
++      std::string sort_key;
++    };
++    std::vector<Candidate> candidates;
++    std::error_code directory_error;
++    if (std::filesystem::is_directory(music_directory, directory_error) && !directory_error) {
++      std::filesystem::directory_iterator iterator(music_directory, directory_error);
++      const std::filesystem::directory_iterator end;
++      while (!directory_error && iterator != end) {
++        std::error_code file_error;
++        if (iterator->is_regular_file(file_error) && !file_error) {
++          const auto extension = LowerAscii(iterator->path().extension().string());
++          if (extension == ".mp3" || extension == ".ogg" || extension == ".flac" ||
++              extension == ".wav") {
++            auto filename = iterator->path().filename().string();
++            candidates.push_back(
++                {iterator->path(), filename, LowerAscii(std::move(filename))});
++          }
++        }
++        iterator.increment(directory_error);
++      }
++    }
++
++    std::sort(candidates.begin(), candidates.end(), [](const Candidate& left,
++                                                       const Candidate& right) {
++      if (left.sort_key != right.sort_key) {
++        return left.sort_key < right.sort_key;
++      }
++      return left.filename < right.filename;
++    });
++
++    custom_music_songs_.reserve(candidates.size());
++    for (const auto& candidate : candidates) {
++      auto name = rex::string::to_utf16(candidate.path.stem().string());
++      if (name.size() > 19) {
++        name.resize(19);
++        if (!name.empty() && name.back() >= 0xD800 && name.back() <= 0xDBFF) {
++          name.pop_back();
++        }
++      }
++      const uint32_t format = LowerAscii(candidate.path.extension().string()) == ".mp3" ? 1 : 0;
++      custom_music_songs_.push_back(
++          {static_cast<uint32_t>(custom_music_songs_.size() + 1), candidate.path,
++           std::move(name), format});
++    }
++
++    REXKRNL_INFO("custom music folder {}: {} songs", rex::path_to_utf8(music_directory),
++                 custom_music_songs_.size());
++  });
++}
++
++void XmpApp::AppendCustomMusicItems(XStaticUntypedEnumerator* enumerator) {
++  EnsureCustomMusicLoaded();
++  for (const auto& song : custom_music_songs_) {
++    auto* record = enumerator->AppendItem();
++    std::memset(record, 0, 820);
++    memory::store_and_swap<uint32_t>(record + 0, song.handle);
++    memory::store_and_swap<std::u16string>(record + 572, song.name);
++    memory::store_and_swap<uint32_t>(record + 772, 0);
++    memory::store_and_swap<uint32_t>(record + 776, 0);
++    memory::store_and_swap<uint32_t>(record + 780, song.format);
++  }
++}
++
+ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+                                       uint32_t buffer_length) {
+   // NOTE: buffer_length may be zero or valid.
++  bool log_message = true;
++  if (message == 0x00070009) {
++    const auto count = get_status_log_count_.fetch_add(1, std::memory_order_relaxed) + 1;
++    log_message = count <= 3 || count % 1000 == 0;
++  } else if (message == 0x0007001B) {
++    const auto count =
++        get_playback_controller_log_count_.fetch_add(1, std::memory_order_relaxed) + 1;
++    log_message = count <= 3 || count % 1000 == 0;
++  }
++  if (log_message) {
++    REXKRNL_INFO("XMP message app={:#x} msg={:#x} buffer_length={}", app_id_, message,
++                 buffer_length);
++  }
++
+   auto buffer = memory_->TranslateVirtual(buffer_ptr);
+   switch (message) {
++    case 0x00070025: {
++      assert_true(!buffer_length || buffer_length == 12);
++      return X_E_SUCCESS;
++    }
++    case 0x0007003B: {
++      assert_true(!buffer_length || buffer_length == 824);
++      auto* record = buffer + 4;
++      const uint32_t song_handle = memory::load_and_swap<uint32_t>(record + 0);
++      const auto song_name = memory::load_and_swap<std::u16string>(record + 572);
++      EnsureCustomMusicLoaded();
++
++      const CustomMusicSong* selected_song = nullptr;
++      for (const auto& song : custom_music_songs_) {
++        if (song.handle == song_handle) {
++          selected_song = &song;
++          break;
++        }
++      }
++      if (!selected_song) {
++        for (const auto& song : custom_music_songs_) {
++          if (song.name == song_name) {
++            selected_song = &song;
++            break;
++          }
++        }
++      }
++
++      const auto path = selected_song ? rex::path_to_utf8(selected_song->path) : "<unknown>";
++      REXKRNL_INFO("XMP play request: {} ({})", rex::string::to_utf8(song_name), path);
++      active_playlist_ = nullptr;
++      active_song_index_ = 0;
++      state_ = State::kPlaying;
++      OnStateChanged();
++      return X_E_SUCCESS;
++    }
+     case 0x00070002: {
+       assert_true(!buffer_length || buffer_length == 12);
+       uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
+diff --git a/src/kernel/xam/xam_enum.cpp b/src/kernel/xam/xam_enum.cpp
+index 700bd9e..e1836fb 100644
+--- a/src/kernel/xam/xam_enum.cpp
++++ b/src/kernel/xam/xam_enum.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/kernel/xam/module.h>
+ #include <rex/kernel/xam/private.h>
++#include <rex/kernel/xam/apps/xmp_app.h>
+ #include <rex/logging.h>
+ #include <rex/ppc/function.h>
+ #include <rex/ppc/types.h>
+@@ -19,6 +20,8 @@
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xtypes.h>
+ 
++#include <atomic>
++
+ #if REX_PLATFORM_WIN32
+ #include <rex/platform.h>
+ #endif
+@@ -84,11 +87,42 @@ ppc_u32_result_t XamEnumerate_entry(ppc_u32_t handle, ppc_u32_t flags, ppc_pvoid
+   return result;
+ }
+ 
+-ppc_u32_result_t XamCreateEnumeratorHandle_entry(ppc_unknown_t unk1, ppc_unknown_t unk2,
+-                                                 ppc_unknown_t unk3, ppc_unknown_t unk4,
+-                                                 ppc_unknown_t unk5, ppc_unknown_t unk6,
+-                                                 ppc_unknown_t unk7, ppc_unknown_t unk8) {
+-  return X_ERROR_INVALID_PARAMETER;
++ppc_u32_result_t XamCreateEnumeratorHandle_entry(ppc_u32_t user_index, ppc_u32_t app_id,
++                                                 ppc_u32_t open_message,
++                                                 ppc_u32_t close_message,
++                                                 ppc_u32_t extra_size,
++                                                 ppc_u32_t items_per_enumerate,
++                                                 ppc_u32_t flags, ppc_pu32_t out_handle_ptr) {
++  if (uint32_t(app_id) != 0xFA) {
++    static std::atomic_flag warned = ATOMIC_FLAG_INIT;
++    if (!warned.test_and_set(std::memory_order_relaxed)) {
++      REXKRNL_WARN("XamCreateEnumeratorHandle: unsupported app id {:#x}", uint32_t(app_id));
++    }
++    return X_ERROR_INVALID_PARAMETER;
++  }
++  if (!out_handle_ptr) {
++    return X_ERROR_INVALID_PARAMETER;
++  }
++
++  auto* app = static_cast<apps::XmpApp*>(REX_KERNEL_STATE()->app_manager()->GetApp(0xFA));
++  if (!app) {
++    REXKRNL_WARN("XamCreateEnumeratorHandle: XMP app is not registered");
++    return X_ERROR_INVALID_PARAMETER;
++  }
++
++  auto enumerator = make_object<XStaticUntypedEnumerator>(
++      REX_KERNEL_STATE(), uint32_t(items_per_enumerate), 820);
++  void* extra = nullptr;
++  const auto initialize_result = enumerator->Initialize(
++      uint32_t(user_index), uint32_t(app_id), uint32_t(open_message), uint32_t(close_message),
++      uint32_t(flags), uint32_t(extra_size), &extra);
++  if (XFAILED(initialize_result)) {
++    return initialize_result;
++  }
++
++  app->AppendCustomMusicItems(enumerator.get());
++  *out_handle_ptr = enumerator->handle();
++  return X_ERROR_SUCCESS;
+ }
+ 
+ ppc_u32_result_t XamGetPrivateEnumStructureFromHandle_entry(ppc_u32_t handle,
+diff --git a/src/system/xam/app_manager.cpp b/src/system/xam/app_manager.cpp
+index f96257f..abd982b 100644
+--- a/src/system/xam/app_manager.cpp
++++ b/src/system/xam/app_manager.cpp
+@@ -25,6 +25,11 @@ void AppManager::RegisterApp(std::unique_ptr<App> app) {
+   apps_.push_back(std::move(app));
+ }
+ 
++App* AppManager::GetApp(uint32_t app_id) const {
++  const auto& it = app_lookup_.find(app_id);
++  return it == app_lookup_.end() ? nullptr : it->second;
++}
++
+ X_HRESULT AppManager::DispatchMessageSync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
+                                           uint32_t buffer_length) {
+   const auto& it = app_lookup_.find(app_id);
+-- 
+2.43.0
+

@@ -1,0 +1,59 @@
+From 5905278d0ae5c5ff77e70314d8882b3ad0e5bf28 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 25 Sep 2026 08:41:54 -0700
+Subject: [PATCH 29/97] codegen: vaddsws saturates per word, not per byte
+
+The overflow mask (a ^ sum) & (b ^ sum) only carries the overflow flag in bit 31 of each
+word, but blendv_epi8 selects on bit 7 of every byte, so any byte whose own bit 7 was set
+was replaced with saturation bytes even when nothing overflowed (0x158 + 0x160 gave 0x2FF
+instead of 0x2B8). Spread bit 31 across the word before blending.
+
+Found by a differential interpreter run on WWE '13's Bink 2 decoder, whose block-sum
+helper uses vaddsws; the wrong sums produced the grey/black macroblocks in every video.
+tests/ppc/asm/instr_vaddsws.s covers the non-overflowing case and both saturation
+directions; it fails without this change (767 != 696) and ppc_tests pass 1459/1459 with it.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/codegen/builders/vector.cpp | 6 ++++--
+ tests/ppc/asm/instr_vaddsws.s   | 9 +++++++++
+ 2 files changed, 13 insertions(+), 2 deletions(-)
+ create mode 100644 tests/ppc/asm/instr_vaddsws.s
+
+diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
+index 173b82b..ce08539 100644
+--- a/src/codegen/builders/vector.cpp
++++ b/src/codegen/builders/vector.cpp
+@@ -254,10 +254,12 @@ bool build_vaddsws(BuilderContext& ctx) {
+   ctx.println(
+       "\t\tsimde__m128i sat_val = simde_mm_xor_si128(simde_mm_srai_epi32(a, 31), "
+       "simde_mm_set1_epi32(0x7FFFFFFF));");
+-  // Blend: select sat_val where overflow MSB is set, else sum
++  // Blend: select sat_val where the word's overflow MSB is set, else sum. blendv_epi8 selects per
++  // byte on each byte's MSB, so spread bit 31 across the word first; blending on the raw overflow
++  // word replaced any byte whose own bit 7 happened to be set (e.g. 0x158 + 0x160 -> 0x2FF).
+   ctx.println(
+       "\t\tsimde_mm_store_si128((simde__m128i*){}.u8, simde_mm_blendv_epi8(sum, sat_val, "
+-      "overflow));",
++      "simde_mm_srai_epi32(overflow, 31)));",
+       vD);
+   ctx.println("\t}}");
+   return true;
+diff --git a/tests/ppc/asm/instr_vaddsws.s b/tests/ppc/asm/instr_vaddsws.s
+new file mode 100644
+index 0000000..0ebfceb
+--- /dev/null
++++ b/tests/ppc/asm/instr_vaddsws.s
+@@ -0,0 +1,9 @@
++test_vaddsws_1:
++  # Lane 0 is a non-overflowing sum whose overflow-detect word has bit 7 set
++  # (0x158 + 0x160); lanes 1/2 saturate high/low; lane 3 mixes signs.
++  #_ REGISTER_IN v3 [00000158, 7FFFFFF0, 80000010, FFFFFF00]
++  #_ REGISTER_IN v4 [00000160, 00000100, FFFFFF00, 00000200]
++  vaddsws v3, v3, v4
++  blr
++  #_ REGISTER_OUT v3 [000002B8, 7FFFFFFF, 80000000, 00000100]
++  #_ REGISTER_OUT v4 [00000160, 00000100, FFFFFF00, 00000200]
+-- 
+2.43.0
+

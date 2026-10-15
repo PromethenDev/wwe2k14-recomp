@@ -1,0 +1,78 @@
+From ad0160f15fb59e0a9f34b0df31674f0c0be61d0f Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 21:04:40 -0700
+Subject: [PATCH 53/97] host vsync: fire the guest vblank half a display period
+ after the display vblank (phase offset)
+
+Laptop 2026-09-26 203049 (display-locked guest vblank): repeated frames only in light scenes (3-8/s, command
+processor mostly idle, no late frames), almost none in heavy ones. In light scenes the frame is handed to the
+presenter immediately after the guest vblank - i.e. exactly when the display/compositor latches, so it
+alternately makes and misses it. vsync_host_display_phase_percent (default 50) delays the guest vblank that
+part of a period; display pacing statistics now sample opposite the hand-over point.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/graphics_system.cpp | 25 ++++++++++++++++++++++---
+ 1 file changed, 22 insertions(+), 3 deletions(-)
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index 7dfa05d..a56393f 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -19,6 +19,7 @@
+ #include <functional>
+ #include <memory>
+ #include <mutex>
++#include <thread>
+ #include <utility>
+ 
+ #include <rex/cvar.h>
+@@ -49,6 +50,10 @@ REXCVAR_DEFINE_BOOL(display_pacing_stats, false, "GPU",
+                     "Log per second how many new frames reached each host display vblank (Windows)")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_INT32(vsync_host_display_phase_percent, 50, "GPU",
++                     "With vsync_host_display: fire the guest vblank this percentage of a display period after the "
++                     "display vblank (0 = at the vblank)");
++
+ REXCVAR_DEFINE_BOOL(vsync_host_display, false, "GPU",
+                     "Fire guest vblanks on the host display's vertical blanks when the display refresh is a "
+                     "multiple of the guest refresh (Windows); otherwise a timer is used");
+@@ -206,6 +211,15 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+               } else if (waited && now - last_host_vblank_time >= host_period / 2) {
+                 last_host_vblank_time = now;
+                 if (++host_vblank_index % host_divider == 0) {
++                  // Phase offset: the guest frame is handed to the presenter right after the guest vblank; firing
++                  // it exactly at the display vblank races with the display/compositor latching the image
++                  // (laptop 2026-09-26 203049: repeated frames only in light scenes, where the hand-over is
++                  // immediate). Firing it part of a period later keeps hand-overs away from the latch.
++                  const int32_t phase_percent =
++                      std::clamp(REXCVAR_GET(vsync_host_display_phase_percent), 0, 90);
++                  if (phase_percent) {
++                    std::this_thread::sleep_until(now + host_period * phase_percent / 100);
++                  }
+                   MarkVblank();
+                   // Keep the timer path's phase right after this vblank if it takes over.
+                   next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
+@@ -423,10 +437,15 @@ void GraphicsSystem::DisplayPacingThread() {
+       last_vblank = Clock::time_point();
+       continue;
+     }
+-    // Count at mid-period: the guest frame for this vblank is consumed right after the vblank (display-locked
+-    // guest vblank), so sampling at the vblank itself races with it and misattributes frames.
++    // Count half a period away from where guest frames are handed over (right after the display-locked guest
++    // vblank, vsync_host_display_phase_percent after the display vblank); counting at the hand-over itself races
++    // with it and misattributes frames.
+     const uint32_t mid_hz = std::max(1u, last_host_refresh_hz_.load(std::memory_order_relaxed));
+-    std::this_thread::sleep_for(std::chrono::microseconds(500000 / mid_hz));
++    const int32_t sample_percent =
++        (std::clamp(REXCVAR_GET(vsync_host_display_phase_percent), 0, 90) + 50) % 100;
++    if (sample_percent) {
++      std::this_thread::sleep_for(std::chrono::microseconds(10000 * sample_percent / mid_hz));
++    }
+     const auto now = Clock::now();
+     const uint64_t frames = presenter()->guest_frames_consumed();
+     const uint64_t new_frames = frames - last_frames;
+-- 
+2.43.0
+

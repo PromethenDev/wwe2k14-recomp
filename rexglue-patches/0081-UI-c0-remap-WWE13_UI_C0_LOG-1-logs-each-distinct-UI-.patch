@@ -1,0 +1,59 @@
+From 5fa8e4a1495bcc8c6a13f8a12184326d07bdaea4 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 1 Oct 2026 18:48:23 -0700
+Subject: [PATCH 81/97] UI c0 remap: WWE13_UI_C0_LOG=1 logs each distinct (UI
+ VS, fetch-0 size, remapped) once
+
+Diagnostic for the 576p entrance box: shows which full-screen copies/fades the remap touches per mode.
+---
+ src/graphics/vulkan/command_processor.cpp | 27 +++++++++++++++++++++++
+ 1 file changed, 27 insertions(+)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 18f8055..e9574a2 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -10,6 +10,8 @@
+  */
+ 
+ #include <algorithm>
++#include <set>
++#include <tuple>
+ #include <array>
+ #include <atomic>
+ #include <bit>
+@@ -4735,6 +4737,31 @@ bool VulkanCommandProcessor::IssueDraw(xenos::PrimitiveType prim_type, uint32_t
+                          regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1], ui_c0_target_x,
+                          ui_c0_target_y) &&
+       !UiC0DrawSamplesSceneSizedTexture(GetUiC0RemapConfig(), regs);
++  // WWE13_UI_C0_LOG=1: log each distinct (UI vertex shader, fetch-0 texture size, remapped?) once, to
++  // see which full-screen copies/fades the remap shrinks at a given internal resolution.
++  static const bool ui_c0_log = std::getenv("WWE13_UI_C0_LOG") != nullptr;
++  if (ui_c0_log && (float_constant_map_vertex.float_bitmap[0] & UINT64_C(1)) != 0) {
++    uint32_t probe_x = 0;
++    uint32_t probe_y = 0;
++    if (GetUiC0RemapTarget(GetUiC0RemapConfig(), vertex_shader->ucode_data_hash(),
++                           regs[XE_GPU_REG_SHADER_CONSTANT_000_X],
++                           regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1], probe_x, probe_y)) {
++      static std::set<std::tuple<uint64_t, uint32_t, uint32_t, uint32_t, bool>> seen;
++      const uint32_t fetch0 = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0];
++      const uint32_t size = regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 2];
++      const uint32_t fw = (fetch0 & 3) == 2 ? (size & 0x1FFF) + 1 : 0;
++      const uint32_t fh = (fetch0 & 3) == 2 ? ((size >> 13) & 0x1FFF) + 1 : 0;
++      const uint32_t base = (fetch0 & 3) == 2 ? (regs[XE_GPU_REG_SHADER_CONSTANT_FETCH_00_0 + 1] & 0xFFFFF000) : 0;
++      if (seen.size() < 256 &&
++          seen.emplace(vertex_shader->ucode_data_hash(), fw, fh, fetch0 & 3, ui_c0_remap_this_draw).second) {
++        REXGPU_INFO("[wwe13-ui-c0-log] vs={:016X} fetch0_type={} tex={}x{} base={:08X} c0=({:08X},{:08X}) "
++                    "viewport_scissor_from_regs remapped={}",
++                    vertex_shader->ucode_data_hash(), fetch0 & 3, fw, fh, base,
++                    regs[XE_GPU_REG_SHADER_CONSTANT_000_X], regs[XE_GPU_REG_SHADER_CONSTANT_000_X + 1],
++                    ui_c0_remap_this_draw);
++      }
++    }
++  }
+ 
+   // Update dynamic graphics pipeline state.
+   UpdateDynamicState(viewport_info, primitive_polygonal, normalized_depth_control,
+-- 
+2.43.0
+

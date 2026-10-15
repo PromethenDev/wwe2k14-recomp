@@ -1,0 +1,180 @@
+From 40b5dbae54115f08c5491ff405fd3f17f5a33adb Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 20:41:32 -0700
+Subject: [PATCH 12/97] graphics: add debug_rt_cache_ownership render-target
+ log (default off)
+
+---
+ .../graphics/pipeline/render_target/cache.h   |  4 +
+ src/graphics/pipeline/render_target/cache.cpp | 80 +++++++++++++++++++
+ 2 files changed, 84 insertions(+)
+
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 18e6b14..9c5e5e6 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -564,6 +564,8 @@ class RenderTargetCache {
+   uint32_t draw_resolution_scale_x_;
+   uint32_t draw_resolution_scale_y_;
+ 
++  uint64_t debug_rt_cache_draw_index_ = 0;
++
+   DrawExtentEstimator draw_extent_estimator_;
+ 
+   // For host render targets.
+@@ -645,6 +647,8 @@ class RenderTargetCache {
+ 
+   RenderTarget* GetOrCreateRenderTarget(RenderTargetKey key);
+ 
++  std::string DebugRenderTargetKeyString(RenderTargetKey key) const;
++
+   // Checks if changing ownership of the range to the specified render target
+   // would require transferring data - primarily for barrier placement on the
+   // pixel shader interlock path (where transfers do not involve copying, but
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index db82ab0..c467fc5 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -41,6 +41,28 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",
+                     "Resolve from host render targets directly to shared memory when possible")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++REXCVAR_DEFINE_BOOL(debug_rt_cache_ownership, false, "GPU",
++                    "Log render-target cache ownership and EDRAM transfers");
++
++namespace {
++
++const char* GetEdramModeName(rex::graphics::xenos::EdramMode mode) {
++  switch (mode) {
++    case rex::graphics::xenos::EdramMode::kNoOperation:
++      return "no-operation";
++    case rex::graphics::xenos::EdramMode::kColorDepth:
++      return "color-depth";
++    case rex::graphics::xenos::EdramMode::kDepthOnly:
++      return "depth-only";
++    case rex::graphics::xenos::EdramMode::kCopy:
++      return "copy";
++    default:
++      return "unknown";
++  }
++}
++
++}  // namespace
++
+ namespace rex::graphics {
+ 
+ void RenderTargetCache::GetPSIColorFormatInfo(xenos::ColorRenderTargetFormat format,
+@@ -395,16 +417,31 @@ void RenderTargetCache::ClearCache() {
+ 
+ void RenderTargetCache::BeginFrame() {
+   ResetAccumulatedRenderTargets();
++  if (REXCVAR_GET(debug_rt_cache_ownership)) {
++    debug_rt_cache_draw_index_ = 0;
++  }
+ }
+ 
+ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                reg::RB_DEPTHCONTROL normalized_depth_control,
+                                uint32_t normalized_color_mask, const Shader& vertex_shader) {
++  const bool debug_rt_cache_ownership = REXCVAR_GET(debug_rt_cache_ownership);
++  if (debug_rt_cache_ownership) {
++    ++debug_rt_cache_draw_index_;
++  }
++  const uint64_t debug_draw_index = debug_rt_cache_draw_index_;
++
+   const RegisterFile& regs = register_file();
+   bool interlock_barrier_only = GetPath() == Path::kPixelShaderInterlock;
+ 
+   auto rb_surface_info = regs.Get<reg::RB_SURFACE_INFO>();
+   xenos::MsaaSamples msaa_samples = rb_surface_info.msaa_samples;
++  if (debug_rt_cache_ownership) {
++    xenos::EdramMode edram_mode = regs.Get<reg::RB_MODECONTROL>().edram_mode;
++    REXGPU_INFO("RT_CACHE draw={} mode={}({}) rasterization_done={} color_mask=0x{:08X}",
++                debug_draw_index, static_cast<uint32_t>(edram_mode), GetEdramModeName(edram_mode),
++                is_rasterization_done, normalized_color_mask);
++  }
+   assert_true(msaa_samples <= xenos::MsaaSamples::k4X);
+   if (msaa_samples > xenos::MsaaSamples::k4X) {
+     // Safety check because a lot of code assumes up to 4x.
+@@ -561,6 +598,12 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+       std::memset(last_update_accumulated_render_targets_, 0,
+                   sizeof(last_update_accumulated_render_targets_));
+     }
++    if (debug_rt_cache_ownership) {
++      REXGPU_INFO("RT_CACHE draw={} bound role=depth none", debug_draw_index);
++      for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++        REXGPU_INFO("RT_CACHE draw={} bound role=color{} none", debug_draw_index, i);
++      }
++    }
+     return true;
+   }
+ 
+@@ -658,6 +701,15 @@ bool RenderTargetCache::Update(bool is_rasterization_done,
+                                        rt_base);
+   }
+ 
++  if (debug_rt_cache_ownership) {
++    REXGPU_INFO("RT_CACHE draw={} bound role=depth {}", debug_draw_index,
++                DebugRenderTargetKeyString(rt_keys[0]));
++    for (uint32_t i = 0; i < xenos::kMaxColorRenderTargets; ++i) {
++      REXGPU_INFO("RT_CACHE draw={} bound role=color{} {}", debug_draw_index, i,
++                  DebugRenderTargetKeyString(rt_keys[1 + i]));
++    }
++  }
++
+   if (interlock_barrier_only) {
+     // Because a full pixel shader interlock barrier may clear the ownership map
+     // (since it flushes all previous writes, and there's no need for another
+@@ -1213,6 +1265,18 @@ RenderTargetCache::RenderTarget* RenderTargetCache::GetOrCreateRenderTarget(Rend
+   return render_target;
+ }
+ 
++std::string RenderTargetCache::DebugRenderTargetKeyString(RenderTargetKey key) const {
++  if (key.IsEmpty()) {
++    return "none";
++  }
++  return fmt::format(
++      "key=0x{:08X} base_tiles={} pitch_tiles_32={} pitch_tiles={} msaa={} format={}({}) role={}",
++      key.key, static_cast<uint32_t>(key.base_tiles),
++      static_cast<uint32_t>(key.pitch_tiles_at_32bpp), key.GetPitchTiles(),
++      uint32_t(1) << uint32_t(key.msaa_samples), static_cast<uint32_t>(key.resource_format),
++      key.GetFormatName(), key.is_depth ? "depth" : "color");
++}
++
+ bool RenderTargetCache::WouldOwnershipChangeRequireTransfers(RenderTargetKey dest,
+                                                              uint32_t start_tiles_base_relative,
+                                                              uint32_t length_tiles) const {
+@@ -1290,7 +1354,12 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+   bool dest_is_64bpp = dest.Is64bpp();
+   bool host_depth_encoding_different = dest.is_depth && GetPath() == Path::kHostRenderTargets &&
+                                        IsHostDepthEncodingDifferent(dest.GetDepthFormat());
++  const bool debug_rt_cache_ownership = REXCVAR_GET(debug_rt_cache_ownership);
+   auto change_ownership_in_extent = [&](uint32_t extent_start, uint32_t extent_end) {
++    if (debug_rt_cache_ownership && extent_start < extent_end) {
++      REXGPU_INFO("RT_CACHE draw={} claim range=[{}, {}) dest={}", debug_rt_cache_draw_index_,
++                  extent_start, extent_end, DebugRenderTargetKeyString(dest));
++    }
+     // The map contains consecutive ranges, merged if the adjacent ones are the
+     // same. Find the range starting at >= the start. A portion of the range
+     // preceding it may be intersecting the render target's range (or even fully
+@@ -1421,6 +1490,17 @@ void RenderTargetCache::ChangeOwnership(RenderTargetKey dest, uint32_t start_til
+     // The ownership change extent goes to the next EDRAM addressing period.
+     change_ownership_in_extent(0, std::min(end_tiles & (xenos::kEdramTileCount - 1), start_tiles));
+   }
++  if (debug_rt_cache_ownership && transfers_append_out) {
++    for (const Transfer& transfer : *transfers_append_out) {
++      REXGPU_INFO(
++          "RT_CACHE draw={} transfer source={} -> dest={} range=[{}, {}) host_depth_source={}",
++          debug_rt_cache_draw_index_, DebugRenderTargetKeyString(transfer.source->key()),
++          DebugRenderTargetKeyString(dest), transfer.start_tiles, transfer.end_tiles,
++          transfer.host_depth_source
++              ? DebugRenderTargetKeyString(transfer.host_depth_source->key())
++              : std::string("none"));
++    }
++  }
+ }
+ 
+ }  // namespace rex::graphics
+-- 
+2.43.0
+

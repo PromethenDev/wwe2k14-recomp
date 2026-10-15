@@ -1,0 +1,48 @@
+From 77ca72ba7f0e932f4029f37249a90d21e1f2d656 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 00:55:28 -0700
+Subject: [PATCH 85/97] Resolve: rate-limit the 'outside the surface pitch'
+ error (first 16, then every 4096th)
+
+WWE '13 at internal 480p issues one 1280x720 resolve from a 640-pitch surface every frame; its consumer only samples
+the 640-wide part (replays with the destination overwritten are pixel-identical, bug hunt p4-resolve480.md), so the
+clamp is harmless but the log grew by ~60 lines per second.
+---
+ src/graphics/util/draw.cpp | 14 +++++++++++---
+ 1 file changed, 11 insertions(+), 3 deletions(-)
+
+diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
+index db2eaeb..676fe26 100644
+--- a/src/graphics/util/draw.cpp
++++ b/src/graphics/util/draw.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <atomic>
+ #include <array>
+ #include <bit>
+ #include <cmath>
+@@ -1087,9 +1088,16 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
+   // Defer them until emptiness is known so a clipped zero-pixel no-op is not
+   // reported as an error.
+   if (outside_surface_pitch) {
+-    REXGPU_ERROR("Resolve region {} <= x < {} is outside the surface pitch {}",
+-                 x0_before_surface_pitch_clamp, x1_before_surface_pitch_clamp,
+-                 surface_pitch_aligned);
++    // Rate-limited: WWE '13 at internal 480p issues one such clamped resolve every frame (a 1280x720 copy whose
++    // consumer only samples the 640-wide part, logs/bughunt-20261002/p4-resolve480.md), which filled the log at
++    // ~60 lines per second. Log the first 16, then every 4096th.
++    static std::atomic<uint64_t> outside_surface_pitch_count{0};
++    const uint64_t count = outside_surface_pitch_count.fetch_add(1, std::memory_order_relaxed);
++    if (count < 16 || (count & 4095) == 0) {
++      REXGPU_ERROR("Resolve region {} <= x < {} is outside the surface pitch {} (occurrence {})",
++                   x0_before_surface_pitch_clamp, x1_before_surface_pitch_clamp,
++                   surface_pitch_aligned, count + 1);
++    }
+   }
+   if (taller_than_max_resolve_size) {
+     REXGPU_ERROR("Resolve region {} <= y < {} is taller than {}", y0_before_height_clamp,
+-- 
+2.43.0
+

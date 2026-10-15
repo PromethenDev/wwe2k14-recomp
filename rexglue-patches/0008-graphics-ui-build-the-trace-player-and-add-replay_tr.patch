@@ -1,0 +1,130 @@
+From a62c013e516702c204d8aa774f386b873aff9f02 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 22 Sep 2026 17:23:00 -0700
+Subject: [PATCH 08/97] graphics/ui: build the trace player and add
+ --replay_trace
+
+Compiles trace_reader.cpp and trace_player.cpp (fixing a malformed snappy
+include) and adds --replay_trace/--replay_trace_out to ReXApp: instead of
+launching the title, play one captured .xtr frame through the live backend
+and write the presented frame as PPM. Known issue: the process aborts in
+heap release after the image is written.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/CMakeLists.txt   |  2 ++
+ src/graphics/trace_reader.cpp |  2 +-
+ src/ui/rex_app.cpp            | 54 +++++++++++++++++++++++++++++++++++
+ 3 files changed, 57 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
+index a977ca5..d5ebabd 100644
+--- a/src/graphics/CMakeLists.txt
++++ b/src/graphics/CMakeLists.txt
+@@ -20,6 +20,8 @@ set(REXGRAPHICS_SYSTEM_SOURCES
+     graphics_system.cpp
+     command_processor.cpp
+     trace_writer.cpp
++    trace_reader.cpp
++    trace_player.cpp
+     pipeline/texture/extent.cpp
+     pipeline/texture/util.cpp
+     util/draw_extent_estimator.cpp
+diff --git a/src/graphics/trace_reader.cpp b/src/graphics/trace_reader.cpp
+index 86eb1b3..83348e5 100644
+--- a/src/graphics/trace_reader.cpp
++++ b/src/graphics/trace_reader.cpp
+@@ -21,7 +21,7 @@
+ #include <rex/memory/mapped_memory.h>
+ #include <rex/platform.h>
+ 
+-#include <snappy.h"
++#include "snappy.h"
+ 
+ namespace rex::graphics {
+ 
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 25f26e8..293d9fa 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -21,6 +21,7 @@
+ #include <rex/ui/overlay/debug_overlay.h>
+ #include <rex/ui/overlay/settings_overlay.h>
+ #include <rex/graphics/graphics_system.h>
++#include <rex/graphics/trace_player.h>
+ #if REX_HAS_VULKAN
+ #include <rex/graphics/vulkan/graphics_system.h>
+ #endif
+@@ -39,9 +40,15 @@
+ 
+ #include <imgui.h>
+ 
++#include <cstdio>
+ #include <filesystem>
+ 
+ REXCVAR_DEFINE_STRING(user_data_root, "", "Runtime", "Override user data path");
++REXCVAR_DEFINE_STRING(replay_trace, "", "GPU",
++                      "Replay this single-frame GPU trace (.xtr) instead of launching the "
++                      "title, write the presented frame to replay_trace_out, then exit");
++REXCVAR_DEFINE_STRING(replay_trace_out, "", "GPU",
++                      "Output image (.ppm) for replay_trace; default: trace path + .ppm");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+ 
+ namespace rex {
+@@ -243,6 +250,53 @@ bool ReXApp::OnInitialize() {
+                           });
+   }
+ 
++  if (!REXCVAR_GET(replay_trace).empty()) {
++    // Trace replay: play one captured frame through the live GPU backend and
++    // save what the presenter shows. The title is never launched.
++    auto* replay_graphics = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
++    module_thread_ = std::thread([this, replay_graphics]() {
++      std::filesystem::path trace_path = REXCVAR_GET(replay_trace);
++      std::filesystem::path out_path = REXCVAR_GET(replay_trace_out);
++      if (out_path.empty()) {
++        out_path = trace_path;
++        out_path += ".ppm";
++      }
++      bool ok = false;
++      if (replay_graphics && replay_graphics->presenter()) {
++        auto player = std::make_unique<rex::graphics::TracePlayer>(replay_graphics);
++        if (player->Open(trace_path.string()) && player->frame_count() > 0) {
++          REXLOG_INFO("Replaying trace {} ({} frames)", trace_path.string(), player->frame_count());
++          player->SeekFrame(0);
++          player->SeekCommand(static_cast<int>(player->current_frame()->commands.size() - 1));
++          player->WaitOnPlayback();
++          ui::RawImage image;
++          if (replay_graphics->presenter()->CaptureGuestOutput(image)) {
++            if (FILE* f = std::fopen(out_path.string().c_str(), "wb")) {
++              std::fprintf(f, "P6\n%u %u\n255\n", image.width, image.height);
++              for (uint32_t y = 0; y < image.height; ++y) {
++                const uint8_t* row = image.data.data() + y * image.stride;
++                for (uint32_t x = 0; x < image.width; ++x) {
++                  std::fwrite(row + x * 4, 1, 3, f);
++                }
++              }
++              std::fclose(f);
++              ok = true;
++            }
++          } else {
++            REXLOG_ERROR("Replay: CaptureGuestOutput failed");
++          }
++        } else {
++          REXLOG_ERROR("Replay: could not open trace {}", trace_path.string());
++        }
++      } else {
++        REXLOG_ERROR("Replay: no graphics system / presenter");
++      }
++      REXLOG_INFO("Replay {}: {}", ok ? "wrote" : "FAILED", out_path.string());
++      app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
++    });
++    return true;
++  }
++
+   // Launch module in background
+   app_context().CallInUIThreadDeferred([this]() {
+     OnPreLaunchModule();
+-- 
+2.43.0
+

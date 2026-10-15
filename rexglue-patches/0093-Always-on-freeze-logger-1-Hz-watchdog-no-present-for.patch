@@ -1,0 +1,930 @@
+From 58f90a1a257284048597ec70549f2039a8d2e5b6 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 5 Oct 2026 06:17:04 -0700
+Subject: [PATCH 93/97] Always-on freeze logger: 1 Hz watchdog (no present for
+ 10 s after the first) + lock-free 4096-entry kernel sync-event ring (123
+ ns/push); one report per freeze in the logs folder (threads, wait objects,
+ host backtraces, ring, last 200 log lines); WWE2K14_FREEZE_LOG=0 disables,
+ WWE2K14_FREEZE_TEST_BLOCK test hook
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/freeze_logger.h    |  59 +++
+ src/core/CMakeLists.txt                    |   1 +
+ src/core/freeze_logger.cpp                 | 580 +++++++++++++++++++++
+ src/core/rate_census.cpp                   |  11 +-
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp |  78 +++
+ src/system/xthread.cpp                     |   6 +
+ 6 files changed, 733 insertions(+), 2 deletions(-)
+ create mode 100644 include/rex/diagnostics/freeze_logger.h
+ create mode 100644 src/core/freeze_logger.cpp
+
+diff --git a/include/rex/diagnostics/freeze_logger.h b/include/rex/diagnostics/freeze_logger.h
+new file mode 100644
+index 0000000..7e9da6d
+--- /dev/null
++++ b/include/rex/diagnostics/freeze_logger.h
+@@ -0,0 +1,59 @@
++/**
++ * @file        rex/diagnostics/freeze_logger.h
++ * @brief       Always-on freeze logger: a low-rate present watchdog plus a
++ *              lock-free ring of kernel synchronization events, written to a
++ *              report file when the game stops presenting. Intended for normal
++ *              player builds so a freeze anywhere records its own cause.
++ */
++#pragma once
++
++#include <cstdint>
++
++namespace rex::diagnostics::freeze_logger {
++
++// Kernel synchronization event kinds recorded in the ring buffer.
++enum class SyncType : uint32_t {
++  kUnknown = 0,
++  kEventCreate,
++  kEventSet,
++  kEventReset,
++  kEventPulse,
++  kSemaphoreRelease,
++  kWaitBegin,
++  kWaitEnd,
++  kThreadCreate,
++  kThreadExit,
++};
++
++// Starts the always-on logger: installs the one-shot capture signal handler and
++// a 1 Hz watchdog thread. No-op when already running, or when disabled with
++// WWE2K14_FREEZE_LOG=0 / REX_FREEZE_LOG_DISABLE=1. Cheap and safe to call once.
++void Start();
++
++// Stops the watchdog (used at shutdown). Safe to call when never started.
++void Stop();
++
++// True when the logger is running (not disabled by environment).
++bool IsEnabled();
++
++// Hot-path recorders. All are no-ops when the logger is disabled. They never
++// allocate, never take a lock, and only touch atomics + a fixed slot.
++void RecordPresent();
++void RecordVdSwap();
++void RecordSyncEvent(SyncType type, uint32_t handle, uint32_t object_type, const char* name);
++
++// Records the current guest thread as blocked on `handle` (object_type/name) and
++// then as unblocked. `guest_lr` is the guest link register at the wait call, a
++// useful proxity for the blocked guest PC (the recompiled runtime keeps no PC).
++void RecordWaitBegin(uint32_t handle, uint32_t object_type, const char* name, uint64_t guest_lr);
++void RecordWaitEnd(uint32_t handle);
++
++// Registers the calling host thread as a guest thread slot (for the report) and
++// unregisters it. Called from XThread's host trampoline.
++void RegisterThread(uint32_t guest_thread_id, const char* name);
++void UnregisterThread();
++
++// Total number of sync events pushed into the ring (overhead accounting).
++uint64_t RecordedEventCount();
++
++}  // namespace rex::diagnostics::freeze_logger
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index a085a7f..8e65ebc 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -9,6 +9,7 @@ add_library(rexcore STATIC
+     clock.cpp
+     cvar.cpp
+     exception_handler.cpp
++    freeze_logger.cpp
+     filesystem.cpp
+     filesystem_wildcard.cpp
+     logging.cpp
+diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
+new file mode 100644
+index 0000000..507c754
+--- /dev/null
++++ b/src/core/freeze_logger.cpp
+@@ -0,0 +1,580 @@
++// Always-on freeze logger (see include/rex/diagnostics/freeze_logger.h).
++//
++// Design constraints from the owner's R8 decision:
++//   * negligible always-on cost: a 1 Hz watchdog thread, no sampling profiler;
++//   * a fixed lock-free ring of kernel synchronization events, no locks,
++//     no allocation on the producer hot path;
++//   * on freeze, write ONE report (threads + waits + ring + log tail) into the
++//     player's logs folder and keep the game running;
++//   * never crash or deadlock the game: the watchdog only takes its own
++//     lifecycle mutex and reads snapshot atomics / fixed slots.
++//
++// This file must not depend on rex::system (rexcore is lower in the stack), so
++// the guest link register at a wait is supplied by the kernel caller and the
++// per-thread state is a snapshot of atomics.
++
++#include <rex/diagnostics/freeze_logger.h>
++
++#include <algorithm>
++#include <atomic>
++#include <bit>
++#include <chrono>
++#include <cstdint>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <ctime>
++#include <filesystem>
++#include <fstream>
++#include <mutex>
++#include <string>
++#include <thread>
++
++#include <rex/cvar.h>
++#include <rex/filesystem.h>
++#include <rex/logging.h>
++#include <rex/logging/api.h>
++#include <rex/thread.h>
++
++#if defined(_WIN32)
++#define WIN32_LEAN_AND_MEAN
++#include <windows.h>
++#else
++#include <execinfo.h>
++#include <signal.h>
++#include <sys/syscall.h>
++#include <time.h>
++#include <unistd.h>
++#endif
++
++namespace rex::diagnostics::freeze_logger {
++namespace {
++
++constexpr uint32_t kRingSize = 4096;
++constexpr int kMaxThreads = 64;
++constexpr uint32_t kMaxCaptureDepth = 24;
++constexpr int kFreezeGapSeconds = 10;
++
++std::atomic<bool> g_started{false};
++std::atomic<bool> g_enabled{false};
++std::atomic<bool> g_running{false};
++std::mutex g_lifecycle;
++std::thread g_watchdog;
++
++std::atomic<uint64_t> g_last_present_ns{0};
++std::atomic<uint64_t> g_present_count{0};
++std::atomic<uint64_t> g_last_vdswap_ns{0};
++std::atomic<uint64_t> g_vdswap_count{0};
++std::atomic<uint32_t> g_last_present_host_tid{0};
++std::atomic<bool> g_reported{false};
++std::atomic<uint64_t> g_event_count{0};
++uint64_t g_start_ns = 0;
++
++// --- ring buffer -----------------------------------------------------------
++
++struct SyncRecord {
++  uint16_t kind;
++  uint16_t object_type;
++  uint32_t host_tid;
++  uint32_t guest_id;
++  uint32_t handle;
++  uint64_t t_ns;
++  char name[32];
++};
++
++struct RingSlot {
++  std::atomic<uint64_t> seq{0};
++  SyncRecord rec{};
++};
++
++RingSlot g_ring[kRingSize];
++std::atomic<uint64_t> g_ring_write{0};
++
++// --- per-thread snapshot ---------------------------------------------------
++
++struct ThreadSlot {
++  std::atomic<bool> active{false};
++  std::atomic<uint32_t> guest_id{0};
++  std::atomic<uint32_t> host_tid{0};
++  char name[48] = {};
++  std::atomic<uint64_t> wait_since_ns{0};
++  std::atomic<uint32_t> wait_handle{0};
++  std::atomic<uint32_t> wait_object_type{0};
++  std::atomic<uint64_t> wait_lr{0};
++  char wait_name[48] = {};
++  std::atomic<uint32_t> cap_depth{0};
++  std::atomic<uint64_t> cap_pc[kMaxCaptureDepth] = {};
++};
++
++ThreadSlot g_slots[kMaxThreads];
++std::atomic<uint64_t> g_used_mask{0};
++#if !defined(_WIN32)
++thread_local ThreadSlot* t_slot = nullptr;
++int g_capture_signal = 0;
++#else
++thread_local ThreadSlot* t_slot = nullptr;
++#endif
++
++uint64_t NowNs() {
++  const auto now = std::chrono::steady_clock::now().time_since_epoch();
++  return uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(now).count());
++}
++
++const char* ObjectTypeName(uint32_t type) {
++  // Mirrors rex::system::XObject::Type (include/rex/system/xobject.h).
++  static const char* kNames[] = {
++      "Undefined", "Enumerator", "Event",       "File",    "IOCompletion",
++      "Module",    "Mutant",     "Notify",      "Semaphore", "Session",
++      "Socket",    "SymLink",    "Thread",      "Timer",
++  };
++  if (type < sizeof(kNames) / sizeof(kNames[0])) return kNames[type];
++  return "?";
++}
++
++void PushEvent(SyncType type, uint32_t handle, uint32_t object_type, const char* name) {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  ThreadSlot* slot = t_slot;
++  SyncRecord rec{};
++  rec.kind = static_cast<uint16_t>(type);
++  rec.object_type = static_cast<uint16_t>(object_type);
++  rec.host_tid = rex::thread::current_thread_system_id();
++  rec.guest_id = slot ? slot->guest_id.load(std::memory_order_relaxed) : 0;
++  rec.handle = handle;
++  rec.t_ns = NowNs();
++  if (name && *name) {
++    std::strncpy(rec.name, name, sizeof(rec.name) - 1);
++  }
++  const uint64_t seq = g_ring_write.fetch_add(1, std::memory_order_relaxed);
++  RingSlot& entry = g_ring[seq % kRingSize];
++  entry.seq.store(seq * 2 + 1, std::memory_order_release);
++  entry.rec = rec;
++  entry.seq.store(seq * 2 + 2, std::memory_order_release);
++  g_event_count.fetch_add(1, std::memory_order_relaxed);
++}
++
++#if !defined(_WIN32)
++// One-shot capture handler. Runs on the target thread; captures a host backtrace
++// (symbolizable to guest functions with the shipped binary) into its slot.
++void OnCaptureSignal(int, siginfo_t*, void*) {
++  ThreadSlot* slot = t_slot;
++  if (!slot) return;
++  void* frames[kMaxCaptureDepth];
++  const int depth = ::backtrace(frames, kMaxCaptureDepth);
++  const int clamped = depth < 0 ? 0 : std::min<int>(depth, kMaxCaptureDepth);
++  for (int i = 0; i < clamped; ++i) {
++    slot->cap_pc[i].store(reinterpret_cast<uint64_t>(frames[i]), std::memory_order_relaxed);
++  }
++  slot->cap_depth.store(static_cast<uint32_t>(clamped), std::memory_order_release);
++}
++#endif
++
++void InstallCaptureHandler() {
++#if !defined(_WIN32)
++  g_capture_signal = SIGRTMIN + 3;
++  struct sigaction action {};
++  action.sa_sigaction = OnCaptureSignal;
++  action.sa_flags = SA_SIGINFO | SA_RESTART;
++  sigemptyset(&action.sa_mask);
++  sigaction(g_capture_signal, &action, nullptr);
++#endif
++}
++
++void RequestCapture(ThreadSlot* slot) {
++#if defined(_WIN32)
++  const DWORD tid = slot->host_tid.load(std::memory_order_relaxed);
++  HANDLE handle = OpenThread(THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | THREAD_QUERY_INFORMATION,
++                             FALSE, tid);
++  if (!handle) return;
++  if (SuspendThread(handle) != static_cast<DWORD>(-1)) {
++    CONTEXT context{};
++    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++    if (GetThreadContext(handle, &context)) {
++      slot->cap_pc[0].store(context.Rip, std::memory_order_relaxed);
++      uint32_t depth = 1;
++      uint64_t rbp = context.Rbp;
++      while (depth < kMaxCaptureDepth && rbp) {
++        MEMORY_BASIC_INFORMATION info{};
++        if (VirtualQuery(reinterpret_cast<void*>(rbp), &info, sizeof(info)) == 0 ||
++            info.State != MEM_COMMIT || (info.Protect & PAGE_NOACCESS)) {
++          break;
++        }
++        uint64_t* frame = reinterpret_cast<uint64_t*>(rbp);
++        const uint64_t next = frame[0];
++        const uint64_t ret = frame[1];
++        if (ret == 0) break;
++        slot->cap_pc[depth++].store(ret, std::memory_order_relaxed);
++        if (next <= rbp) break;
++        rbp = next;
++      }
++      slot->cap_depth.store(depth, std::memory_order_release);
++    }
++    ResumeThread(handle);
++  }
++  CloseHandle(handle);
++#else
++  const uint32_t tid = slot->host_tid.load(std::memory_order_relaxed);
++  if (tid == 0) return;
++  syscall(SYS_tgkill, getpid(), static_cast<pid_t>(tid), g_capture_signal);
++#endif
++}
++
++void CaptureAllThreads() {
++  for (int i = 0; i < kMaxThreads; ++i) {
++    ThreadSlot& slot = g_slots[i];
++    if (!slot.active.load(std::memory_order_acquire)) continue;
++    slot.cap_depth.store(0, std::memory_order_release);
++  }
++  for (int i = 0; i < kMaxThreads; ++i) {
++    ThreadSlot& slot = g_slots[i];
++    if (!slot.active.load(std::memory_order_acquire)) continue;
++    RequestCapture(&slot);
++  }
++  // Give runnable threads time to take the signal / be suspended-read.
++  std::this_thread::sleep_for(std::chrono::milliseconds(150));
++}
++
++std::string ReadHostState(uint32_t tid) {
++#if defined(_WIN32)
++  (void)tid;
++  return "?";
++#else
++  std::ifstream input("/proc/self/task/" + std::to_string(tid) + "/stat");
++  std::string line;
++  if (!input || !std::getline(input, line)) return "?";
++  const size_t name_end = line.rfind(") ");
++  if (name_end == std::string::npos || name_end + 2 >= line.size()) return "?";
++  return std::string(1, line[name_end + 2]);
++#endif
++}
++
++std::string ReadTailLines(const std::string& path, size_t max_lines) {
++  std::ifstream file(path, std::ios::binary);
++  if (!file) return {};
++  file.seekg(0, std::ios::end);
++  const std::streamoff size = file.tellg();
++  if (size <= 0) return {};
++  const std::streamoff chunk = 65536;
++  std::string data;
++  std::streamoff pos = size;
++  size_t newlines = 0;
++  while (pos > 0 && newlines <= max_lines) {
++    const size_t read_size = static_cast<size_t>(std::min<std::streamoff>(chunk, pos));
++    pos -= static_cast<std::streamoff>(read_size);
++    std::string buffer(read_size, '\0');
++    file.seekg(pos);
++    file.read(buffer.data(), static_cast<std::streamsize>(read_size));
++    data.insert(0, buffer);
++    newlines = static_cast<size_t>(std::count(data.begin(), data.end(), '\n'));
++  }
++  size_t cursor = data.size();
++  size_t count = 0;
++  while (cursor > 0 && count <= max_lines) {
++    --cursor;
++    if (data[cursor] == '\n') {
++      ++count;
++      if (count > max_lines) {
++        ++cursor;
++        break;
++      }
++    }
++  }
++  return data.substr(cursor);
++}
++
++int ActiveThreadCount() {
++  return std::popcount(g_used_mask.load(std::memory_order_relaxed));
++}
++
++std::string ReportDir() {
++  const std::string log_file = REXCVAR_GET(log_file);
++  if (!log_file.empty()) {
++    std::filesystem::path parent = std::filesystem::path(log_file).parent_path();
++    if (!parent.empty()) return parent.string();
++  }
++  std::error_code error;
++  return rex::filesystem::GetExecutableFolder().string();
++}
++
++void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
++  const uint64_t last_vdswap_ns = g_last_vdswap_ns.load(std::memory_order_acquire);
++  CaptureAllThreads();
++
++  char stamp[32] = {};
++  const std::time_t t = std::time(nullptr);
++  std::tm local{};
++#if defined(_WIN32)
++  localtime_s(&local, &t);
++#else
++  localtime_r(&t, &local);
++#endif
++  std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
++
++  const std::string dir = ReportDir();
++  const std::string path = dir + "/wwe2k14-freeze-" + stamp + ".txt";
++  FILE* file = std::fopen(path.c_str(), "wb");
++  if (!file) {
++    REXLOG_WARN("[freeze-logger] freeze detected but cannot write {}", path);
++    return;
++  }
++  const double gap_s = double(now_ns - last_present_ns) / 1e9;
++  const double vdswap_gap_s =
++      last_vdswap_ns ? double(now_ns - last_vdswap_ns) / 1e9 : -1.0;
++  std::fprintf(file, "WWE 2K14 freeze report\n");
++  std::fprintf(file, "generated: %s  uptime_s=%.1f\n", stamp, double(now_ns - g_start_ns) / 1e9);
++  std::fprintf(file, "trigger: no frame presented for %.1f s (threshold %d s)\n", gap_s,
++               kFreezeGapSeconds);
++  std::fprintf(file, "present: total=%llu last=%.1f s ago\n",
++               (unsigned long long)g_present_count.load(std::memory_order_relaxed), gap_s);
++  std::fprintf(file, "vdswap: total=%llu last=%.1f s ago\n",
++               (unsigned long long)g_vdswap_count.load(std::memory_order_relaxed), vdswap_gap_s);
++  std::fprintf(file, "sync_events_recorded=%llu\n",
++               (unsigned long long)g_event_count.load(std::memory_order_relaxed));
++
++  std::fprintf(file, "\n=== guest threads (%d slots) ===\n", kMaxThreads);
++  for (int i = 0; i < kMaxThreads; ++i) {
++    ThreadSlot& slot = g_slots[i];
++    if (!slot.active.load(std::memory_order_acquire)) continue;
++    const uint32_t host_tid = slot.host_tid.load(std::memory_order_relaxed);
++    const uint32_t guest_id = slot.guest_id.load(std::memory_order_relaxed);
++    const uint64_t wait_since = slot.wait_since_ns.load(std::memory_order_acquire);
++    std::fprintf(file, "slot=%d name=%s guest_id=%u host_tid=%u host_state=%s\n", i, slot.name,
++                 guest_id, host_tid, ReadHostState(host_tid).c_str());
++    if (wait_since != 0) {
++      char wait_name[sizeof(slot.wait_name) + 1] = {};
++      std::memcpy(wait_name, slot.wait_name, sizeof(slot.wait_name));
++      std::fprintf(file, "  waiting_on: handle=0x%08X type=%s name=\"%s\" for %.1f s guest_lr=0x%llX\n",
++                   slot.wait_handle.load(std::memory_order_relaxed),
++                   ObjectTypeName(slot.wait_object_type.load(std::memory_order_relaxed)), wait_name,
++                   double(now_ns - wait_since) / 1e9,
++                   (unsigned long long)slot.wait_lr.load(std::memory_order_relaxed));
++    } else {
++      std::fprintf(file, "  waiting_on: (not blocked in a kernel wait)\n");
++    }
++    const uint32_t depth = std::min<uint32_t>(slot.cap_depth.load(std::memory_order_acquire),
++                                              kMaxCaptureDepth);
++    if (depth > 0) {
++      std::fprintf(file, "  capture: host_pc_count=%u (symbolize with the shipped binary)\n", depth);
++      for (uint32_t d = 0; d < depth; ++d) {
++        std::fprintf(file, "    pc[%u]=0x%llx\n", d,
++                     (unsigned long long)slot.cap_pc[d].load(std::memory_order_relaxed));
++      }
++    } else {
++      std::fprintf(file, "  capture: none (thread blocked and did not run)\n");
++    }
++  }
++
++  const uint64_t write = g_ring_write.load(std::memory_order_acquire);
++  const uint64_t begin = write > kRingSize ? write - kRingSize : 0;
++  std::fprintf(file, "\n=== sync ring (oldest..newest; %llu total) ===\n",
++               (unsigned long long)write);
++  std::fprintf(file, "%s\n", "seq kind host_tid guest_id t_ms handle type name");
++  static const char* kKindNames[] = {
++      "unknown", "create", "set", "reset", "pulse", "sem-release",
++      "wait-begin", "wait-end", "thread-create", "thread-exit",
++  };
++  for (uint64_t seq = begin; seq < write; ++seq) {
++    RingSlot& entry = g_ring[seq % kRingSize];
++    if (entry.seq.load(std::memory_order_acquire) != seq * 2 + 2) continue;
++    const SyncRecord& rec = entry.rec;
++    const char* kind = rec.kind < sizeof(kKindNames) / sizeof(kKindNames[0])
++                           ? kKindNames[rec.kind]
++                           : "?";
++    std::fprintf(file, "%llu %s %u %u %.1f 0x%08X %s %s\n", (unsigned long long)seq, kind,
++                 rec.host_tid, rec.guest_id, double(rec.t_ns) / 1e6, rec.handle,
++                 ObjectTypeName(rec.object_type), rec.name);
++  }
++
++  const std::string log_path = REXCVAR_GET(log_file);
++  std::fprintf(file, "\n=== last 200 game log lines (%s) ===\n",
++               log_path.empty() ? "(no --log_file)" : log_path.c_str());
++  if (!log_path.empty()) {
++    const std::string tail = ReadTailLines(log_path, 200);
++    std::fwrite(tail.data(), 1, tail.size(), file);
++  }
++  std::fclose(file);
++
++  REXLOG_WARN(
++      "[freeze-logger] no frame presented for {:.1f} s; wrote freeze report {} ({} threads, {} ring "
++      "events)",
++      gap_s, path, ActiveThreadCount(),
++      (unsigned long long)g_event_count.load(std::memory_order_relaxed));
++  REXLOG_WARN("[freeze-logger] report path: {}", path);
++}
++
++}  // namespace
++
++uint64_t RecordedEventCount() { return g_event_count.load(std::memory_order_relaxed); }
++
++bool IsEnabled() { return g_enabled.load(std::memory_order_relaxed); }
++
++void RecordPresent() {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  g_last_present_ns.store(NowNs(), std::memory_order_release);
++  g_present_count.fetch_add(1, std::memory_order_relaxed);
++  g_last_present_host_tid.store(rex::thread::current_thread_system_id(),
++                                std::memory_order_relaxed);
++  g_reported.store(false, std::memory_order_release);
++}
++
++bool TestBlockVdSwapOnce() {
++  static const bool armed = [] {
++    const char* value = std::getenv("WWE2K14_FREEZE_TEST_BLOCK");
++    return value != nullptr && *value != '\0';
++  }();
++  if (!armed) return false;
++  static const uint64_t delay_ns = [] {
++    const char* value = std::getenv("WWE2K14_FREEZE_TEST_BLOCK");
++    char* end = nullptr;
++    const long seconds = std::strtol(value, &end, 10);
++    if (end == value || *end != '\0' || seconds <= 0) return uint64_t(60) * 1000000000ull;
++    return uint64_t(seconds) * 1000000000ull;
++  }();
++  static std::atomic<bool> triggered{false};
++  if (triggered.load(std::memory_order_acquire)) return false;
++  if (NowNs() - g_start_ns < delay_ns) return false;
++  bool expected = false;
++  if (!triggered.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) return false;
++  RecordWaitBegin(0, 2 /* Event */, "wwe2k14-freeze-test", 0);
++  REXLOG_WARN(
++      "[freeze-logger] positive control: blocking guest VdSwap thread tid={} on "
++      "wwe2k14-freeze-test",
++      rex::thread::current_thread_system_id());
++  return true;
++}
++
++void RecordVdSwap() {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  if (TestBlockVdSwapOnce()) {
++    for (;;) std::this_thread::sleep_for(std::chrono::seconds(1));
++  }
++  g_last_vdswap_ns.store(NowNs(), std::memory_order_release);
++  g_vdswap_count.fetch_add(1, std::memory_order_relaxed);
++}
++
++void RecordSyncEvent(SyncType type, uint32_t handle, uint32_t object_type, const char* name) {
++  PushEvent(type, handle, object_type, name);
++}
++
++void RecordWaitBegin(uint32_t handle, uint32_t object_type, const char* name, uint64_t guest_lr) {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  ThreadSlot* slot = t_slot;
++  if (slot) {
++    slot->wait_handle.store(handle, std::memory_order_relaxed);
++    slot->wait_object_type.store(object_type, std::memory_order_relaxed);
++    slot->wait_lr.store(guest_lr, std::memory_order_relaxed);
++    if (name && *name) {
++      std::strncpy(slot->wait_name, name, sizeof(slot->wait_name) - 1);
++    } else {
++      slot->wait_name[0] = '\0';
++    }
++    slot->wait_since_ns.store(NowNs(), std::memory_order_release);
++  }
++  PushEvent(SyncType::kWaitBegin, handle, object_type, name);
++}
++
++void RecordWaitEnd(uint32_t handle) {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  ThreadSlot* slot = t_slot;
++  if (slot) slot->wait_since_ns.store(0, std::memory_order_release);
++  PushEvent(SyncType::kWaitEnd, handle, 0, nullptr);
++}
++
++void RegisterThread(uint32_t guest_thread_id, const char* name) {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  int index = -1;
++  uint64_t mask = g_used_mask.load(std::memory_order_relaxed);
++  for (;;) {
++    if (mask == ~uint64_t(0)) break;
++    int candidate = 0;
++    while (candidate < kMaxThreads && (mask & (uint64_t(1) << candidate))) ++candidate;
++    if (candidate >= kMaxThreads) break;
++    if (g_used_mask.compare_exchange_weak(mask, mask | (uint64_t(1) << candidate),
++                                          std::memory_order_acq_rel)) {
++      index = candidate;
++      break;
++    }
++  }
++  if (index < 0) return;
++  ThreadSlot& slot = g_slots[index];
++  slot.guest_id.store(guest_thread_id, std::memory_order_relaxed);
++  slot.host_tid.store(rex::thread::current_thread_system_id(), std::memory_order_relaxed);
++  slot.wait_since_ns.store(0, std::memory_order_relaxed);
++  slot.cap_depth.store(0, std::memory_order_relaxed);
++  std::memset(slot.name, 0, sizeof(slot.name));
++  if (name && *name) std::strncpy(slot.name, name, sizeof(slot.name) - 1);
++  slot.active.store(true, std::memory_order_release);
++  t_slot = &slot;
++  RecordSyncEvent(SyncType::kThreadCreate, 0, 0, name);
++}
++
++void UnregisterThread() {
++  ThreadSlot* slot = t_slot;
++  t_slot = nullptr;
++  if (!slot) return;
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  RecordSyncEvent(SyncType::kThreadExit, 0, 0, slot->name);
++  slot->wait_since_ns.store(0, std::memory_order_relaxed);
++  slot->active.store(false, std::memory_order_release);
++  const int index = static_cast<int>(slot - g_slots);
++  if (index >= 0 && index < kMaxThreads) {
++    g_used_mask.fetch_and(~(uint64_t(1) << index), std::memory_order_acq_rel);
++  }
++}
++
++namespace {
++
++void Watchdog() {
++  while (g_running.load(std::memory_order_acquire)) {
++    std::this_thread::sleep_for(std::chrono::seconds(1));
++    if (!g_running.load(std::memory_order_acquire)) break;
++    const uint64_t last_present = g_last_present_ns.load(std::memory_order_acquire);
++    if (last_present == 0) continue;
++    const uint64_t now = NowNs();
++    if (now - last_present < uint64_t(kFreezeGapSeconds) * 1000000000ull) continue;
++    bool expected = false;
++    if (!g_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) continue;
++    GenerateReport(now, last_present);
++  }
++}
++
++}  // namespace
++
++void Start() {
++  std::lock_guard<std::mutex> lock(g_lifecycle);
++  if (g_started.load(std::memory_order_acquire)) return;
++  g_started.store(true, std::memory_order_release);
++  const char* disable = std::getenv("WWE2K14_FREEZE_LOG");
++  const char* disable_generic = std::getenv("REX_FREEZE_LOG_DISABLE");
++  const bool disabled = (disable && std::strcmp(disable, "0") == 0) ||
++                        (disable_generic && std::strcmp(disable_generic, "1") == 0);
++  if (disabled) {
++    REXLOG_INFO("[freeze-logger] disabled by environment");
++    return;
++  }
++  g_start_ns = NowNs();
++  g_enabled.store(true, std::memory_order_release);
++  InstallCaptureHandler();
++  g_running.store(true, std::memory_order_release);
++  g_watchdog = std::thread(Watchdog);
++  std::atexit([] { Stop(); });
++  REXLOG_INFO("[freeze-logger] enabled: present-gap={} s report_dir={}", kFreezeGapSeconds,
++              ReportDir());
++  if (const char* bench = std::getenv("REX_FREEZE_LOG_BENCH"); bench && std::strcmp(bench, "1") == 0) {
++    constexpr int kIterations = 1000000;
++    const uint64_t begin = NowNs();
++    for (int i = 0; i < kIterations; ++i) {
++      RecordSyncEvent(SyncType::kEventSet, 0xF8000000u, 2, "bench");
++    }
++    const uint64_t elapsed = NowNs() - begin;
++    REXLOG_INFO("[freeze-logger] bench: {} pushes in {} ns = {:.1f} ns/push", kIterations,
++                (unsigned long long)elapsed, double(elapsed) / kIterations);
++  }
++}
++
++void Stop() {
++  std::lock_guard<std::mutex> lock(g_lifecycle);
++  if (!g_running.exchange(false)) return;
++  if (g_watchdog.joinable()) g_watchdog.join();
++}
++
++}  // namespace rex::diagnostics::freeze_logger
+diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
+index 09e1334..07dfff3 100644
+--- a/src/core/rate_census.cpp
++++ b/src/core/rate_census.cpp
+@@ -3,6 +3,7 @@
+  * @brief       Optional per-second runtime rate census.
+  */
+ 
++#include <rex/diagnostics/freeze_logger.h>
+ #include <rex/diagnostics/rate_census.h>
+ 
+ #include <algorithm>
+@@ -947,11 +948,17 @@ void RecordVblank() { g_rate_census.RecordVblank(); }
+ 
+ void RecordInterrupt(uint32_t source) { g_rate_census.RecordInterrupt(source); }
+ 
+-void RecordVdSwap() { g_rate_census.RecordVdSwap(); }
++void RecordVdSwap() {
++  freeze_logger::RecordVdSwap();
++  g_rate_census.RecordVdSwap();
++}
+ 
+ void RecordPresentInterval(uint32_t interval) { g_rate_census.RecordPresentInterval(interval); }
+ 
+-void RecordPresent() { g_rate_census.RecordPresent(); }
++void RecordPresent() {
++  freeze_logger::RecordPresent();
++  g_rate_census.RecordPresent();
++}
+ 
+ void RecordGpuBusyStart() { g_rate_census.RecordGpuBusyStart(); }
+ 
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 5397189..375c641 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -14,11 +14,14 @@
+ 
+ #include <algorithm>
+ #include <atomic>
++#include <cstdlib>
++#include <cstring>
+ #include <memory>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/dbg.h>
++#include <rex/diagnostics/freeze_logger.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/kernel/xboxkrnl/threading.h>
+ #include <rex/logging.h>
+@@ -41,6 +44,31 @@
+ namespace rex::kernel::xboxkrnl {
+ using namespace rex::system;
+ using rex::runtime::current_ppc_context;
++namespace freeze_logger = rex::diagnostics::freeze_logger;
++
++// Opt-in kernel event trace (WWE13_EVT_TRACE=1). Off by default: used to
++// capture the set/clear/wait order of the Havok-cloth handshake events
++// (StartCloth/EndCloth) and any other named event during an entrance hang.
++// Evidence method from the R4 cloth-race fix (docs/BUGHUNT-2K14.md).
++namespace {
++bool EvtTraceEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("WWE13_EVT_TRACE");
++    return value != nullptr && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++}  // namespace
++
++namespace {
++// Guest link register of the calling guest thread; 0 on host threads without a
++// bound ThreadState. The recompiled runtime keeps no guest PC, so the caller
++// address at a kernel wait is the best available "where is it blocked".
++uint64_t GuestLr() {
++  auto* state = rex::runtime::ThreadState::Get();
++  return state ? uint64_t(state->context()->lr) : 0;
++}
++}  // namespace
+ 
+ // r13 + 0x100: pointer to thread local state
+ // Thread local state:
+@@ -530,6 +558,12 @@ ppc_u32_result_t NtCreateEvent_entry(ppc_pu32_t handle_ptr,
+   if (handle_ptr) {
+     *handle_ptr = ev->handle();
+   }
++  freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventCreate, ev->handle(),
++                                 (uint32_t)ev->type(), ev->name().c_str());
++  if (EvtTraceEnabled()) {
++    REXLOG_INFO("[evt2k14] create handle=0x{:08X} name={} type={} initial={}", ev->handle(),
++                ev->name(), (uint32_t)event_type, (uint32_t)initial_state);
++  }
+   return X_STATUS_SUCCESS;
+ }
+ 
+@@ -538,6 +572,11 @@ uint32_t xeNtSetEvent(uint32_t handle, rex::be<uint32_t>* previous_state_ptr) {
+ 
+   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
+   if (ev) {
++    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventSet, handle,
++                                   (uint32_t)ev->type(), ev->name().c_str());
++    if (EvtTraceEnabled()) {
++      REXLOG_INFO("[evt2k14] set handle=0x{:08X} name={}", handle, ev->name());
++    }
+     int32_t was_signalled = ev->Set(0, false);
+     if (previous_state_ptr) {
+       *previous_state_ptr = static_cast<uint32_t>(was_signalled);
+@@ -558,6 +597,8 @@ ppc_u32_result_t NtPulseEvent_entry(ppc_u32_t handle, ppc_pu32_t previous_state_
+ 
+   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
+   if (ev) {
++    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventPulse, handle,
++                                   (uint32_t)ev->type(), ev->name().c_str());
+     int32_t was_signalled = ev->Pulse(0, false);
+     if (previous_state_ptr) {
+       *previous_state_ptr = static_cast<uint32_t>(was_signalled);
+@@ -574,6 +615,11 @@ uint32_t xeNtClearEvent(uint32_t handle) {
+ 
+   auto ev = REX_KERNEL_OBJECTS()->LookupObject<XEvent>(handle);
+   if (ev) {
++    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventReset, handle,
++                                   (uint32_t)ev->type(), ev->name().c_str());
++    if (EvtTraceEnabled()) {
++      REXLOG_INFO("[evt2k14] clear handle=0x{:08X} name={}", handle, ev->name());
++    }
+     ev->Reset();
+   } else {
+     result = X_STATUS_INVALID_HANDLE;
+@@ -669,6 +715,8 @@ ppc_u32_result_t NtReleaseSemaphore_entry(ppc_u32_t sem_handle, ppc_u32_t releas
+ 
+   auto sem = REX_KERNEL_OBJECTS()->LookupObject<XSemaphore>(sem_handle);
+   if (sem) {
++    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kSemaphoreRelease, sem_handle,
++                                   (uint32_t)sem->type(), sem->name().c_str());
+     bool success = sem->ReleaseSemaphore(static_cast<int32_t>(release_count), &previous_count);
+     if (!success) {
+       result = X_STATUS_SEMAPHORE_LIMIT_EXCEEDED;
+@@ -840,7 +888,10 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+     return X_STATUS_ABANDONED_WAIT_0;
+   }
+ 
++  freeze_logger::RecordWaitBegin(object->handle(), (uint32_t)object->type(),
++                                 object->name().c_str(), GuestLr());
+   X_STATUS result = object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
++  freeze_logger::RecordWaitEnd(object->handle());
+ 
+   if (alertable && result == X_STATUS_USER_APC) {
+     XThread::GetCurrentThread()->DeliverAPCs();
+@@ -871,7 +922,18 @@ ppc_u32_result_t NtWaitForSingleObjectEx_entry(ppc_u32_t object_handle, ppc_u32_
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+   if (object) {
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++    freeze_logger::RecordWaitBegin((uint32_t)object_handle, (uint32_t)object->type(),
++                                   object->name().c_str(), GuestLr());
++    if (EvtTraceEnabled()) {
++      REXLOG_INFO("[evt2k14] wait-begin handle=0x{:08X} name={} timeout={}", (uint32_t)object_handle,
++                  object->name(), timeout_ptr ? (int64_t)timeout : -1);
++    }
+     result = object->Wait(3, wait_mode, alertable, timeout_ptr ? &timeout : nullptr);
++    freeze_logger::RecordWaitEnd((uint32_t)object_handle);
++    if (EvtTraceEnabled()) {
++      REXLOG_INFO("[evt2k14] wait-end handle=0x{:08X} name={} result=0x{:08X}",
++                  (uint32_t)object_handle, object->name(), (uint32_t)result);
++    }
+     if (alertable && result == X_STATUS_USER_APC) {
+       XThread::GetCurrentThread()->DeliverAPCs();
+     }
+@@ -901,9 +963,14 @@ ppc_u32_result_t KeWaitForMultipleObjects_entry(ppc_u32_t count, ppc_pu32_t obje
+   }
+ 
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++  const uint32_t first_handle = objects.empty() ? 0 : objects[0]->handle();
++  freeze_logger::RecordWaitBegin(first_handle,
++                                 objects.empty() ? 0 : (uint32_t)objects[0]->type(),
++                                 objects.empty() ? "" : objects[0]->name().c_str(), GuestLr());
+   X_STATUS result = XObject::WaitMultiple(
+       uint32_t(objects.size()), reinterpret_cast<XObject**>(objects.data()), wait_type, wait_reason,
+       processor_mode, alertable, timeout_ptr ? &timeout : nullptr);
++  freeze_logger::RecordWaitEnd(first_handle);
+   if (alertable && result == X_STATUS_USER_APC) {
+     XThread::GetCurrentThread()->DeliverAPCs();
+   }
+@@ -925,8 +992,13 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+     objects.push_back(std::move(object));
+   }
+ 
++  const uint32_t first_handle = objects.empty() ? 0 : objects[0]->handle();
++  freeze_logger::RecordWaitBegin(first_handle,
++                                 objects.empty() ? 0 : (uint32_t)objects[0]->type(),
++                                 objects.empty() ? "" : objects[0]->name().c_str(), GuestLr());
+   auto result = XObject::WaitMultiple(count, reinterpret_cast<XObject**>(objects.data()), wait_type,
+                                       6, wait_mode, alertable, timeout_ptr);
++  freeze_logger::RecordWaitEnd(first_handle);
+   if (alertable && result == X_STATUS_USER_APC) {
+     XThread::GetCurrentThread()->DeliverAPCs();
+   }
+@@ -950,8 +1022,14 @@ ppc_u32_result_t NtSignalAndWaitForSingleObjectEx_entry(ppc_u32_t signal_handle,
+   auto wait_object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(wait_handle);
+   if (signal_object && wait_object) {
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++    freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventSet, signal_handle,
++                                   (uint32_t)signal_object->type(),
++                                   signal_object->name().c_str());
++    freeze_logger::RecordWaitBegin(wait_handle, (uint32_t)wait_object->type(),
++                                   wait_object->name().c_str(), GuestLr());
+     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
+                                     timeout_ptr ? &timeout : nullptr);
++    freeze_logger::RecordWaitEnd(wait_handle);
+   } else {
+     result = X_STATUS_INVALID_HANDLE;
+   }
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 489f57f..f648300 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -18,6 +18,7 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
+ #include <rex/dbg.h>
++#include <rex/diagnostics/freeze_logger.h>
+ #include <rex/perf/counter.h>
+ #include <rex/literals.h>
+ #include <rex/logging.h>
+@@ -427,6 +428,9 @@ X_STATUS XThread::Create() {
+     // Set name immediately, if we have one.
+     thread_->set_name(thread_name_);
+ 
++    rex::diagnostics::freeze_logger::RegisterThread(
++        thread_id_, thread_name_.empty() ? "XThread" : thread_name_.c_str());
++
+     PROFILE_THREAD_ENTER(thread_name_.c_str());
+     PROFILE_THREAD_CREATED();
+ 
+@@ -440,6 +444,8 @@ X_STATUS XThread::Create() {
+     PROFILE_THREAD_EXITED();
+     PROFILE_THREAD_EXIT();
+ 
++    rex::diagnostics::freeze_logger::UnregisterThread();
++
+     // Release the self-reference to the thread.
+     ReleaseHandle();
+   });
+-- 
+2.43.0
+

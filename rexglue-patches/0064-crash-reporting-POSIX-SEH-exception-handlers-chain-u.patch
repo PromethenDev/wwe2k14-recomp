@@ -1,0 +1,233 @@
+From db4553c88fea937e9315e526cd4ffe17474a8758 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 28 Sep 2026 18:56:04 -0700
+Subject: [PATCH 64/97] crash reporting: POSIX SEH/exception handlers chain
+ unhandled faults to the previously installed handler (game crash note was
+ buried); Windows flushes logging on exit; selected-GPU log line carries
+ driver version
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/core/exception_handler_posix.cpp | 33 +++++++++++
+ src/core/seh_posix.cpp               | 85 ++++++++++++++++++++++++----
+ src/ui/vulkan/vulkan_provider.cpp    |  6 +-
+ src/ui/windowed_app_main_win.cpp     |  6 +-
+ 4 files changed, 117 insertions(+), 13 deletions(-)
+
+diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
+index 8aced51..d254dd4 100644
+--- a/src/core/exception_handler_posix.cpp
++++ b/src/core/exception_handler_posix.cpp
+@@ -14,6 +14,7 @@
+ #if REX_PLATFORM_LINUX || REX_PLATFORM_MAC
+ 
+ #include <signal.h>
++#include <unistd.h>
+ 
+ #include <cstdint>
+ #include <cstring>
+@@ -40,6 +41,36 @@ constexpr size_t kMaxHandlerCount = 8;
+ // Executed in order.
+ std::pair<ExceptionHandler::Handler, void*> handlers_[kMaxHandlerCount];
+ 
++// ReXGlue uses SIGILL/SIGSEGV for recoverable MMIO callbacks. Preserve the
++// signal action that was installed before that mechanism and pass unhandled
++// faults to it instead of returning to the same faulting instruction forever.
++static void ChainUnhandledSignal(int signal_number, siginfo_t* signal_info,
++                                 void* signal_context) {
++  const struct sigaction* original = nullptr;
++  if (signal_number == SIGILL) {
++    original = &original_sigill_handler_;
++  } else if (signal_number == SIGSEGV) {
++    original = &original_sigsegv_handler_;
++  }
++  if (!original || original->sa_handler == SIG_IGN) {
++    return;
++  }
++  if (original->sa_handler == SIG_DFL) {
++    sigaction(signal_number, original, nullptr);
++    sigset_t unblocked;
++    sigemptyset(&unblocked);
++    sigaddset(&unblocked, signal_number);
++    sigprocmask(SIG_UNBLOCK, &unblocked, nullptr);
++    raise(signal_number);
++    _exit(128 + signal_number);
++  }
++  if (original->sa_flags & SA_SIGINFO) {
++    original->sa_sigaction(signal_number, signal_info, signal_context);
++  } else {
++    original->sa_handler(signal_number);
++  }
++}
++
+ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+                                      void* signal_context) {
+   mcontext_t& mcontext = reinterpret_cast<ucontext_t*>(signal_context)->uc_mcontext;
+@@ -205,6 +236,8 @@ static void ExceptionHandlerCallback(int signal_number, siginfo_t* signal_info,
+       return;
+     }
+   }
++
++  ChainUnhandledSignal(signal_number, signal_info, signal_context);
+ }
+ 
+ void ExceptionHandler::Install(Handler fn, void* data) {
+diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
+index ea3ddcc..6971ec7 100644
+--- a/src/core/seh_posix.cpp
++++ b/src/core/seh_posix.cpp
+@@ -12,7 +12,10 @@
+ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only");
+ 
+ #include <signal.h>
+-#include <cstdlib>  // std::abort()
++#include <unistd.h>
++
++#include <cstdlib>   // std::abort()
++#include <cstring>   // std::memset()
+ 
+ #include <rex/ppc/exceptions.h>
+ 
+@@ -21,6 +24,67 @@ namespace rex::ppc::detail {
+ static thread_local SehThreadState tls_seh_state;
+ static thread_local bool tls_seh_active = false;
+ 
++// The signal actions that were installed before the PPC SEH layer claimed
++// SIGSEGV/SIGBUS/SIGFPE/SIGILL. A fault that the PPC SEH layer declines (we
++// are not inside SEH-protected guest code) must reach the handler that owned
++// the signal before, for example an application crash reporter. Without this
++// the handler installed by seh_initialize() buries any earlier handler and
++// fatal, unhandled faults terminate silently via SIG_DFL.
++static struct sigaction g_previous_sigsegv_action;
++static struct sigaction g_previous_sigbus_action;
++static struct sigaction g_previous_sigfpe_action;
++static struct sigaction g_previous_sigill_action;
++
++static const struct sigaction* PreviousActionForSignal(int sig) {
++  switch (sig) {
++    case SIGSEGV:
++      return &g_previous_sigsegv_action;
++    case SIGBUS:
++      return &g_previous_sigbus_action;
++    case SIGFPE:
++      return &g_previous_sigfpe_action;
++    case SIGILL:
++      return &g_previous_sigill_action;
++    default:
++      return nullptr;
++  }
++}
++
++// Terminate with the default disposition for the signal. Used both when there
++// is no previous handler to chain to and when the chained handler returns
++// without resolving the fault (returning from a fatal signal handler would
++// re-execute the faulting instruction forever).
++[[noreturn]] static void TerminateWithDefaultDisposition(int sig) {
++  struct sigaction action;
++  std::memset(&action, 0, sizeof(action));
++  action.sa_handler = SIG_DFL;
++  sigemptyset(&action.sa_mask);
++  sigaction(sig, &action, nullptr);
++  sigset_t unblocked;
++  sigemptyset(&unblocked);
++  sigaddset(&unblocked, sig);
++  sigprocmask(SIG_UNBLOCK, &unblocked, nullptr);
++  raise(sig);
++  _exit(128 + sig);
++}
++
++[[noreturn]] static void ChainToPreviousHandler(int sig, siginfo_t* info, void* context) {
++  const struct sigaction* previous = PreviousActionForSignal(sig);
++  if (previous) {
++    if (previous->sa_handler == SIG_IGN || previous->sa_handler == SIG_DFL) {
++      // No earlier handler: keep the default fatal behaviour.
++      TerminateWithDefaultDisposition(sig);
++    }
++    if (previous->sa_flags & SA_SIGINFO) {
++      previous->sa_sigaction(sig, info, context);
++    } else {
++      previous->sa_handler(sig);
++    }
++  }
++  // The previous handler returned without resolving the fault.
++  TerminateWithDefaultDisposition(sig);
++}
++
+ SehThreadState& seh_thread_state() {
+   return tls_seh_state;
+ }
+@@ -31,13 +95,13 @@ int seh_filter(uint32_t /*code*/, void* /*ep*/) {
+ }
+ 
+ /// Signal handler for SIGSEGV/SIGBUS/SIGFPE/SIGILL
+-static void signal_handler(int sig, siginfo_t* info, void* /*ucontext*/) {
++static void signal_handler(int sig, siginfo_t* info, void* context) {
+   // Only handle if we're in SEH-protected code
+   if (!tls_seh_active) {
+-    // Not in SEH region - restore default handler and re-raise
+-    signal(sig, SIG_DFL);
+-    raise(sig);
+-    return;
++    // Not in SEH region - pass the fault to the handler that owned the signal
++    // before this layer (e.g. an application crash reporter), or terminate
++    // with the default disposition if there was none.
++    ChainToPreviousHandler(sig, info, context);
+   }
+ 
+   // Determine exception code based on signal
+@@ -110,10 +174,11 @@ void seh_initialize() {
+   sigemptyset(&sa.sa_mask);
+   sa.sa_flags = SA_SIGINFO | SA_NODEFER;  // SA_NODEFER allows re-entry for nested exceptions
+ 
+-  sigaction(SIGSEGV, &sa, nullptr);
+-  sigaction(SIGBUS, &sa, nullptr);
+-  sigaction(SIGFPE, &sa, nullptr);
+-  sigaction(SIGILL, &sa, nullptr);
++  // Save the actions being replaced so declined faults can be chained to them.
++  sigaction(SIGSEGV, &sa, &g_previous_sigsegv_action);
++  sigaction(SIGBUS, &sa, &g_previous_sigbus_action);
++  sigaction(SIGFPE, &sa, &g_previous_sigfpe_action);
++  sigaction(SIGILL, &sa, &g_previous_sigill_action);
+ }
+ 
+ bool& seh_active() {
+diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
+index 423e100..27df325 100644
+--- a/src/ui/vulkan/vulkan_provider.cpp
++++ b/src/ui/vulkan/vulkan_provider.cpp
+@@ -256,10 +256,12 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
+   VkPhysicalDeviceProperties selected_properties = {};
+   ifn.vkGetPhysicalDeviceProperties(provider->vulkan_device_->physical_device(),
+                                     &selected_properties);
+-  REXLOG_INFO("Selected Vulkan physical device: {} (type: {}, id: {:04X}:{:04X})",
++  REXLOG_INFO("[wwe13-profile:gpu] Selected Vulkan physical device: {} (type: {}, "
++              "id: {:04X}:{:04X}, driver version: 0x{:X})",
+               selected_properties.deviceName,
+               PhysicalDeviceTypeName(selected_properties.deviceType),
+-              selected_properties.vendorID, selected_properties.deviceID);
++              selected_properties.vendorID, selected_properties.deviceID,
++              selected_properties.driverVersion);
+ 
+   if (with_presentation) {
+     provider->ui_samplers_ = UISamplers::Create(provider->vulkan_device_.get());
+diff --git a/src/ui/windowed_app_main_win.cpp b/src/ui/windowed_app_main_win.cpp
+index 3f223c4..1005821 100644
+--- a/src/ui/windowed_app_main_win.cpp
++++ b/src/ui/windowed_app_main_win.cpp
+@@ -114,8 +114,12 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman
+     app->InvokeOnDestroy();
+   }
+ 
++  // Flush all categories after app/context destruction, matching the POSIX
++  // entrypoint so the final release log is complete on normal exit.
++  rex::ShutdownLogging();
++
+   // TODO: Port ShutdownWin32App from Xenia
+-  // Logging may still be needed in the destructors.
++  // Logging has been flushed and shut down after app destruction.
+   // rex::ShutdownWin32App();
+ 
+   CoUninitialize();
+-- 
+2.43.0
+

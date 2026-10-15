@@ -1,0 +1,319 @@
+From d289f5be3832c861a53ce944bf2543b40d4d947c Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 17:32:48 -0700
+Subject: [PATCH 47/97] graphics: display pacing statistics; opt-in guest
+ vblank on the host display vblank
+
+display_pacing_stats (Windows): a thread waits on the host display's vblanks (DXGI output of the window's
+monitor) and logs per second how many new guest frames were presented before each one: 0 = the display
+repeated a frame, 1 = even, 2+ = a frame was replaced before it was shown. A steady 60 flips/s does not show
+this. The presenter counts successful presents and logs the Vulkan present mode it selected.
+
+vsync_host_display (default off, experiment): guest vblanks fire on the host display's vblanks (every Nth at
+N x 60 Hz) instead of the free-running timer, to stop phase drift between guest presents and the panel's
+refresh. Falls back to the timer for non-multiple rates, failed or implausibly fast waits, and waits longer than
+four periods (then for 5 s). Escalation review (GPT-6 Sol): unproven on a hybrid iGPU-display laptop, so opt-in
+and judged by the pacing statistics.
+
+Wine gates PASS (normal; keep-60 with the experiment on - no DXGI display under Wine, timer fallback).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/graphics_system.h |   7 ++
+ include/rex/ui/presenter.h             |  10 ++
+ src/graphics/graphics_system.cpp       | 125 +++++++++++++++++++++++++
+ src/ui/presenter.cpp                   |  36 +++++++
+ src/ui/vulkan/vulkan_presenter.cpp     |  11 +++
+ 5 files changed, 189 insertions(+)
+
+diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
+index e407a0d..526bfc7 100644
+--- a/include/rex/graphics/graphics_system.h
++++ b/include/rex/graphics/graphics_system.h
+@@ -119,6 +119,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
+   std::atomic<bool> vsync_worker_running_;
+   system::object_ref<system::XHostThread> vsync_worker_thread_;
+ 
++  // display_pacing_stats (Windows): per host display vblank, how many new guest frames were presented since the
++  // previous one (0 = the display repeated a frame, 1 = even, 2+ = a frame was replaced before it was shown).
++  void DisplayPacingThread();
++  std::atomic<bool> display_pacing_running_{false};
++  std::thread display_pacing_thread_;
++  std::atomic<uint32_t> last_host_refresh_hz_{60};
++
+   RegisterFile register_file_;
+   std::unique_ptr<CommandProcessor> command_processor_;
+ 
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index 8358f29..45f45d5 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -355,7 +355,17 @@ class Presenter {
+   // Requests (re)painting with the UI if there's UI to draw.
+   void RequestUIPaintFromUIThread();
+ 
++  // Host display vertical blank of the monitor the surface is on, for pacing the guest vblank to the real
++  // display (callable from any thread). Windows (DXGI) only; elsewhere, or with no known output, the wait returns
++  // false immediately and the refresh rate is 0.
++  bool WaitForHostDisplayVBlank();
++  uint32_t GetHostDisplayRefreshHz();
++  // Successful host presents of the guest output so far (for display pacing statistics).
++  uint64_t host_present_count() const { return host_present_count_.load(std::memory_order_relaxed); }
++
+  protected:
++  std::atomic<uint64_t> host_present_count_{0};
++
+   enum class PaintResult {
+     kPresented,
+     kPresentedSuboptimal,
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index a0b28df..173495a 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -13,6 +13,8 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <chrono>
++#include <cmath>
+ #include <cstdint>
+ #include <functional>
+ #include <memory>
+@@ -43,6 +45,14 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
+ REXCVAR_DEFINE_BOOL(store_shaders, true, "GPU", "Persist Vulkan shader and pipeline storage")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
++REXCVAR_DEFINE_BOOL(display_pacing_stats, false, "GPU",
++                    "Log per second how many new frames reached each host display vblank (Windows)")
++    .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
++
++REXCVAR_DEFINE_BOOL(vsync_host_display, false, "GPU",
++                    "Fire guest vblanks on the host display's vertical blanks when the display refresh is a "
++                    "multiple of the guest refresh (Windows); otherwise a timer is used");
++
+ namespace {
+ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+     const std::string& effect_name) {
+@@ -149,7 +159,61 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+         uint64_t next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
+         // Avoid replaying missed vblanks after a long stall or suspend.
+         constexpr uint64_t kResyncAfterIntervals = 3;
++        // vsync_host_display: guest vblanks on the host display's vertical blanks (every Nth when the display runs
++        // at N times the guest rate) instead of a free-running timer. A timer drifts against the display, and when
++        // presents land near the display's refresh they alternate between making and missing it (repeated and
++        // skipped frames at a steady 60). Falls back to the timer when the display rate is not a multiple, the wait
++        // fails or returns implausibly fast, or a wait blocks for longer than a few periods.
++        using SteadyClock = std::chrono::steady_clock;
++        const auto guest_period =
++            std::chrono::duration_cast<SteadyClock::duration>(std::chrono::duration<double>(1.0 / refresh_rate_hz));
++        auto host_refresh_check_time = SteadyClock::time_point();
++        auto host_sync_suspended_until = SteadyClock::time_point();
++        auto last_host_vblank_time = SteadyClock::time_point();
++        uint32_t host_divider = 0;
++        uint32_t logged_host_divider = UINT32_MAX;
++        uint64_t host_vblank_index = 0;
+         while (vsync_worker_running_) {
++          if (vsync_enabled && REXCVAR_GET(vsync_host_display) && presenter()) {
++            auto now = SteadyClock::now();
++            if (now >= host_refresh_check_time) {
++              host_refresh_check_time = now + std::chrono::seconds(1);
++              const uint32_t host_hz = presenter()->GetHostDisplayRefreshHz();
++              host_divider = 0;
++              for (uint32_t divider = 1; divider <= 4 && host_hz; ++divider) {
++                if (std::abs(double(host_hz) - refresh_rate_hz * divider) <= 1.5) {
++                  host_divider = divider;
++                  break;
++                }
++              }
++              if (host_divider != logged_host_divider) {
++                logged_host_divider = host_divider;
++                REXGPU_INFO("[host-vsync] display {} Hz: {}", host_hz,
++                            host_divider ? fmt::format("guest vblank on every {} display vblank(s)", host_divider)
++                                         : std::string("not a multiple of the guest rate, timer vblank"));
++              }
++            }
++            if (host_divider && now >= host_sync_suspended_until) {
++              const auto wait_start = SteadyClock::now();
++              const bool waited = presenter()->WaitForHostDisplayVBlank();
++              now = SteadyClock::now();
++              const auto host_period = guest_period / host_divider;
++              if (waited && now - wait_start > host_period * 4) {
++                // Display asleep or the output is stalling: don't hold the guest to it.
++                REXGPU_WARN("[host-vsync] display vblank wait took {} ms, timer vblank for 5 s",
++                            std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_start).count());
++                host_sync_suspended_until = now + std::chrono::seconds(5);
++              } else if (waited && now - last_host_vblank_time >= host_period / 2) {
++                last_host_vblank_time = now;
++                if (++host_vblank_index % host_divider == 0) {
++                  MarkVblank();
++                  // Keep the timer path's phase right after this vblank if it takes over.
++                  next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
++                }
++                continue;
++              }
++            }
++          }
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           const bool current_vsync_enabled = REXCVAR_GET(vsync);
+           if (current_vsync_enabled != vsync_enabled) {
+@@ -183,6 +247,12 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+       }));
+   // TODO: set_can_debugger_suspend not yet ported
+   // vsync_worker_thread_->set_can_debugger_suspend(true);
++#if REX_PLATFORM_WIN32
++  if (REXCVAR_GET(display_pacing_stats) && presenter()) {
++    display_pacing_running_ = true;
++    display_pacing_thread_ = std::thread(&GraphicsSystem::DisplayPacingThread, this);
++  }
++#endif  // REX_PLATFORM_WIN32
+   vsync_worker_thread_->set_name("GPU VSync");
+   vsync_worker_thread_->Create();
+ 
+@@ -202,6 +272,11 @@ void GraphicsSystem::Shutdown() {
+     command_processor_.reset();
+   }
+ 
++  if (display_pacing_thread_.joinable()) {
++    display_pacing_running_ = false;
++    display_pacing_thread_.join();
++  }
++
+   if (vsync_worker_thread_) {
+     vsync_worker_running_ = false;
+     vsync_worker_thread_->Wait(0, 0, 0, nullptr);
+@@ -335,6 +410,56 @@ void GraphicsSystem::DispatchInterruptCallback(uint32_t source, uint32_t cpu) {
+                                          rex::countof(args));
+ }
+ 
++void GraphicsSystem::DisplayPacingThread() {
++  using Clock = std::chrono::steady_clock;
++  auto window_start = Clock::now();
++  auto last_vblank = Clock::time_point();
++  uint64_t last_presents = presenter()->host_present_count();
++  uint64_t vblanks = 0, repeats = 0, singles = 0, multiples = 0, long_gaps = 0;
++  double max_gap_ms = 0.0;
++  while (display_pacing_running_) {
++    if (!presenter()->WaitForHostDisplayVBlank()) {
++      std::this_thread::sleep_for(std::chrono::milliseconds(100));
++      last_vblank = Clock::time_point();
++      continue;
++    }
++    const auto now = Clock::now();
++    const uint64_t presents = presenter()->host_present_count();
++    const uint64_t new_frames = presents - last_presents;
++    last_presents = presents;
++    if (last_vblank != Clock::time_point()) {
++      const double gap_ms = std::chrono::duration<double, std::milli>(now - last_vblank).count();
++      max_gap_ms = std::max(max_gap_ms, gap_ms);
++      // A wake-up more than 1.5 periods after the previous one missed a vblank (this thread was late): its frame
++      // count covers two vblanks, so it is not classified.
++      const uint32_t hz = std::max(1u, last_host_refresh_hz_.load(std::memory_order_relaxed));
++      if (gap_ms > 1500.0 / hz) {
++        ++long_gaps;
++      } else {
++        ++vblanks;
++        if (new_frames == 0) {
++          ++repeats;
++        } else if (new_frames == 1) {
++          ++singles;
++        } else {
++          ++multiples;
++        }
++      }
++    }
++    last_vblank = now;
++    if (now - window_start >= std::chrono::seconds(1)) {
++      last_host_refresh_hz_.store(presenter()->GetHostDisplayRefreshHz(), std::memory_order_relaxed);
++      REXGPU_INFO("[display-pacing] hz={} vblanks={} new0={} new1={} new2p={} late_wakeups={} max_gap_ms={:.2f} "
++                  "presents={}",
++                  last_host_refresh_hz_.load(std::memory_order_relaxed), vblanks, repeats, singles, multiples,
++                  long_gaps, max_gap_ms, presents);
++      vblanks = repeats = singles = multiples = long_gaps = 0;
++      max_gap_ms = 0.0;
++      window_start = now;
++    }
++  }
++}
++
+ void GraphicsSystem::MarkVblank() {
+   diagnostics::rate_census::RecordVblank();
+ 
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index b6dc208..4ee2811 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -1609,6 +1609,42 @@ void Presenter::WaitForUITickFromUIThread() {
+ #endif  // XE_PLATFORM
+ }
+ 
++bool Presenter::WaitForHostDisplayVBlank() {
++#if REX_PLATFORM_WIN32
++  Microsoft::WRL::ComPtr<IDXGIOutput> output;
++  {
++    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
++    output = dxgi_ui_tick_output_;
++  }
++  return output && SUCCEEDED(output->WaitForVBlank());
++#else
++  return false;
++#endif  // XE_PLATFORM
++}
++
++uint32_t Presenter::GetHostDisplayRefreshHz() {
++#if REX_PLATFORM_WIN32
++  Microsoft::WRL::ComPtr<IDXGIOutput> output;
++  {
++    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
++    output = dxgi_ui_tick_output_;
++  }
++  DXGI_OUTPUT_DESC output_desc;
++  if (!output || FAILED(output->GetDesc(&output_desc))) {
++    return 0;
++  }
++  DEVMODEW mode = {};
++  mode.dmSize = sizeof(mode);
++  if (!EnumDisplaySettingsW(output_desc.DeviceName, ENUM_CURRENT_SETTINGS, &mode) ||
++      !(mode.dmFields & DM_DISPLAYFREQUENCY)) {
++    return 0;
++  }
++  return mode.dmDisplayFrequency;
++#else
++  return 0;
++#endif  // XE_PLATFORM
++}
++
+ void Presenter::ForceUIThreadPaintTick() {
+ #if REX_PLATFORM_WIN32
+   std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 30bafba..2fa9642 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -1369,6 +1369,14 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(
+     // Highest latency (but always guaranteed to be available).
+     swapchain_create_info.presentMode = VK_PRESENT_MODE_FIFO_KHR;
+   }
++  REXLOG_INFO("VulkanPresenter: swapchain present mode {} ({}x{}, {} images requested)",
++              swapchain_create_info.presentMode == VK_PRESENT_MODE_IMMEDIATE_KHR  ? "immediate"
++              : swapchain_create_info.presentMode == VK_PRESENT_MODE_MAILBOX_KHR ? "mailbox"
++              : swapchain_create_info.presentMode == VK_PRESENT_MODE_FIFO_RELAXED_KHR
++                  ? "fifo_relaxed"
++                  : "fifo",
++              swapchain_create_info.imageExtent.width, swapchain_create_info.imageExtent.height,
++              swapchain_create_info.minImageCount);
+   swapchain_create_info.clipped = VK_TRUE;
+   swapchain_create_info.oldSwapchain = old_swapchain;
+   VkSwapchainKHR swapchain;
+@@ -2208,6 +2216,9 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
++  if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
++    host_present_count_.fetch_add(1, std::memory_order_relaxed);
++  }
+   switch (present_result) {
+     case VK_SUCCESS:
+       return PaintResult::kPresented;
+-- 
+2.43.0
+

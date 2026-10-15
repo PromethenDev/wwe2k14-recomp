@@ -1,0 +1,55 @@
+From 7a2b7c6912b7c37c21ba5ab9884f5b7386943e19 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 19:06:55 -0700
+Subject: [PATCH 58/97] trace: make a captured frame self-contained (invalidate
+ texture/buffer caches when a trace opens)
+
+F9 traces recorded memory only for textures/buffers (re)loaded during the captured frame; everything uploaded earlier
+stayed valid in the host caches and was never written as MemoryRead, so replays showed characters over a BLACK arena,
+mat and crowd. InitializeTrace now waits for the trace downloads and clears the texture, primitive and shared-memory
+caches (GPU-written pages already captured), so every range the frame uses is recorded. Only runs while opening a
+trace. Verified: fresh Attitude Era traces replay the full environment (out/traces/ae-mat-fresh, ae-mat-match).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/command_processor.cpp | 16 ++++++++++++++--
+ 1 file changed, 14 insertions(+), 2 deletions(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 335f82c..8b3ec98 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -6156,16 +6156,28 @@ void VulkanCommandProcessor::InitializeTrace() {
+   }
+   bool render_target_submitted = render_target_cache_->InitializeTraceSubmitDownloads();
+   bool shared_memory_submitted = shared_memory_->InitializeTraceSubmitDownloads();
+-  if (!render_target_submitted && !shared_memory_submitted) {
++  if (!AwaitAllQueueOperationsCompletion()) {
+     return;
+   }
+-  AwaitAllQueueOperationsCompletion();
+   if (render_target_submitted) {
+     render_target_cache_->InitializeTraceCompleteDownloads();
+   }
+   if (shared_memory_submitted) {
+     shared_memory_->InitializeTraceCompleteDownloads();
+   }
++
++  // A frame trace must not depend on sampled textures or shared-memory-backed
++  // buffers having been uploaded before tracing started. Preserve GPU-written
++  // shared-memory pages (their contents were captured above), but invalidate
++  // CPU-backed pages so their first use in the trace writes a MemoryRead.
++  // Clear the caches only after the preceding submission has completed, and
++  // only while opening a trace.
++  InvalidateTextureDescriptorSetReuse();
++  ClearTransientDescriptorPools();
++  texture_cache_->ClearCache();
++  primitive_processor_->ClearCache();
++  shared_memory_->ClearCache();
++  InvalidateAllVertexBufferResidency();
+ }
+ 
+ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+-- 
+2.43.0
+

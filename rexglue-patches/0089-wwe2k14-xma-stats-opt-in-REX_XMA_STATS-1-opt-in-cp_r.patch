@@ -1,0 +1,224 @@
+From 55bb7dfb117ebfb35b8e538be75c040ef95fba98 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 3 Oct 2026 07:31:46 -0700
+Subject: [PATCH 89/97] wwe2k14: [xma-stats] opt-in (REX_XMA_STATS=1); opt-in
+ --cp_read_pointer_writeback_per_block experiment (default off, no measured
+ effect)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/command_processor.h |  5 ++
+ src/audio/xma_context.cpp                | 32 +++++++++---
+ src/graphics/command_processor.cpp       | 63 +++++++++++++++++++++---
+ 3 files changed, 86 insertions(+), 14 deletions(-)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index ebe0695..3a47a8f 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -207,6 +207,7 @@ class CommandProcessor {
+   virtual void ReturnFromWait();
+ 
+   uint32_t ExecutePrimaryBuffer(uint32_t start_index, uint32_t end_index);
++  void WriteBackReadPointer(uint32_t index);
+   virtual void OnPrimaryBufferEnd() {}
+   void ExecuteIndirectBuffer(uint32_t ptr, uint32_t length);
+   bool ExecutePacket(memory::RingBuffer* reader);
+@@ -320,6 +321,10 @@ class CommandProcessor {
+   uint32_t read_ptr_index_ = 0;
+   uint32_t read_ptr_update_freq_ = 0;
+   uint32_t read_ptr_writeback_ptr_ = 0;
++  std::chrono::steady_clock::time_point read_ptr_writeback_stats_start_{};
++  uint32_t read_ptr_writeback_stats_last_index_ = 0;
++  uint64_t read_ptr_writeback_stats_writes_ = 0;
++  uint64_t read_ptr_writeback_stats_advances_ = 0;
+ 
+   std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
+   std::atomic<uint32_t> write_ptr_index_;
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index 7214d26..dd19a5c 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -12,6 +12,7 @@
+ #include <atomic>
+ #include <chrono>
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <rex/audio/xma/context.h>
+@@ -96,13 +97,23 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
+ 
+ namespace {
+ // [wwe2k14 diagnostic] periodic XMA activity summary (private SDK branch only).
++// Opt in with REX_XMA_STATS=1; normal runs do not collect or log these counters.
+ struct XmaStats {
+   std::atomic<uint64_t> work{0}, no_output{0}, decodes{0}, out_blocks{0}, err{0}, consume_only{0};
+   std::atomic<uint64_t> active_mask[8]{};
+   std::atomic<int64_t> last_ms{0};
+ };
+ XmaStats g_xma_stats;
++bool XmaStatsEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("REX_XMA_STATS");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
+ void XmaStatsMaybeLog() {
++  if (!XmaStatsEnabled()) return;
+   const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
+       std::chrono::steady_clock::now().time_since_epoch()).count();
+   int64_t last = g_xma_stats.last_ms.load();
+@@ -127,12 +138,15 @@ bool XmaContext::Work() {
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
+-  g_xma_stats.work++;
+-  g_xma_stats.active_mask[(id() / 64) & 7].fetch_or(1ull << (id() % 64));
+-  XmaStatsMaybeLog();
++  const bool collect_xma_stats = XmaStatsEnabled();
++  if (collect_xma_stats) {
++    g_xma_stats.work++;
++    g_xma_stats.active_mask[(id() / 64) & 7].fetch_or(1ull << (id() % 64));
++    XmaStatsMaybeLog();
++  }
+ 
+   if (!data.output_buffer_valid) {
+-    g_xma_stats.no_output++;
++    if (collect_xma_stats) g_xma_stats.no_output++;
+     return true;
+   }
+ 
+@@ -140,7 +154,7 @@ bool XmaContext::Work() {
+ 
+   // Consume-only context: no input, just drain remaining subframes.
+   if (data.IsConsumeOnlyContext()) {
+-    g_xma_stats.consume_only++;
++    if (collect_xma_stats) g_xma_stats.consume_only++;
+     if (current_frame_remaining_subframes_ == 0) {
+       return true;
+     }
+@@ -163,11 +177,13 @@ bool XmaContext::Work() {
+ 
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+     Decode(&data);
+-    g_xma_stats.decodes++;
+-    if (data.error_status) g_xma_stats.err++;
++    if (collect_xma_stats) {
++      g_xma_stats.decodes++;
++      if (data.error_status) g_xma_stats.err++;
++    }
+     const size_t before_write = output_rb.write_offset();
+     Consume(&output_rb, &data);
+-    if (output_rb.write_offset() >= before_write)
++    if (collect_xma_stats && output_rb.write_offset() >= before_write)
+       g_xma_stats.out_blocks += (output_rb.write_offset() - before_write) / kOutputBytesPerBlock;
+ 
+     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 0fdb7bc..765cd23 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -42,6 +42,9 @@
+ 
+ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
++REXCVAR_DEFINE_BOOL(cp_read_pointer_writeback_per_block, false, "GPU",
++                    "Opt in to ring read-pointer writebacks at the configured CP_RB_CNTL block frequency");
++
+ REXCVAR_DEFINE_BOOL(clear_memory_page_state, true, "GPU",
+                     "Refresh page-valid state from GPU-written memory at frame end. "
+                     "Disable for minor CPU overhead reduction, but may break memory coherency.")
+@@ -392,12 +395,7 @@ void CommandProcessor::WorkerThreadMain() {
+     diagnostics::rate_census::RecordGpuBusyStart();
+     read_ptr_index_ = ExecutePrimaryBuffer(read_ptr_index_, write_ptr_index);
+ 
+-    // TODO(benvanik): use reader->Read_update_freq_ and only issue after moving
+-    //     that many indices.
+-    if (read_ptr_writeback_ptr_) {
+-      memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_),
+-                                       read_ptr_index_);
+-    }
++    WriteBackReadPointer(read_ptr_index_);
+     diagnostics::rate_census::RecordGpuBusyEnd();
+ 
+     // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
+@@ -790,6 +788,44 @@ void CommandProcessor::PrepareForWait() {
+ 
+ void CommandProcessor::ReturnFromWait() {}
+ 
++void CommandProcessor::WriteBackReadPointer(uint32_t index) {
++  if (!read_ptr_writeback_ptr_) {
++    return;
++  }
++
++  memory::store_and_swap<uint32_t>(memory_->TranslatePhysical(read_ptr_writeback_ptr_), index);
++
++  // Keep one-second live counters for the guest's read-pointer poll target.
++  // WWE13_RATE_CENSUS is opt-in, so normal runs pay only this disabled branch.
++  if (!diagnostics::rate_census::IsEnabled()) {
++    return;
++  }
++  const auto now = std::chrono::steady_clock::now();
++  if (read_ptr_writeback_stats_start_ == std::chrono::steady_clock::time_point{}) {
++    read_ptr_writeback_stats_start_ = now;
++    read_ptr_writeback_stats_last_index_ = index;
++  }
++  ++read_ptr_writeback_stats_writes_;
++  if (index != read_ptr_writeback_stats_last_index_) {
++    ++read_ptr_writeback_stats_advances_;
++  }
++  read_ptr_writeback_stats_last_index_ = index;
++  const auto elapsed_ms = std::chrono::duration_cast<std::chrono::milliseconds>(
++                              now - read_ptr_writeback_stats_start_)
++                              .count();
++  if (elapsed_ms < 1000) {
++    return;
++  }
++  REXLOG_INFO("[rate-census-rptr] addr={:08X} writes={} advances={} index={:08X} "
++              "update_freq_dw={} per_block={}",
++              read_ptr_writeback_ptr_, read_ptr_writeback_stats_writes_,
++              read_ptr_writeback_stats_advances_, index, read_ptr_update_freq_,
++              REXCVAR_GET(cp_read_pointer_writeback_per_block));
++  read_ptr_writeback_stats_start_ = now;
++  read_ptr_writeback_stats_writes_ = 0;
++  read_ptr_writeback_stats_advances_ = 0;
++}
++
+ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t write_index) {
+   SCOPE_profile_cpu_f("gpu");
+ 
+@@ -816,6 +852,11 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+   memory::RingBuffer reader(memory_->TranslatePhysical(primary_buffer_ptr_), primary_buffer_size_);
+   reader.set_read_offset(read_index * sizeof(uint32_t));
+   reader.set_write_offset(write_index * sizeof(uint32_t));
++  const uint32_t ring_size_dwords = primary_buffer_size_ / sizeof(uint32_t);
++  const bool writeback_per_block = REXCVAR_GET(cp_read_pointer_writeback_per_block) &&
++                                   read_ptr_writeback_ptr_ && read_ptr_update_freq_ &&
++                                   ring_size_dwords;
++  uint32_t last_writeback_index = reader.read_offset() / sizeof(uint32_t);
+   do {
+     if (!ExecutePacket(&reader)) {
+       // This probably should be fatal - but we're going to continue anyways.
+@@ -823,6 +864,16 @@ uint32_t CommandProcessor::ExecutePrimaryBuffer(uint32_t read_index, uint32_t wr
+       assert_always();
+       break;
+     }
++    if (writeback_per_block) {
++      const uint32_t current_read_index = reader.read_offset() / sizeof(uint32_t);
++      const uint32_t consumed_dwords = current_read_index >= last_writeback_index
++                                           ? current_read_index - last_writeback_index
++                                           : ring_size_dwords - last_writeback_index + current_read_index;
++      if (consumed_dwords >= read_ptr_update_freq_) {
++        WriteBackReadPointer(current_read_index);
++        last_writeback_index = current_read_index;
++      }
++    }
+   } while (reader.read_count());
+ 
+   OnPrimaryBufferEnd();
+-- 
+2.43.0
+

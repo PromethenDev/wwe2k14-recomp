@@ -1,0 +1,34 @@
+From aef26073dd13a92092465ea17998300616982173 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 24 Sep 2026 05:24:49 -0700
+Subject: [PATCH 15/97] audio: build SDL's disk audio driver for headless
+ capture
+
+Enables SDL_DISKAUDIO so SDL_AUDIODRIVER=disk can record the mixed guest
+audio to a raw file on machines without a sound device. WWE '13 cycle
+187: 8 min of non-silent 6ch/48 kHz output recorded and confirmed clean by
+the owner; 3-arm gate 629/1012/1176 s, 0 faults, frame timing unchanged.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ thirdparty/CMakeLists.txt | 4 ++--
+ 1 file changed, 2 insertions(+), 2 deletions(-)
+
+diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
+index fc37ac6..04b2c94 100644
+--- a/thirdparty/CMakeLists.txt
++++ b/thirdparty/CMakeLists.txt
+@@ -252,8 +252,8 @@ set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)
+ set(SDL_VULKAN OFF CACHE BOOL "" FORCE)
+ set(SDL_METAL OFF CACHE BOOL "" FORCE)
+ 
+-# Disable dummy drivers
+-set(SDL_DISKAUDIO OFF CACHE BOOL "" FORCE)
++# Audio driver: disk enabled for capture; dummy disabled
++set(SDL_DISKAUDIO ON CACHE BOOL "" FORCE)
+ set(SDL_DUMMYAUDIO OFF CACHE BOOL "" FORCE)
+ set(SDL_DUMMYVIDEO OFF CACHE BOOL "" FORCE)
+ 
+-- 
+2.43.0
+

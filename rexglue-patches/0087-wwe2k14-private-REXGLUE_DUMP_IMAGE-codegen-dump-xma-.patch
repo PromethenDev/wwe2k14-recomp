@@ -1,0 +1,137 @@
+From 520720f3d141a9237ccb4d312cd3d6161e28ca7c Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 19:52:39 -0700
+Subject: [PATCH 87/97] wwe2k14 private: REXGLUE_DUMP_IMAGE codegen dump +
+ [xma-stats] diagnostic
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/audio/xma_context.cpp       | 34 +++++++++++++++++++++++++++++++++
+ src/codegen/codegen_context.cpp | 28 +++++++++++++++++++++++++++
+ 2 files changed, 62 insertions(+)
+
+diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
+index eafb410..7214d26 100644
+--- a/src/audio/xma_context.cpp
++++ b/src/audio/xma_context.cpp
+@@ -9,6 +9,8 @@
+ * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+ */
+ 
++#include <atomic>
++#include <chrono>
+ #include <algorithm>
+ #include <cstring>
+ 
+@@ -92,6 +94,28 @@ int XmaContext::Setup(uint32_t id, memory::Memory* memory, uint32_t guest_ptr) {
+   return 0;
+ }
+ 
++namespace {
++// [wwe2k14 diagnostic] periodic XMA activity summary (private SDK branch only).
++struct XmaStats {
++  std::atomic<uint64_t> work{0}, no_output{0}, decodes{0}, out_blocks{0}, err{0}, consume_only{0};
++  std::atomic<uint64_t> active_mask[8]{};
++  std::atomic<int64_t> last_ms{0};
++};
++XmaStats g_xma_stats;
++void XmaStatsMaybeLog() {
++  const int64_t now = std::chrono::duration_cast<std::chrono::milliseconds>(
++      std::chrono::steady_clock::now().time_since_epoch()).count();
++  int64_t last = g_xma_stats.last_ms.load();
++  if (now - last < 5000 || !g_xma_stats.last_ms.compare_exchange_strong(last, now)) return;
++  int active = 0;
++  for (auto& m : g_xma_stats.active_mask) active += __builtin_popcountll(m.exchange(0));
++  REXAPU_INFO("[xma-stats] 5s: work={} no_output_buf={} consume_only={} decodes={} out_blocks={} error_status!=0={} active_ctx={}",
++              g_xma_stats.work.exchange(0), g_xma_stats.no_output.exchange(0),
++              g_xma_stats.consume_only.exchange(0), g_xma_stats.decodes.exchange(0),
++              g_xma_stats.out_blocks.exchange(0), g_xma_stats.err.exchange(0), active);
++}
++}  // namespace
++
+ bool XmaContext::Work() {
+   if (!is_allocated() || !is_enabled()) {
+     return false;
+@@ -103,8 +127,12 @@ bool XmaContext::Work() {
+   auto context_ptr = memory()->TranslateVirtual(guest_ptr());
+   XMA_CONTEXT_DATA data(context_ptr);
+   const XMA_CONTEXT_DATA initial_data = data;
++  g_xma_stats.work++;
++  g_xma_stats.active_mask[(id() / 64) & 7].fetch_or(1ull << (id() % 64));
++  XmaStatsMaybeLog();
+ 
+   if (!data.output_buffer_valid) {
++    g_xma_stats.no_output++;
+     return true;
+   }
+ 
+@@ -112,6 +140,7 @@ bool XmaContext::Work() {
+ 
+   // Consume-only context: no input, just drain remaining subframes.
+   if (data.IsConsumeOnlyContext()) {
++    g_xma_stats.consume_only++;
+     if (current_frame_remaining_subframes_ == 0) {
+       return true;
+     }
+@@ -134,7 +163,12 @@ bool XmaContext::Work() {
+ 
+   while (remaining_subframe_blocks_in_output_buffer_ >= minimum_subframe_decode_count) {
+     Decode(&data);
++    g_xma_stats.decodes++;
++    if (data.error_status) g_xma_stats.err++;
++    const size_t before_write = output_rb.write_offset();
+     Consume(&output_rb, &data);
++    if (output_rb.write_offset() >= before_write)
++      g_xma_stats.out_blocks += (output_rb.write_offset() - before_write) / kOutputBytesPerBlock;
+ 
+     if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
+       break;
+diff --git a/src/codegen/codegen_context.cpp b/src/codegen/codegen_context.cpp
+index f588434..5495ab8 100644
+--- a/src/codegen/codegen_context.cpp
++++ b/src/codegen/codegen_context.cpp
+@@ -21,6 +21,12 @@
+ #include <rex/system/user_module.h>
+ #include <rex/system/xex_module.h>
+ 
++#include <algorithm>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <string>
++
+ namespace rex::codegen {
+ 
+ Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& configPath,
+@@ -87,6 +93,28 @@ Result<CodegenContext> CodegenContext::Create(const std::filesystem::path& confi
+   ctx.binary_ = BinaryView::fromModule(*module);
+   ctx.resolver_ = runtime.export_resolver();
+ 
++  // Opt-in analysis aid: REXGLUE_DUMP_IMAGE=<path> writes the loaded (decrypted, decompressed, patched)
++  // image as a flat file starting at the base address, for disassembly-based boundary verification.
++  if (const char* dump = std::getenv("REXGLUE_DUMP_IMAGE")) {
++    std::vector<uint8_t> flat(ctx.binary_.imageSize(), 0);
++    for (const auto& s : ctx.binary_.sections()) {
++      const uint32_t off = s.baseAddress - ctx.binary_.baseAddress();
++      if (s.data && off < flat.size())
++        std::memcpy(flat.data() + off, s.data, std::min<size_t>(s.size, flat.size() - off));
++    }
++    if (FILE* f = std::fopen(dump, "wb")) {
++      std::fwrite(flat.data(), 1, flat.size(), f);
++      std::fclose(f);
++      REXCODEGEN_INFO("Dumped image ({} bytes) to {}", flat.size(), dump);
++      if (FILE* m = std::fopen((std::string(dump) + ".sections.txt").c_str(), "w")) {
++        for (const auto& s : ctx.binary_.sections())
++          std::fprintf(m, "%.*s 0x%08X 0x%X %d\n", static_cast<int>(s.name.size()), s.name.data(),
++                       s.baseAddress, s.size, s.executable ? 1 : 0);
++        std::fclose(m);
++      }
++    }
++  }
++
+   REXCODEGEN_INFO("Loaded XEX: base=0x{:08X}, size=0x{:X}, entry=0x{:08X}",
+                   ctx.binary_.baseAddress(), ctx.binary_.imageSize(), ctx.binary_.entryPoint());
+ 
+-- 
+2.43.0
+

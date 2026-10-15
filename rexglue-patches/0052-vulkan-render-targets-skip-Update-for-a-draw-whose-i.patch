@@ -1,0 +1,223 @@
+From 9b15c7122dce913b0c7aa227238a9fd8df166d61 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 26 Sep 2026 19:59:06 -0700
+Subject: [PATCH 52/97] vulkan render targets: skip Update for a draw whose
+ inputs equal the previous draw's
+
+RenderTargetCache::Update + the Vulkan host-render-target part cost ~135 ns per draw (live stage timing), and
+consecutive draws (crowd, props) usually use the same render targets. When every input equals the previous
+successful call's - RB_SURFACE_INFO, RB_DEPTH_INFO, RB_COLOR_INFO x4, RB_MODECONTROL, the registers
+DrawExtentEstimator::EstimateMaxY reads (window offset, window/screen scissor, clip/VTE control, SC mode,
+pixel center, viewport Y offset/scale), the normalized depth control and color mask, rasterization - and no
+other mutating entry point ran in between (BeginFrame, ClearCache, DestroyAllRenderTargets, Resolve,
+EndSubmission, CompletedSubmissionUpdated, trace downloads, EDRAM snapshot restore all invalidate), the previous
+result (ownership, transfers already done, render pass, framebuffer, render target usage) still holds.
+Clip-disabled draws (possible CPU vertex extent estimation), the pixel shader interlock path and
+debug_rt_cache_ownership always take the full path. Kill switch: vulkan_rt_update_fast_path=false.
+
+Replay A/B (2 heavy entrance traces x300, 3 alternating rounds): -2.85% / -1.35% frame time, pixel-identical.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ .../graphics/pipeline/render_target/cache.h   |  6 +++
+ .../rex/graphics/vulkan/render_target_cache.h | 11 ++++
+ src/graphics/pipeline/render_target/cache.cpp |  3 ++
+ src/graphics/vulkan/render_target_cache.cpp   | 52 +++++++++++++++++++
+ 4 files changed, 72 insertions(+)
+
+diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
+index 9c5e5e6..570ab76 100644
+--- a/include/rex/graphics/pipeline/render_target/cache.h
++++ b/include/rex/graphics/pipeline/render_target/cache.h
+@@ -181,6 +181,12 @@ class RenderTargetCache {
+   uint32_t GetLastUpdateBoundRenderTargets(uint32_t* depth_and_color_formats_out = nullptr) const;
+ 
+  protected:
++  // Update() fast path (host render targets): when a draw's Update inputs equal the previous successful call's and
++  // nothing else touched the cache in between, the previous result still holds (ownership, transfers, render pass,
++  // framebuffer, render target usage) and the call is skipped. Every other mutating entry point invalidates it.
++  void InvalidateUpdateFastPath() { update_fast_path_valid_ = false; }
++  bool update_fast_path_valid_ = false;
++
+   RenderTargetCache(const RegisterFile& register_file, const memory::Memory& memory,
+                     TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
+                     uint32_t draw_resolution_scale_y)
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 43ef7a2..8860f87 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -803,6 +803,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // resolve_clear_rectangle is expected to be provided by
+   // PrepareHostRenderTargetsResolveClear which should do all the needed size
+   // bound checks.
++  struct UpdateFastPathKey {
++    uint32_t registers[17];
++    uint32_t normalized_depth_control;
++    uint32_t normalized_color_mask;
++    uint32_t is_rasterization_done;
++    bool operator==(const UpdateFastPathKey& other) const {
++      return !std::memcmp(this, &other, sizeof(*this));
++    }
++  };
++  UpdateFastPathKey last_update_fast_path_key_ = {};
++
+   void PerformTransfersAndResolveClears(
+       uint32_t render_target_count, RenderTarget* const* render_targets,
+       const std::vector<Transfer>* render_target_transfers,
+diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
+index c467fc5..cf0477c 100644
+--- a/src/graphics/pipeline/render_target/cache.cpp
++++ b/src/graphics/pipeline/render_target/cache.cpp
+@@ -363,6 +363,7 @@ void RenderTargetCache::InitializeCommon() {
+ }
+ 
+ void RenderTargetCache::DestroyAllRenderTargets(bool shutting_down) {
++  InvalidateUpdateFastPath();
+   ownership_ranges_.clear();
+   if (!shutting_down) {
+     ownership_ranges_.emplace(std::piecewise_construct, std::forward_as_tuple(uint32_t(0)),
+@@ -383,6 +384,7 @@ void RenderTargetCache::ShutdownCommon() {
+ }
+ 
+ void RenderTargetCache::ClearCache() {
++  InvalidateUpdateFastPath();
+   // Keep only render targets currently owning any EDRAM data.
+   if (!render_targets_.empty()) {
+     std::unordered_set<RenderTargetKey, RenderTargetKey::Hasher> used_render_targets;
+@@ -416,6 +418,7 @@ void RenderTargetCache::ClearCache() {
+ }
+ 
+ void RenderTargetCache::BeginFrame() {
++  InvalidateUpdateFastPath();
+   ResetAccumulatedRenderTargets();
+   if (REXCVAR_GET(debug_rt_cache_ownership)) {
+     debug_rt_cache_draw_index_ = 0;
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 50d3509..ec53003 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -41,6 +41,11 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",
+                       "Vulkan render target implementation path")
+     .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+ 
++REXCVAR_DEFINE_BOOL(vulkan_rt_update_fast_path, true, "GPU/Vulkan",
++                    "Skip the render target cache update for a draw whose render target inputs equal the previous "
++                    "draw's when nothing else changed the cache in between");
++REXCVAR_DECLARE(bool, debug_rt_cache_ownership);
++
+ // DEFINE_string(
+ //     render_target_path_vulkan, "",
+ //     "Render target emulation path to use on Vulkan.\n"
+@@ -1096,6 +1101,7 @@ void VulkanRenderTargetCache::Shutdown(bool from_destructor) {
+ }
+ 
+ void VulkanRenderTargetCache::ClearCache() {
++  InvalidateUpdateFastPath();
+   const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -1118,6 +1124,7 @@ void VulkanRenderTargetCache::ClearCache() {
+ }
+ 
+ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
++  InvalidateUpdateFastPath();
+   if (edram_snapshot_restore_pool_) {
+     edram_snapshot_restore_pool_->Reclaim(command_processor_.GetCompletedSubmission());
+   }
+@@ -1127,6 +1134,7 @@ void VulkanRenderTargetCache::CompletedSubmissionUpdated() {
+ }
+ 
+ void VulkanRenderTargetCache::EndSubmission() {
++  InvalidateUpdateFastPath();
+   if (edram_snapshot_restore_pool_) {
+     edram_snapshot_restore_pool_->FlushWrites();
+   }
+@@ -1148,6 +1156,7 @@ void VulkanRenderTargetCache::ResetTraceDownload() {
+ }
+ 
+ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
++  InvalidateUpdateFastPath();
+   ResetTraceDownload();
+ 
+   if (IsDrawResolutionScaled()) {
+@@ -1193,6 +1202,7 @@ bool VulkanRenderTargetCache::InitializeTraceSubmitDownloads() {
+ }
+ 
+ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
++  InvalidateUpdateFastPath();
+   if (edram_snapshot_download_buffer_memory_ == VK_NULL_HANDLE) {
+     return;
+   }
+@@ -1228,6 +1238,7 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
+ }
+ 
+ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
++  InvalidateUpdateFastPath();
+   if (IsDrawResolutionScaled()) {
+     // No 1:1 mapping.
+     return;
+@@ -1332,6 +1343,7 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+                                       VulkanSharedMemory& shared_memory,
+                                       VulkanTextureCache& texture_cache,
+                                       uint32_t& written_address_out, uint32_t& written_length_out) {
++  InvalidateUpdateFastPath();
+   written_address_out = 0;
+   written_length_out = 0;
+ 
+@@ -1596,6 +1608,42 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
+ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+                                      reg::RB_DEPTHCONTROL normalized_depth_control,
+                                      uint32_t normalized_color_mask, const Shader& vertex_shader) {
++  // Fast path: every input of RenderTargetCache::Update and of the host render target part below - the render
++  // target registers, the normalized masks, and the registers DrawExtentEstimator::EstimateMaxY reads. Clip-disabled
++  // draws may estimate the extent from vertex data on the CPU, so they always take the full path.
++  UpdateFastPathKey fast_path_key;
++  bool fast_path_key_valid = false;
++  if (REXCVAR_GET(vulkan_rt_update_fast_path) && GetPath() == Path::kHostRenderTargets &&
++      !REXCVAR_GET(debug_rt_cache_ownership)) {
++    const RegisterFile& regs = register_file();
++    if (!regs.Get<reg::PA_CL_CLIP_CNTL>().clip_disable) {
++      static constexpr uint32_t kKeyRegisters[] = {
++          XE_GPU_REG_RB_SURFACE_INFO,         XE_GPU_REG_RB_DEPTH_INFO,
++          XE_GPU_REG_RB_COLOR_INFO,           XE_GPU_REG_RB_COLOR1_INFO,
++          XE_GPU_REG_RB_COLOR2_INFO,          XE_GPU_REG_RB_COLOR3_INFO,
++          XE_GPU_REG_RB_MODECONTROL,          XE_GPU_REG_PA_SC_WINDOW_OFFSET,
++          XE_GPU_REG_PA_SC_WINDOW_SCISSOR_TL, XE_GPU_REG_PA_SC_WINDOW_SCISSOR_BR,
++          XE_GPU_REG_PA_SC_SCREEN_SCISSOR_BR, XE_GPU_REG_PA_CL_CLIP_CNTL,
++          XE_GPU_REG_PA_CL_VTE_CNTL,          XE_GPU_REG_PA_SU_SC_MODE_CNTL,
++          XE_GPU_REG_PA_SU_VTX_CNTL,          XE_GPU_REG_PA_CL_VPORT_YOFFSET,
++          XE_GPU_REG_PA_CL_VPORT_YSCALE,
++      };
++      static_assert(sizeof(kKeyRegisters) / sizeof(kKeyRegisters[0]) ==
++                    sizeof(fast_path_key.registers) / sizeof(fast_path_key.registers[0]));
++      for (size_t i = 0; i < sizeof(kKeyRegisters) / sizeof(kKeyRegisters[0]); ++i) {
++        fast_path_key.registers[i] = regs[kKeyRegisters[i]];
++      }
++      fast_path_key.normalized_depth_control = normalized_depth_control.value;
++      fast_path_key.normalized_color_mask = normalized_color_mask;
++      fast_path_key.is_rasterization_done = is_rasterization_done;
++      fast_path_key_valid = true;
++      if (update_fast_path_valid_ && fast_path_key == last_update_fast_path_key_) {
++        return true;
++      }
++    }
++  }
++  update_fast_path_valid_ = false;
++
+   if (!RenderTargetCache::Update(is_rasterization_done, normalized_depth_control,
+                                  normalized_color_mask, vertex_shader)) {
+     return false;
+@@ -1725,6 +1773,10 @@ bool VulkanRenderTargetCache::Update(bool is_rasterization_done,
+       return false;
+   }
+ 
++  if (fast_path_key_valid) {
++    last_update_fast_path_key_ = fast_path_key;
++    update_fast_path_valid_ = true;
++  }
+   return true;
+ }
+ 
+-- 
+2.43.0
+

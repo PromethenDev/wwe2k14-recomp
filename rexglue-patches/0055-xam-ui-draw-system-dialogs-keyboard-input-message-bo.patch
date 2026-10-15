@@ -1,0 +1,189 @@
+From dd5647f09642d126b4fa7135917c40763cf9a6b8 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 27 Sep 2026 15:32:40 -0700
+Subject: [PATCH 55/97] xam ui: draw system dialogs (keyboard input, message
+ box) in a neutral game-like style
+
+Owner 2026-09-27: the default ImGui look of the XShowKeyboardUI prompt (clip naming in Highlight Reel) looked like
+an emulator debug window. Dialogs are now centred, dark panel with a red title bar/border, square corners, larger
+text, uppercase titles; the generic titles are 'ENTER TEXT' / 'NOTICE' instead of 'Keyboard Input' / 'Message Box';
+Esc cancels the keyboard prompt. Behaviour and results are unchanged (clip save verified: XamContentCreateEx 0).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xam/xam_ui.cpp | 81 +++++++++++++++++++++++++++++++++------
+ 1 file changed, 70 insertions(+), 11 deletions(-)
+
+diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
+index 17a384b..264e9e0 100644
+--- a/src/kernel/xam/xam_ui.cpp
++++ b/src/kernel/xam/xam_ui.cpp
+@@ -67,6 +67,50 @@ class XamDialog : public rex::ui::ImGuiDialog {
+  protected:
+   XamDialog(rex::ui::ImGuiDrawer* imgui_drawer) : rex::ui::ImGuiDialog(imgui_drawer) {}
+ 
++  // System dialogs are drawn in a neutral, game-like style (dark panel, red accent, centred, larger text) instead of
++  // the default debug-UI look, so players do not see an emulator/debug window in the middle of the game.
++  static constexpr int kStyleColors = 15;
++  static constexpr int kStyleVars = 7;
++  static void PushSystemDialogStyle(ImGuiIO& io) {
++    const ImVec4 red(0.78f, 0.06f, 0.09f, 1.0f);
++    const ImVec4 red_dark(0.50f, 0.03f, 0.05f, 1.0f);
++    ImGui::PushStyleColor(ImGuiCol_PopupBg, ImVec4(0.04f, 0.04f, 0.05f, 0.97f));
++    ImGui::PushStyleColor(ImGuiCol_WindowBg, ImVec4(0.04f, 0.04f, 0.05f, 0.97f));
++    ImGui::PushStyleColor(ImGuiCol_TitleBg, red_dark);
++    ImGui::PushStyleColor(ImGuiCol_TitleBgActive, red_dark);
++    ImGui::PushStyleColor(ImGuiCol_Border, red);
++    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(0.96f, 0.96f, 0.96f, 1.0f));
++    ImGui::PushStyleColor(ImGuiCol_FrameBg, ImVec4(0.14f, 0.14f, 0.15f, 1.0f));
++    ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, ImVec4(0.20f, 0.20f, 0.21f, 1.0f));
++    ImGui::PushStyleColor(ImGuiCol_FrameBgActive, ImVec4(0.22f, 0.22f, 0.23f, 1.0f));
++    ImGui::PushStyleColor(ImGuiCol_Button, ImVec4(0.16f, 0.16f, 0.17f, 1.0f));
++    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, red);
++    ImGui::PushStyleColor(ImGuiCol_ButtonActive, red_dark);
++    ImGui::PushStyleColor(ImGuiCol_NavCursor, red);
++    ImGui::PushStyleColor(ImGuiCol_TextSelectedBg, ImVec4(0.78f, 0.06f, 0.09f, 0.55f));
++    ImGui::PushStyleColor(ImGuiCol_ModalWindowDimBg, ImVec4(0.0f, 0.0f, 0.0f, 0.55f));
++    ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 0.0f);
++    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 0.0f);
++    ImGui::PushStyleVar(ImGuiStyleVar_WindowBorderSize, 2.0f);
++    ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 2.0f);
++    ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(24.0f, 18.0f));
++    ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(12.0f, 8.0f));
++    ImGui::PushStyleVar(ImGuiStyleVar_ItemSpacing, ImVec2(12.0f, 12.0f));
++    ImGui::SetNextWindowPos(ImVec2(io.DisplaySize.x * 0.5f, io.DisplaySize.y * 0.5f), ImGuiCond_Always,
++                            ImVec2(0.5f, 0.5f));
++  }
++  static void PopSystemDialogStyle() {
++    ImGui::PopStyleVar(kStyleVars);
++    ImGui::PopStyleColor(kStyleColors);
++  }
++  static std::string SystemDialogTitle(std::string title) {
++    for (auto& c : title) {
++      if (c >= 'a' && c <= 'z') c = char(c - 'a' + 'A');
++    }
++    // "###" keeps the ImGui popup id stable and hidden.
++    return title + "###xam_system_dialog";
++  }
++
+   void OnClose() override {
+     if (close_callback_) {
+       close_callback_();
+@@ -223,8 +267,9 @@ class MessageBoxDialog : public XamDialog {
+         default_button_(default_button),
+         chosen_button_(default_button) {
+     if (!title_.size()) {
+-      title_ = "Message Box";
++      title_ = "Notice";
+     }
++    title_ = SystemDialogTitle(title_);
+   }
+ 
+   uint32_t chosen_button() const { return chosen_button_; }
+@@ -236,15 +281,20 @@ class MessageBoxDialog : public XamDialog {
+       has_opened_ = true;
+       first_draw = true;
+     }
+-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
++    PushSystemDialogStyle(io);
++    if (ImGui::BeginPopupModal(title_.c_str(), nullptr,
++                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
++      ImGui::SetWindowFontScale(1.35f);
+       if (description_.size()) {
+-        ImGui::Text("%s", description_.c_str());
++        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
++        ImGui::TextUnformatted(description_.c_str());
++        ImGui::PopTextWrapPos();
+       }
+       if (first_draw) {
+         ImGui::SetKeyboardFocusHere();
+       }
+       for (size_t i = 0; i < buttons_.size(); ++i) {
+-        if (ImGui::Button(buttons_[i].c_str())) {
++        if (ImGui::Button(buttons_[i].c_str(), ImVec2(ImGui::GetFontSize() * 7.0f, 0.0f))) {
+           chosen_button_ = static_cast<uint32_t>(i);
+           ImGui::CloseCurrentPopup();
+           Close();
+@@ -252,11 +302,11 @@ class MessageBoxDialog : public XamDialog {
+         ImGui::SameLine();
+       }
+       ImGui::Spacing();
+-      ImGui::Spacing();
+       ImGui::EndPopup();
+     } else {
+       Close();
+     }
++    PopSystemDialogStyle();
+   }
+ 
+  private:
+@@ -354,12 +404,13 @@ class KeyboardInputDialog : public XamDialog {
+         text_buffer_() {
+     if (!title_.size()) {
+       if (!description_.size()) {
+-        title_ = "Keyboard Input";
++        title_ = "Enter text";
+       } else {
+         title_ = description_;
+         description_ = "";
+       }
+     }
++    title_ = SystemDialogTitle(title_);
+     text_ = default_text;
+     text_buffer_.resize(max_length);
+     rex::string::util_copy_truncating(text_buffer_.data(), default_text_, text_buffer_.size());
+@@ -375,13 +426,19 @@ class KeyboardInputDialog : public XamDialog {
+       has_opened_ = true;
+       first_draw = true;
+     }
+-    if (ImGui::BeginPopupModal(title_.c_str(), nullptr, ImGuiWindowFlags_AlwaysAutoResize)) {
++    PushSystemDialogStyle(io);
++    if (ImGui::BeginPopupModal(title_.c_str(), nullptr,
++                               ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoMove)) {
++      ImGui::SetWindowFontScale(1.35f);
+       if (description_.size()) {
+-        ImGui::TextWrapped("%s", description_.c_str());
++        ImGui::PushTextWrapPos(ImGui::GetFontSize() * 30.0f);
++        ImGui::TextUnformatted(description_.c_str());
++        ImGui::PopTextWrapPos();
+       }
+       if (first_draw) {
+         ImGui::SetKeyboardFocusHere();
+       }
++      ImGui::SetNextItemWidth(ImGui::GetFontSize() * 22.0f);
+       if (ImGui::InputText("##body", text_buffer_.data(), text_buffer_.size(),
+                            ImGuiInputTextFlags_EnterReturnsTrue)) {
+         text_ = std::string(text_buffer_.data(), text_buffer_.size());
+@@ -389,24 +446,26 @@ class KeyboardInputDialog : public XamDialog {
+         ImGui::CloseCurrentPopup();
+         Close();
+       }
+-      if (ImGui::Button("OK")) {
++      const ImVec2 button_size(ImGui::GetFontSize() * 7.0f, 0.0f);
++      if (ImGui::Button("OK", button_size)) {
+         text_ = std::string(text_buffer_.data(), text_buffer_.size());
+         cancelled_ = false;
+         ImGui::CloseCurrentPopup();
+         Close();
+       }
+       ImGui::SameLine();
+-      if (ImGui::Button("Cancel")) {
++      if (ImGui::Button("CANCEL", button_size) || ImGui::IsKeyPressed(ImGuiKey_Escape)) {
+         text_ = "";
+         cancelled_ = true;
+         ImGui::CloseCurrentPopup();
+         Close();
+       }
+-      ImGui::Spacing();
++      ImGui::TextDisabled("Enter = OK    Esc = Cancel");
+       ImGui::EndPopup();
+     } else {
+       Close();
+     }
++    PopSystemDialogStyle();
+   }
+ 
+  private:
+-- 
+2.43.0
+
