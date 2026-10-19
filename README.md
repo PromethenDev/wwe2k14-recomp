@@ -25,12 +25,13 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 - **CPU**: a 64-bit processor with AVX2 (most PCs from 2013 onward: Intel Haswell / AMD Ryzen or newer).
 - **Graphics**: a graphics card with up-to-date Vulkan drivers. A dedicated graphics card is recommended:
   integrated graphics are not supported well yet (on Intel UHD 630 entrances and matches can show a black picture,
-  and AMD Radeon 780M laptops run slowly).
+  AMD Radeon 780M laptops run slowly, and older Intel HD/UHD graphics such as the HD 520 can close at the title
+  screen).
 - About 10 GB of free space for the game files.
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.0.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.0.1-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -62,8 +63,14 @@ WWE2K14-Recomp-x64/
 
 The launcher shows a recommended setup for your graphics card. You can also choose:
 
-- **Resolution** – 720p is the original Xbox 360 sharpness; 1080p and 1440p are sharper and need a stronger graphics
-  card.
+- **Output size** – the size of the game window or fullscreen picture (720p, 1080p or 1440p). The game itself draws at
+  1280x720, like the Xbox 360, and is scaled to this size.
+- **Picture detail (experimental)** – **1440p** or **4K** make the game draw at 2x or 3x its normal size, a true
+  2560x1440 or 3840x2160 picture, on any screen. They need a stronger graphics card (4K a high-end one), and some
+  effects (for example Batista's entrance pyro) can be missing.
+- **Stretch to fill wide screens** – fill a 21:9 or 16:10 screen instead of showing black bars.
+- **Sync frames to the monitor** (Windows, on by default) – turn it off if the game runs too fast or stutters in
+  fullscreen on a high-refresh, G-SYNC or FreeSync monitor.
 - **Display** – fullscreen or windowed (press **F11** in the game to switch at any time); **Graphics card** – for PCs
   with two GPUs.
 - **Start straight away next time** – skip the launcher on later starts. Hold **Shift** while it starts to come back

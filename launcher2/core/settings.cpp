@@ -197,7 +197,9 @@ std::string BuildIni(const Paths& paths, const Settings& settings) {
   const std::vector<std::string> old_lines = SplitLines(old_text);
   const std::set<std::string> replaced = {"schema", "anti_aliasing", "resolution", "frame_rate",
                                           "display", "gpu", "game_folder", "auto_start",
-                                          "auto_backup", "check_updates", "skipped_update_version"};
+                                          "auto_backup", "check_updates", "skipped_update_version",
+                                          "sync_frames_to_monitor", "stretch_to_fill_wide_screens",
+                                          "sharper_picture", "picture_scale"};
   std::vector<std::string> unknown_settings;
   std::vector<std::string> outside_settings;
   std::string active_section;
@@ -228,6 +230,9 @@ std::string BuildIni(const Paths& paths, const Settings& settings) {
   output << "[Settings]\r\nschema=7\r\n"
          << "resolution=" << (settings.explicit_choice ? ResolutionName(settings.resolution) : "auto") << "\r\n"
          << "display=" << DisplayName(settings.display) << "\r\n"
+         << "sync_frames_to_monitor=" << (settings.sync_frames_to_monitor ? "1" : "0") << "\r\n"
+         << "stretch_to_fill_wide_screens=" << (settings.stretch_to_fill_wide_screens ? "1" : "0") << "\r\n"
+         << "picture_scale=" << std::clamp(settings.picture_scale, 1, 3) << "\r\n"
          << "gpu=" << (settings.gpu_id.empty() ? "auto" : settings.gpu_id) << "\r\n"
          << "game_folder=" << PathToUtf8(settings.game_folder.empty() ? paths.default_game_folder : settings.game_folder)
          << "\r\nauto_start=" << (settings.auto_start ? "1" : "0")
@@ -280,6 +285,23 @@ Settings LoadSettingsImpl(const Paths& paths) {
   }
 
   if (auto parsed = ParseDisplay(IniValue(entries, "display"))) settings.display = *parsed;
+
+  const std::string sync_frames = IniValue(entries, "sync_frames_to_monitor");
+  if (!sync_frames.empty()) {
+    settings.sync_frames_to_monitor = sync_frames == "1" || EqualsAsciiInsensitive(sync_frames, "true");
+  }
+  const std::string stretch = IniValue(entries, "stretch_to_fill_wide_screens");
+  if (!stretch.empty()) {
+    settings.stretch_to_fill_wide_screens = stretch == "1" || EqualsAsciiInsensitive(stretch, "true");
+  }
+  // picture_scale replaced the 1.0.1 test builds' sharper_picture (on = 2x).
+  const std::string scale = IniValue(entries, "picture_scale");
+  const std::string sharper = IniValue(entries, "sharper_picture");
+  if (scale == "1" || scale == "2" || scale == "3") {
+    settings.picture_scale = scale[0] - '0';
+  } else if (sharper == "1" || EqualsAsciiInsensitive(sharper, "true")) {
+    settings.picture_scale = 2;
+  }
 
   const std::string gpu = IniValue(entries, "gpu");
   if (ValidGpuId(gpu)) settings.gpu_id = NormalizeGpuId(gpu);

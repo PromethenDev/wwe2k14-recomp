@@ -1,6 +1,7 @@
 #include "launcher_core.h"
 #include "launcher_version.h"
 #include "native_keys.h"
+#include "display_scale.h"
 #include "update.h"
 
 #include "imgui.h"
@@ -157,6 +158,7 @@ struct AppState {
   bool bypass_auto_start = false;
   bool screenshot_mode = false;
   std::filesystem::path screenshot_dir;
+  float test_pixel_density = 0.0f;  // Screenshot-only simulated high-density framebuffer.
   size_t screenshot_index = 0;
   std::vector<fs::path> test_drop_files;
   Tab test_drop_tab = Tab::Music;
@@ -169,6 +171,9 @@ struct AppState {
   fs::path restore_file;
   std::string banner;
   bool banner_success = false;
+  std::atomic<bool> launch_process_started{false};
+  std::string launch_warning;
+  bool launch_warning_pending = false;
   bool gamepad_connected = false;
   int startup_width = 1280;
   int startup_height = 760;
@@ -186,6 +191,11 @@ struct AppState {
 
 float S(const AppState& app, float pixels) {
   return pixels * app.display_scale;
+}
+
+float GetWindowPixelDensity(const AppState& app) {
+  if (app.screenshot_mode && app.test_pixel_density > 0.0f) return app.test_pixel_density;
+  return SDL_GetWindowPixelDensity(app.window);
 }
 
 ImVec2 S(const AppState& app, float x, float y) {
@@ -271,6 +281,9 @@ Settings ActiveSettings(const AppState& app) {
   settings.auto_start = app.settings.auto_start;
   settings.auto_backup = app.settings.auto_backup;
   settings.check_updates = app.settings.check_updates;
+  settings.sync_frames_to_monitor = app.settings.sync_frames_to_monitor;
+  settings.stretch_to_fill_wide_screens = app.settings.stretch_to_fill_wide_screens;
+  settings.picture_scale = app.settings.picture_scale;
   settings.skipped_update_version = app.settings.skipped_update_version;
   settings.explicit_choice = false;
   return settings;
@@ -362,6 +375,11 @@ void StartUpdateCheck(AppState& app);
 void PollUpdateCheck(AppState& app);
 
 void PollJob(AppState& app) {
+  // StartGame reports process creation separately because it may keep watching for an early crash.
+  // Keep SDL window changes on the UI thread while the worker waits.
+  if (app.launch_process_started.exchange(false, std::memory_order_acquire)) {
+    SDL_MinimizeWindow(app.window);
+  }
   std::function<void()> apply;
   Result result;
   bool finished = false;
@@ -378,8 +396,19 @@ void PollJob(AppState& app) {
   if (app.job.thread.joinable()) app.job.thread.join();
   app.job.active.store(false);
   app.update_job = false;
-  if (!result.ok) {
-    SetBanner(app, result.error.empty() ? "That action could not be completed." : result.error);
+  if (result.unknown) {
+    // A wait API error cannot prove that the game exited; keep the launcher open without a false warning.
+    SDL_RestoreWindow(app.window);
+    SDL_RaiseWindow(app.window);
+  } else if (!result.ok) {
+    if (result.error == kGameClosedEarlyMessage) {
+      SDL_RestoreWindow(app.window);
+      SDL_RaiseWindow(app.window);
+      app.launch_warning = result.error;
+      app.launch_warning_pending = true;
+    } else {
+      SetBanner(app, result.error.empty() ? "That action could not be completed." : result.error);
+    }
   } else {
     if (apply) apply();
   }
@@ -441,12 +470,17 @@ void LaunchNow(AppState& app) {
     app.tab = Tab::GameFiles;
     return;
   }
+  if (GameProcessRunning(app.paths)) {
+    SetBanner(app, "WWE 2K14 is already running. Close the game window before pressing Play again.");
+    return;
+  }
   const Paths paths = app.paths;
   const Settings settings = ActiveSettings(app);
   const std::vector<GpuInfo> gpus = app.gpus;
-  BeginJob(app, "Starting WWE 2K14…", [&app, paths, settings, gpus](const ProgressFn&, CancelFlag&) {
+  app.launch_process_started.store(false, std::memory_order_relaxed);
+  BeginJob(app, "Starting WWE 2K14…", [&app, paths, settings, gpus](const ProgressFn&, CancelFlag& cancel) {
     const LaunchPlan plan = BuildLaunchPlan(paths, settings, gpus);
-    const Result result = StartGame(plan);
+    const Result result = StartGame(plan, 90.0, &app.launch_process_started, &cancel);
     return JobOutcome{result, [&app] {
                         SDL_MinimizeWindow(app.window);
                         app.running = false;
@@ -459,6 +493,10 @@ void StartLaunch(AppState& app) {
   if (!app.game_files.ready()) {
     SetBanner(app, "Add the base game and Title Update 1.0.3 to continue.");
     app.tab = Tab::GameFiles;
+    return;
+  }
+  if (GameProcessRunning(app.paths)) {
+    SetBanner(app, "WWE 2K14 is already running. Close the game window before pressing Play again.");
     return;
   }
   if (!app.settings.auto_backup) {
@@ -1234,6 +1272,63 @@ void DrawUpdateNotes(AppState& app) {
   ImGui::PopStyleColor(2);
 }
 
+void DrawOneDriveWarning(const AppState& app) {
+  if (!IsUnderOneDrive(app.paths.exe_dir) && !IsUnderOneDrive(ActiveGameFolder(app))) return;
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, ImVec4(0.23f, 0.15f, 0.07f, 1.0f));
+  ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(0.48f, 0.31f, 0.12f, 1.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, S(app, 9.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_ChildBorderSize, S(app, 1.0f));
+  ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, S(app, 14.0f, 9.0f));
+  ImGui::BeginChild("onedrive-warning", ImVec2(0.0f, S(app, 78.0f)), true,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  ImGui::PushFont(app.fonts.barlow_semibold);
+  ImGui::TextColored(ImVec4(1.0f, 0.72f, 0.32f, 1.0f), "OneDrive folder detected");
+  ImGui::PopFont();
+  ImGui::PushFont(app.fonts.barlow_small);
+  ImGui::PushStyleColor(ImGuiCol_Text, kSecondary);
+  ImGui::TextWrapped("OneDrive may keep game files online-only. Keep all WWE 2K14/Recomp files "
+                     "downloaded and available offline, or move both folders outside OneDrive before playing.");
+  ImGui::PopStyleColor();
+  ImGui::PopFont();
+  ImGui::EndChild();
+  ImGui::PopStyleVar(3);
+  ImGui::PopStyleColor(2);
+  ImGui::Spacing();
+}
+
+void DrawLaunchWarning(AppState& app) {
+  if (app.launch_warning_pending) {
+    ImGui::OpenPopup("WWE 2K14 PC Recompiled##startup-warning");
+    app.launch_warning_pending = false;
+  }
+  if (app.launch_warning.empty()) return;
+  const float width = S(app, 520.0f);
+  ImGui::SetNextWindowSizeConstraints(ImVec2(width, 0.0f), ImVec2(width, FLT_MAX));
+  ImGui::SetNextWindowPos(ImGui::GetMainViewport()->GetCenter(), ImGuiCond_Always, ImVec2(0.5f, 0.5f));
+  if (ImGui::BeginPopupModal("WWE 2K14 PC Recompiled##startup-warning", nullptr,
+                             ImGuiWindowFlags_AlwaysAutoResize | ImGuiWindowFlags_NoSavedSettings)) {
+    ImGui::PushFont(app.fonts.barlow_regular);
+    ImGui::TextWrapped("%s", app.launch_warning.c_str());
+    ImGui::PopFont();
+    ImGui::Spacing();
+    const float report_width = S(app, 190.0f);
+    const float close_width = S(app, 100.0f);
+    ImGui::SetCursorPosX((ImGui::GetWindowWidth() - report_width - close_width -
+                          ImGui::GetStyle().ItemSpacing.x) * 0.5f);
+    if (AccentButton(app, "Save a Bug Report", ImVec2(report_width, S(app, 38.0f)))) {
+      app.launch_warning.clear();
+      ImGui::CloseCurrentPopup();
+      StartBugReport(app);
+    }
+    ImGui::SameLine();
+    if (ImGui::Button("Close", ImVec2(close_width, S(app, 38.0f)))) {
+      app.launch_warning.clear();
+      ImGui::CloseCurrentPopup();
+    }
+    ImGui::End();
+  }
+}
+
 void DrawPlay(AppState& app) {
   const Settings current = ActiveSettings(app);
   const float width = ImGui::GetContentRegionAvail().x;
@@ -1262,12 +1357,13 @@ void DrawPlay(AppState& app) {
   ImGui::PopStyleColor(2);
 
   ImGui::Spacing();
+  DrawOneDriveWarning(app);
   DrawUpdateBanner(app);
   if (app.update_job) DrawProgress(app);
   const float row_width = ImGui::GetContentRegionAvail().x;
   const float row_gap = ImGui::GetStyle().ItemSpacing.x;
   const float pill_width = std::min(S(app, 150.0f), (row_width - S(app, 124.0f) - 2.0f * row_gap) / 2.0f);
-  DrawPill(app, "RESOLUTION", ResolutionName(current.resolution), pill_width);
+  DrawPill(app, "OUTPUT SIZE", ResolutionName(current.resolution), pill_width);
   ImGui::SameLine();
   DrawPill(app, "DISPLAY", DisplayName(current.display), pill_width);
   ImGui::SameLine();
@@ -1355,6 +1451,9 @@ void DrawSettings(AppState& app) {
     const bool auto_start = app.settings.auto_start;
     const bool auto_backup = app.settings.auto_backup;
     const bool check_updates = app.settings.check_updates;
+    const bool sync_frames_to_monitor = app.settings.sync_frames_to_monitor;
+    const bool stretch_to_fill_wide_screens = app.settings.stretch_to_fill_wide_screens;
+    const int picture_scale = app.settings.picture_scale;
     const std::string skipped_update_version = app.settings.skipped_update_version;
     app.settings = app.recommendation.settings;
     app.settings.gpu_id = selected_gpu_id;
@@ -1362,18 +1461,22 @@ void DrawSettings(AppState& app) {
     app.settings.auto_start = auto_start;
     app.settings.auto_backup = auto_backup;
     app.settings.check_updates = check_updates;
+    app.settings.sync_frames_to_monitor = sync_frames_to_monitor;
+    app.settings.stretch_to_fill_wide_screens = stretch_to_fill_wide_screens;
+    app.settings.picture_scale = picture_scale;
     app.settings.skipped_update_version = skipped_update_version;
     app.settings.explicit_choice = false;
     SaveSettings(app);
   }
   ImGui::Spacing();
+  DrawOneDriveWarning(app);
   const float available_width = ImGui::GetContentRegionAvail().x;
   const float gap = ImGui::GetStyle().ItemSpacing.x;
   const float card_width = (available_width - gap) * 0.5f;
   if (ImGui::BeginTable("settings-grid", 2, ImGuiTableFlags_SizingStretchSame)) {
     ImGui::TableNextColumn();
     if (BeginPanel(app, "settings-resolution", ImVec2(card_width, S(app, compact ? 166.0f : 186.0f)))) {
-      DrawPanelHeading(app, "RESOLUTION", "Choose a clear picture that feels right for your PC.");
+      DrawPanelHeading(app, "OUTPUT SIZE", "The size of the game window or fullscreen picture.");
       ImGui::Spacing();
       const std::array<std::pair<Resolution, const char*>, 3> choices{{
           {Resolution::k720p, "720p"}, {Resolution::k1080p, "1080p"},
@@ -1389,10 +1492,7 @@ void DrawSettings(AppState& app) {
           SaveSettings(app);
         });
       }
-      const char* hint = current.resolution == Resolution::k720p ? "The original Xbox 360 sharpness"
-                          : current.resolution == Resolution::k1080p ? "Sharp - mid-range graphics cards"
-                                                                     : "Sharp - strong graphics cards";
-      DrawTextDisabled(app, hint);
+      DrawTextDisabled(app, "For a sharper picture, also try 'Sharper picture' below.");
     }
     EndPanel();
 
@@ -1443,6 +1543,75 @@ void DrawSettings(AppState& app) {
     }
     ImGui::EndCombo();
   }
+  ImGui::EndChild();
+  ImGui::PopStyleVar();
+  ImGui::PopStyleColor();
+
+  // Screen options are personal preferences, so they never switch off Recommended.
+  ImGui::Spacing();
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, kRaised);
+  ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, S(app, 10.0f));
+  ImGui::BeginChild("settings-screen-row", ImVec2(0, S(app, compact ? 44.0f : 52.0f)), false,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  ImGui::SetCursorPos(S(app, 14, compact ? 10.0f : 14.0f));
+  ImGui::PushStyleColor(ImGuiCol_FrameBg, kWindow);
+  ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, kPanel);
+  ImGui::PushStyleColor(ImGuiCol_Border, kMuted);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, S(app, 1.0f));
+  if (ImGui::Checkbox("Stretch to fill wide screens", &app.settings.stretch_to_fill_wide_screens)) {
+    SaveSettings(app);
+  }
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Fill a 21:9 or 16:10 screen instead of showing black bars. The 16:9 picture is stretched.");
+  }
+#ifdef _WIN32
+  // Host-display sync exists only in the Windows runtime; on Linux the game always uses its own timer.
+  ImGui::SameLine(0.0f, S(app, 28.0f));
+  if (ImGui::Checkbox("Sync frames to the monitor", &app.settings.sync_frames_to_monitor)) SaveSettings(app);
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("Turn off if the game runs too fast or stutters in fullscreen on a high-refresh, "
+                      "G-SYNC or FreeSync monitor.");
+  }
+#endif
+  ImGui::PopStyleVar();
+  ImGui::PopStyleColor(3);
+  ImGui::EndChild();
+  ImGui::PopStyleVar();
+  ImGui::PopStyleColor();
+
+  // Higher internal resolution is experimental and independent from the output-size selector.
+  ImGui::Spacing();
+  ImGui::PushStyleColor(ImGuiCol_ChildBg, kRaised);
+  ImGui::PushStyleVar(ImGuiStyleVar_ChildRounding, S(app, 10.0f));
+  ImGui::BeginChild("settings-sharper-picture-row", ImVec2(0, S(app, compact ? 44.0f : 52.0f)), false,
+                    ImGuiWindowFlags_NoScrollbar | ImGuiWindowFlags_NoScrollWithMouse);
+  ImGui::SetCursorPos(S(app, 14, compact ? 10.0f : 14.0f));
+  ImGui::PushStyleColor(ImGuiCol_FrameBg, kWindow);
+  ImGui::PushStyleColor(ImGuiCol_FrameBgHovered, kPanel);
+  ImGui::PushStyleColor(ImGuiCol_Border, kMuted);
+  ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, S(app, 1.0f));
+  ImGui::AlignTextToFramePadding();
+  ImGui::TextUnformatted("Picture detail (experimental)");
+  if (ImGui::IsItemHovered()) {
+    ImGui::SetTooltip("The game normally draws at 1280x720. 1440p and 4K draw it at 2x or 3x that size for a "
+                      "sharper picture on any screen. Needs a stronger graphics card (4K: a high-end one), and "
+                      "some effects (for example Batista's entrance pyro) can be missing.");
+  }
+  {
+    const std::array<std::pair<int, const char*>, 3> scales{{{1, "Normal (720p)"}, {2, "1440p"}, {3, "4K"}}};
+    const float scale_width = S(app, compact ? 104.0f : 118.0f);
+    ImGui::SameLine(0.0f, S(app, 16.0f));
+    for (size_t i = 0; i < scales.size(); ++i) {
+      if (i) ImGui::SameLine();
+      DrawSegment(app, scales[i].second, app.settings.picture_scale == scales[i].first, scale_width,
+                  [&app, value = scales[i].first] {
+                    app.settings.picture_scale = value;
+                    SaveSettings(app);
+                  });
+    }
+  }
+  ImGui::PopStyleVar();
+  ImGui::PopStyleColor(3);
   ImGui::EndChild();
   ImGui::PopStyleVar();
   ImGui::PopStyleColor();
@@ -2279,6 +2448,7 @@ void DrawMain(AppState& app) {
   }
   ImGui::EndChild();
   DrawFooter(app);
+  DrawLaunchWarning(app);
   ImGui::EndChild();
   ImGui::PopStyleVar();
   ImGui::PopStyleColor();
@@ -2316,6 +2486,15 @@ void ApplyFitToWindow(AppState& app) {
 void DrawFrame(AppState& app) {
   ImGui_ImplSDLRenderer3_NewFrame();
   ImGui_ImplSDL3_NewFrame();
+  if (app.screenshot_mode && app.test_pixel_density > 0.0f) {
+    ImGuiIO& io = ImGui::GetIO();
+    int window_width = 0;
+    int window_height = 0;
+    SDL_GetWindowSize(app.window, &window_width, &window_height);
+    io.DisplaySize = ImVec2(window_width / app.test_pixel_density,
+                            window_height / app.test_pixel_density);
+    io.DisplayFramebufferScale = ImVec2(app.test_pixel_density, app.test_pixel_density);
+  }
   ApplyFitToWindow(app);
   ImGui::NewFrame();
   DrawMain(app);
@@ -2327,8 +2506,11 @@ void DrawFrame(AppState& app) {
   ImGui::Render();
   SDL_SetRenderDrawColor(app.renderer, 15, 16, 20, 255);
   SDL_RenderClear(app.renderer);
-  // SDL scales geometry and clip rectangles; the ImGui backend skips its own scaling when set.
-  SDL_SetRenderScale(app.renderer, app.fit_scale, app.fit_scale);
+  // Map logical ImGui coordinates to framebuffer pixels, then apply fit-to-window. The renderer
+  // backend leaves clip rectangles in logical coordinates when SDL renderer scaling is active.
+  const ImVec2 framebuffer_scale = ImGui::GetIO().DisplayFramebufferScale;
+  SDL_SetRenderScale(app.renderer, app.fit_scale * framebuffer_scale.x,
+                     app.fit_scale * framebuffer_scale.y);
   ImGui_ImplSDLRenderer3_RenderDrawData(ImGui::GetDrawData(), app.renderer);
   SDL_SetRenderScale(app.renderer, 1.0f, 1.0f);
 }
@@ -2429,8 +2611,8 @@ bool CaptureUpdateState(AppState& app) {
 
 void LoadFonts(AppState& app) {
   ImGuiIO& io = ImGui::GetIO();
-  float scale = SDL_GetWindowDisplayScale(app.window);
-  if (scale < 0.5f || !std::isfinite(scale)) scale = 1.0f;
+  const float scale = ui::ComputeUiScale(SDL_GetWindowDisplayScale(app.window),
+                                         GetWindowPixelDensity(app));
   auto add = [scale](const unsigned char* data, unsigned int size, float pixels) {
     ImFont* font = ImGui::GetIO().Fonts->AddFontFromMemoryCompressedTTF(data, static_cast<int>(size), pixels * scale);
     return font ? font : ImGui::GetIO().Fonts->AddFontDefault();
@@ -2490,6 +2672,12 @@ bool Initialize(AppState& app, int argc, char** argv) {
           app.startup_height = height;
           app.test_window_size = true;
         }
+      }
+    }
+    if (argument == "--test-pixel-density" && i + 1 < argc) {
+      const float density = std::strtof(argv[++i], nullptr);
+      if (density >= 0.5f && density <= 4.0f && std::isfinite(density)) {
+        app.test_pixel_density = density;
       }
     }
     if (argument == "--test-drop-tab" && i + 1 < argc) {
@@ -2689,10 +2877,15 @@ int main(int argc, char** argv) {
     SDL_GetRenderVSync(app.renderer, &vsync);
     int width = 0;
     int height = 0;
+    int logical_width = 0;
+    int logical_height = 0;
     SDL_GetWindowSizeInPixels(app.window, &width, &height);
+    SDL_GetWindowSize(app.window, &logical_width, &logical_height);
     const SDL_DisplayMode* mode = SDL_GetCurrentDisplayMode(SDL_GetDisplayForWindow(app.window));
-    PerfLog("renderer=%s vsync=%d window=%dx%d display_scale=%.2f refresh=%.1f Hz video_driver=%s",
-            SDL_GetRendererName(app.renderer), vsync, width, height, SDL_GetWindowDisplayScale(app.window),
+    PerfLog("renderer=%s vsync=%d window_pixels=%dx%d window_coords=%dx%d pixel_density=%.2f "
+            "display_scale=%.2f ui_scale=%.2f refresh=%.1f Hz video_driver=%s",
+            SDL_GetRendererName(app.renderer), vsync, width, height, logical_width, logical_height,
+            GetWindowPixelDensity(app), SDL_GetWindowDisplayScale(app.window), app.display_scale,
             mode ? mode->refresh_rate : 0.0f, SDL_GetCurrentVideoDriver());
   }
   int quiet_frames = 0;

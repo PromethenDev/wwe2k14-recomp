@@ -9,10 +9,12 @@
 #include <algorithm>
 #include <array>
 #include <chrono>
+#include <cstdio>
 #include <map>
 #include <cwchar>
 #include <string>
 #include <system_error>
+#include <thread>
 
 #ifdef _WIN32
 #define WIN32_LEAN_AND_MEAN
@@ -20,6 +22,7 @@
 #else
 #include <cerrno>
 #include <spawn.h>
+#include <sys/wait.h>
 #include <unistd.h>
 extern char** environ;
 #endif
@@ -27,8 +30,8 @@ extern char** environ;
 namespace wwe2k14::launcher {
 namespace {
 
-// The 2K14 runtime exposes only the SDL preset (--resolution) and the draw scale (--resolution_scale);
-// there is no internal-resolution override like the WWE '13 runtime's scene_resolution hook.
+// The 2K14 runtime's --resolution preset sets the guest video mode and startup window; the independent
+// --resolution_scale cvar scales renderer drawing. There is no WWE '13-style scene_resolution override.
 const char* ResolutionPreset(Resolution resolution) {
   switch (resolution) {
     case Resolution::k1080p: return "1080p";
@@ -147,6 +150,10 @@ std::vector<std::string> PosixEnvironment(
 
 #endif
 
+bool IsCancelled(const CancelFlag* cancel) {
+  return cancel && cancel->load(std::memory_order_acquire);
+}
+
 }  // namespace
 
 LaunchPlan BuildLaunchPlan(const Paths& paths, const Settings& settings,
@@ -193,19 +200,31 @@ LaunchPlan BuildLaunchPlan(const Paths& paths, const Settings& settings,
     }
   }
 
+  if (effective.stretch_to_fill_wide_screens) {
+    plan.arguments.emplace_back("--present_letterbox=false");
+  }
+  if (effective.picture_scale == 2 || effective.picture_scale == 3) {
+    plan.arguments.emplace_back("--resolution_scale=" + std::to_string(effective.picture_scale));
+  }
+
   // Only the diagnostics the 2K14 executable actually reads: its thread profiler still uses the
   // WWE13_THREAD_PROFILE* names (src/thread_profiler.cpp). Empty values clear inherited developer
-  // switches. The WWE '13-only renderer overrides (internal resolution, scene AA, frame-rate modes,
-  // F24 pixel rate, rate census, perf overlay, lock-owner sample) are deliberately not set.
+  // switches. The WWE '13-only environment overrides (scene AA, frame-rate modes, F24 pixel rate,
+  // rate census, perf overlay, lock-owner sample) are deliberately not set.
   plan.environment = {
       {"REX_DEBUG_UI", "false"},
       {"WWE13_THREAD_PROFILE", ""},
       {"WWE13_THREAD_PROFILE_HZ", ""},
       {"WWE13_THREAD_PROFILE_OUT", ""}};
+  // The launcher's checkbox is authoritative, also over a WWE2K14_HOST_VSYNC inherited from the player's
+  // environment (on = 1 is the game's own default).
+  plan.environment.emplace_back("WWE2K14_HOST_VSYNC", effective.sync_frames_to_monitor ? "1" : "0");
   return plan;
 }
 
-Result StartGame(const LaunchPlan& plan) {
+Result StartGame(const LaunchPlan& plan, double watch_seconds, std::atomic<bool>* process_started,
+                 const CancelFlag* cancel) {
+  if (process_started) process_started->store(false, std::memory_order_relaxed);
   try {
     std::error_code error;
     for (const std::string& argument : plan.arguments) {
@@ -224,6 +243,7 @@ Result StartGame(const LaunchPlan& plan) {
     if (!fs::is_regular_file(plan.executable, error) || error) {
       return Result::Fail("The game program could not be found next to the launcher.");
     }
+    if (IsCancelled(cancel)) return Result::Ok();
 #ifdef _WIN32
     std::wstring command = QuoteArgument(plan.executable.wstring());
     for (const std::string& argument : plan.arguments) {
@@ -245,7 +265,51 @@ Result StartGame(const LaunchPlan& plan) {
       return Result::Fail("WWE 2K14 could not be started. Check the game folder and try again.");
     }
     CloseHandle(process.hThread);
+    if (process_started) process_started->store(true, std::memory_order_release);
+    bool failed_early = false;
+    bool outcome_unknown = false;
+    if (watch_seconds > 0.0) {
+      const auto deadline = std::chrono::steady_clock::now() +
+          std::chrono::duration_cast<std::chrono::steady_clock::duration>(
+              std::chrono::duration<double>(watch_seconds));
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (IsCancelled(cancel)) break;
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        const DWORD wait_ms = static_cast<DWORD>(std::clamp<int64_t>(remaining.count(), 1, 100));
+        const DWORD wait_result = WaitForSingleObject(process.hProcess, wait_ms);
+        if (IsCancelled(cancel)) break;
+        if (wait_result == WAIT_TIMEOUT) continue;
+        if (wait_result == WAIT_OBJECT_0) {
+          DWORD exit_code = 0;
+          if (!GetExitCodeProcess(process.hProcess, &exit_code)) {
+            const DWORD wait_error = GetLastError();
+            std::fprintf(stderr, "[launcher] GetExitCodeProcess failed while watching WWE 2K14: %lu\n",
+                         static_cast<unsigned long>(wait_error));
+            outcome_unknown = true;
+          } else if (exit_code == STILL_ACTIVE) {
+            std::fprintf(stderr, "[launcher] WWE 2K14 wait signaled but its exit code is still active\n");
+            outcome_unknown = true;
+          } else {
+            failed_early = exit_code != 0;
+          }
+          break;
+        }
+        if (wait_result == WAIT_FAILED) {
+          const DWORD wait_error = GetLastError();
+          std::fprintf(stderr, "[launcher] WaitForSingleObject failed while watching WWE 2K14: %lu\n",
+                       static_cast<unsigned long>(wait_error));
+        } else {
+          std::fprintf(stderr, "[launcher] WaitForSingleObject returned an unknown result: %lu\n",
+                       static_cast<unsigned long>(wait_result));
+        }
+        outcome_unknown = true;
+        break;
+      }
+    }
     CloseHandle(process.hProcess);
+    if (failed_early) return Result::Fail(kGameClosedEarlyMessage);
+    if (outcome_unknown) return Result::Unknown();
     return Result::Ok();
 #else
     std::vector<std::string> arguments;
@@ -288,6 +352,43 @@ Result StartGame(const LaunchPlan& plan) {
     if (status != 0) {
       return Result::Fail("WWE 2K14 could not be started. Check the game folder and try again.");
     }
+    if (process_started) process_started->store(true, std::memory_order_release);
+    bool failed_early = false;
+    bool outcome_unknown = false;
+    if (watch_seconds > 0.0) {
+      const auto deadline = std::chrono::steady_clock::now() +
+          std::chrono::milliseconds(static_cast<int64_t>(watch_seconds * 1000.0));
+      while (std::chrono::steady_clock::now() < deadline) {
+        if (IsCancelled(cancel)) break;
+        int wait_status = 0;
+        const pid_t done = waitpid(child, &wait_status, WNOHANG);
+        if (done == child) {
+          if (IsCancelled(cancel)) break;
+          if (WIFSIGNALED(wait_status)) {
+            failed_early = true;
+          } else if (WIFEXITED(wait_status)) {
+            failed_early = WEXITSTATUS(wait_status) != 0;
+          } else {
+            std::fprintf(stderr, "[launcher] waitpid returned an unclassifiable WWE 2K14 status: %d\n",
+                         wait_status);
+            outcome_unknown = true;
+          }
+          break;
+        }
+        if (done < 0) {
+          const int wait_error = errno;
+          if (wait_error == EINTR) continue;
+          std::fprintf(stderr, "[launcher] waitpid failed while watching WWE 2K14: errno=%d\n", wait_error);
+          outcome_unknown = true;
+          break;
+        }
+        const auto remaining = std::chrono::duration_cast<std::chrono::milliseconds>(
+            deadline - std::chrono::steady_clock::now());
+        std::this_thread::sleep_for(std::min(remaining, std::chrono::milliseconds(100)));
+      }
+    }
+    if (failed_early) return Result::Fail(kGameClosedEarlyMessage);
+    if (outcome_unknown) return Result::Unknown();
     return Result::Ok();
 #endif
   } catch (...) {

@@ -3,6 +3,7 @@
 #endif
 
 #include "launcher_core.h"
+#include "../../ui/display_scale.h"
 
 #include "internal/archive.h"
 #include "internal/util.h"
@@ -88,6 +89,7 @@ void TestSettings(const fs::path& root) {
   assert(loaded.gpu_id == "10DE:2684");
   assert(wwe2k14::launcher::internal::PathToUtf8(loaded.game_folder) == "C:/Games/Roster-\xC3\xA9");
   assert(loaded.auto_start && !loaded.auto_backup && loaded.explicit_choice);
+  assert(loaded.sync_frames_to_monitor && !loaded.stretch_to_fill_wide_screens && loaded.picture_scale == 1);
   assert(SaveSettings(paths, loaded).ok);
   std::vector<uint8_t> saved_bytes;
   assert(wwe2k14::launcher::internal::ReadBinaryFile(paths.settings_file, saved_bytes));
@@ -98,6 +100,18 @@ void TestSettings(const fs::path& root) {
   assert(saved_text.find("unknown_key=keep-this") != std::string::npos);
   assert(saved_text.find("gpu_name=Old GPU") != std::string::npos);
   assert(saved_text.find("[Other]") != std::string::npos && saved_text.find("keep=also-this") != std::string::npos);
+  assert(saved_text.find("sync_frames_to_monitor=1") != std::string::npos);
+  assert(saved_text.find("stretch_to_fill_wide_screens=0") != std::string::npos);
+  assert(saved_text.find("picture_scale=1") != std::string::npos);
+
+  Settings custom_screen = loaded;
+  custom_screen.sync_frames_to_monitor = false;
+  custom_screen.stretch_to_fill_wide_screens = true;
+  custom_screen.picture_scale = 3;
+  assert(SaveSettings(paths, custom_screen).ok);
+  const Settings custom_screen_loaded = LoadSettings(paths);
+  assert(!custom_screen_loaded.sync_frames_to_monitor && custom_screen_loaded.stretch_to_fill_wide_screens &&
+         custom_screen_loaded.picture_scale == 3);
 
   Paths legacy_paths = MakePaths(directory / "legacy");
   fs::create_directories(legacy_paths.exe_dir);
@@ -108,6 +122,26 @@ void TestSettings(const fs::path& root) {
   const Settings legacy = LoadSettings(legacy_paths);
   assert(legacy.resolution == Resolution::k720p && legacy.explicit_choice);
   assert(legacy.gpu_id.empty());
+  assert(legacy.sync_frames_to_monitor && !legacy.stretch_to_fill_wide_screens && legacy.picture_scale == 1);
+
+  // A 1.0.1 test build's sharper_picture=1 becomes the 1440p picture scale.
+  Paths sharper_paths = MakePaths(directory / "sharper");
+  fs::create_directories(sharper_paths.exe_dir);
+  assert(wwe2k14::launcher::internal::WriteBinaryFile(
+      sharper_paths.settings_file,
+      wwe2k14::launcher::internal::Utf8ToUtf16LeBytes("[Settings]\r\nschema=7\r\nsharper_picture=1\r\n")));
+  assert(LoadSettings(sharper_paths).picture_scale == 2);
+  // Out-of-range or garbage picture_scale values fall back to the normal picture (no --resolution_scale argument).
+  for (const char* bad : {"0", "4", "-1", "2x", "high", ""}) {
+    assert(wwe2k14::launcher::internal::WriteBinaryFile(
+        sharper_paths.settings_file, wwe2k14::launcher::internal::Utf8ToUtf16LeBytes(
+                                         std::string("[Settings]\r\nschema=7\r\npicture_scale=") + bad + "\r\n")));
+    const Settings bad_loaded = LoadSettings(sharper_paths);
+    assert(bad_loaded.picture_scale == 1);
+    for (const std::string& argument : BuildLaunchPlan(sharper_paths, bad_loaded, {}).arguments) {
+      assert(argument.rfind("--resolution_scale", 0) != 0);
+    }
+  }
 
   Paths invalid_utf8_paths = MakePaths(directory / "invalid-utf8");
   fs::create_directories(invalid_utf8_paths.exe_dir);
@@ -128,6 +162,43 @@ void TestSettings(const fs::path& root) {
   std::cout << "PASS settings UTF-16LE schema-7 round-trip, unknown keys, schema-2 migration, and 1080p persistence\n";
 }
 
+void TestUiDisplayScale() {
+  using wwe2k14::launcher::ui::ComputeUiScale;
+  assert(ComputeUiScale(2.0f, 2.0f) == 1.0f);  // pixel density must not enlarge logical layout.
+  assert(ComputeUiScale(2.0f, 1.0f) == 2.0f);  // content scaling remains in layout/fonts.
+  assert(ComputeUiScale(1.5f, 2.0f) == 0.75f);
+  assert(ComputeUiScale(0.0f, 1.0f) == 1.0f);
+  assert(ComputeUiScale(2.0f, 0.0f) == 2.0f);
+  assert(ComputeUiScale(1.0f, 4.0f) == 1.0f);  // reject implausibly small resulting scales.
+  std::cout << "PASS HiDPI UI scale separates logical content scale from framebuffer density\n";
+}
+
+void TestOneDrivePathDetection(const fs::path& root) {
+  const fs::path configured_root = root / "OneDriveConsumerRoot";
+  fs::create_directories(configured_root / "Nested");
+  const fs::path configured_child = configured_root / "Nested" / ".." / "WWE 2K14";
+  assert(IsOneDrivePath(configured_child, {configured_root}, false));
+  const fs::path case_variant_child = configured_root.parent_path() /
+      "onedriveconsumerroot" / "WWE 2K14";
+  assert(IsOneDrivePath(case_variant_child, {configured_root}, false));
+
+  // Configured roots take precedence over misleading folder names: do not use the fallback if any
+  // OneDrive environment variable exists, even if this particular path is not beneath its root.
+  const fs::path local_named_onedrive = root / "Games" / "OneDrive" / "WWE 2K14";
+  assert(!IsOneDrivePath(local_named_onedrive, {configured_root}, false));
+  const fs::path prefix_lookalike = configured_root.parent_path() /
+      (configured_root.filename().string() + "Backup") / "WWE 2K14";
+  assert(!IsOneDrivePath(prefix_lookalike, {configured_root}, false));
+
+  // When no configured roots exist, retain the historical folder-name fallback.
+  const fs::path business_named = root / "OneDrive - Example Org" / "WWE2K14-Recomp";
+  const fs::path unrelated = root / "Games" / "OneDriveBackup" / "WWE 2K14";
+  assert(IsOneDrivePath(business_named, {}, true));
+  assert(IsOneDrivePath(local_named_onedrive, {}, true));
+  assert(!IsOneDrivePath(unrelated, {}, true));
+  std::cout << "PASS OneDrive path matching uses canonical configured roots and falls back to folder names only without roots\n";
+}
+
 const std::string* EnvironmentValue(const LaunchPlan& plan, const std::string& name) {
   for (const auto& [key, value] : plan.environment) if (key == name) return &value;
   return nullptr;
@@ -145,7 +216,7 @@ void TestLaunchPlan(const fs::path& root) {
     settings.resolution = resolution;
     settings.display = DisplayMode::kFullscreen;
     settings.gpu_id = "10DE:2684";
-    settings.game_folder = root / "launch" / "WWE 2K14";
+    settings.game_folder = root / "launch" / "Masaüstü" / "WWE 2K14";
     settings.explicit_choice = true;
     const LaunchPlan plan = BuildLaunchPlan(paths, settings, gpus);
     assert(plan.executable == paths.game_exe);
@@ -157,6 +228,7 @@ void TestLaunchPlan(const fs::path& root) {
         "--ignore_offset_for_ranged_allocations=true", "--log_verbose=false", "--mnk_mode=true"};
     assert(plan.arguments.size() == fixed.size() + 5);
     for (size_t index = 0; index < fixed.size(); ++index) assert(plan.arguments[index] == fixed[index]);
+    assert(plan.arguments[0].find("Masa\xC3\xBCst\xC3\xBC") != std::string::npos);
     assert(plan.arguments[8].starts_with("--log_file="));
     const fs::path log_path = wwe2k14::launcher::internal::PathFromUtf8(plan.arguments[8].substr(11));
     assert(log_path.parent_path().lexically_normal() == paths.logs_dir.lexically_normal());
@@ -173,6 +245,12 @@ void TestLaunchPlan(const fs::path& root) {
     assert(EnvironmentValue(plan, "WWE13_THREAD_PROFILE") && EnvironmentValue(plan, "WWE13_THREAD_PROFILE")->empty());
     assert(EnvironmentValue(plan, "WWE13_THREAD_PROFILE_HZ") && EnvironmentValue(plan, "WWE13_THREAD_PROFILE_HZ")->empty());
     assert(EnvironmentValue(plan, "WWE13_THREAD_PROFILE_OUT") && EnvironmentValue(plan, "WWE13_THREAD_PROFILE_OUT")->empty());
+    assert(EnvironmentValue(plan, "WWE2K14_HOST_VSYNC") && *EnvironmentValue(plan, "WWE2K14_HOST_VSYNC") == "1");
+    const std::vector<std::pair<std::string, std::string>> expected_environment = {
+        {"REX_DEBUG_UI", "false"}, {"WWE13_THREAD_PROFILE", ""},
+        {"WWE13_THREAD_PROFILE_HZ", ""}, {"WWE13_THREAD_PROFILE_OUT", ""},
+        {"WWE2K14_HOST_VSYNC", "1"}};
+    assert(plan.environment == expected_environment);
     for (const char* dropped : {"WWE2K14_F24_PIXEL_RATE", "WWE2K14_INTERNAL_RES", "WWE2K14_SCENE_AA",
                                 "WWE2K14_KEEP_60", "WWE2K14_LOCK_30", "WWE2K14_RATE_CENSUS",
                                 "WWE2K14_FRAME_TIME", "WWE2K14_PERF_OVERLAY",
@@ -180,12 +258,40 @@ void TestLaunchPlan(const fs::path& root) {
       assert(EnvironmentValue(plan, dropped) == nullptr);
     }
   }
+  // An explicit 1440p selection must survive recommendation resolution and reach the runtime as
+  // the selected preset. This verifies launcher-side intent only; the SDK's draw scale is separate.
+  Settings selected_1440p;
+  selected_1440p.resolution = Resolution::k1440p;
+  selected_1440p.gpu_id = "1002:164E";
+  selected_1440p.explicit_choice = true;
+  const LaunchPlan selected_plan = BuildLaunchPlan(paths, selected_1440p, gpus);
+  assert(selected_plan.arguments[11] == "--resolution=1440p");
+
+  Settings output_options;
+  output_options.explicit_choice = true;
+  const LaunchPlan default_options_plan = BuildLaunchPlan(paths, output_options, gpus);
+  assert(default_options_plan.arguments.size() == 12);
+  assert(EnvironmentValue(default_options_plan, "WWE2K14_HOST_VSYNC") &&
+         *EnvironmentValue(default_options_plan, "WWE2K14_HOST_VSYNC") == "1");
+
+  output_options.sync_frames_to_monitor = false;
+  output_options.stretch_to_fill_wide_screens = true;
+  output_options.picture_scale = 2;
+  const LaunchPlan enabled_options_plan = BuildLaunchPlan(paths, output_options, gpus);
+  assert(enabled_options_plan.arguments.size() == 14);
+  assert(enabled_options_plan.arguments[12] == "--present_letterbox=false");
+  assert(enabled_options_plan.arguments[13] == "--resolution_scale=2");
+  assert(EnvironmentValue(enabled_options_plan, "WWE2K14_HOST_VSYNC") &&
+         *EnvironmentValue(enabled_options_plan, "WWE2K14_HOST_VSYNC") == "0");
+  output_options.picture_scale = 3;
+  assert(BuildLaunchPlan(paths, output_options, gpus).arguments[13] == "--resolution_scale=3");
+
   Settings automatic;
   automatic.gpu_id = "1002:164E";
   const LaunchPlan integrated = BuildLaunchPlan(paths, automatic, gpus);
   // Integrated graphics now share the original 720p preset; 2K14 has no 480p / 30-locked override.
   assert(integrated.arguments[1] == "--async_shader_compilation=false");
-  std::cout << "PASS launch plan 720p/1080p/1440p, 2K14-only env overrides, dropped WWE '13 overrides absent\n";
+  std::cout << "PASS launch plan output sizes, optional widescreen/sharp-picture arguments, monitor-sync env, and defaults\n";
 }
 
 void TestGameChecksAndSearch(const fs::path& root, const fs::path& data) {
@@ -459,6 +565,8 @@ int main() {
   assert(!error);
   const fs::path root = output / "run";
   const fs::path data = WWE2K14_LAUNCHER_TESTDATA;
+  TestUiDisplayScale();
+  TestOneDrivePathDetection(root / "onedrive-test");
   TestSettings(root);
   TestLaunchPlan(root);
   TestGameChecksAndSearch(root, data);

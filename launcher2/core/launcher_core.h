@@ -23,8 +23,10 @@ namespace fs = std::filesystem;
 struct Result {
   bool ok = true;
   std::string error;  // player-readable, empty when ok
+  bool unknown = false;  // outcome could not be classified; callers should not report a false failure
   static Result Ok() { return {}; }
-  static Result Fail(std::string message) { return {false, std::move(message)}; }
+  static Result Fail(std::string message) { return {false, std::move(message), false}; }
+  static Result Unknown() { return {false, {}, true}; }
 };
 
 // done/total in bytes (or items when bytes are unknown); label = what is happening now ("Extracting pac/ch/ch82.pac").
@@ -44,17 +46,24 @@ struct Paths {
   fs::path default_game_folder;  // exe_dir/"WWE 2K14"
 };
 Paths ResolvePaths(const fs::path& launcher_executable);
+// True when any path component is a personal or business OneDrive root.
+bool IsUnderOneDrive(const fs::path& path);
+// Testable path matcher. allow_name_fallback is true only when no OneDrive environment variables exist.
+bool IsOneDrivePath(const fs::path& path, const std::vector<fs::path>& roots,
+                    bool allow_name_fallback);
 
 // ---------------------------------------------------------------------------------------------- settings
-// WWE 2K14 has no in-game frame-rate or anti-aliasing override (the WWE '13 runtime's
-// scene_resolution / scene_aa / present-interval hooks were never ported), so the launcher only
-// keeps options the 2K14 executable actually acts on: the SDL output resolution and the display mode.
+// WWE 2K14 does not have the WWE '13 runtime's custom frame-rate or scene-AA hooks. The launcher exposes
+// the output size/display mode, host frame sync, optional wide-screen stretching, and the runtime's renderer scale.
 enum class Resolution { k720p, k1080p, k1440p };
 enum class DisplayMode { kFullscreen, kWindowed };
 
 struct Settings {
   Resolution resolution = Resolution::k720p;
   DisplayMode display = DisplayMode::kFullscreen;
+  bool sync_frames_to_monitor = true;
+  bool stretch_to_fill_wide_screens = false;
+  int picture_scale = 1;  // internal draw scale: 1 = the game's 720p, 2 = 1440p, 3 = 4K (experimental)
   std::string gpu_id;    // stable id of the chosen Vulkan device ("" = recommended)
   fs::path game_folder;  // folder holding default.xex + default.xexp
   bool auto_start = false;          // "Start straight away next time" (hold Shift at start to come back)
@@ -76,8 +85,9 @@ struct GpuInfo {
   int vulkan_index = -1;   // what the game's --vulkan_device expects
 };
 std::vector<GpuInfo> ListGpus();  // Vulkan enumeration (volk), CPU/llvmpipe devices excluded
-// The defaults shown as "Recommended for this PC": integrated/handheld -> 480p, 30 locked, Original AA;
-// discrete -> 720p, Classic, Original AA. Returns the reason line too ("Radeon 780M - integrated graphics").
+// The current default shown as "Recommended for this PC" is 720p on all detected GPUs. Returns the
+// reason line too (for example, "Radeon 780M - integrated graphics"). The 2K14 runtime has no verified
+// 480p internal-render option or launcher frame-rate override.
 struct Recommendation {
   Settings settings;
   std::string reason;
@@ -158,9 +168,8 @@ Result AddSongs(const Paths& paths, const std::vector<fs::path>& files, std::vec
 Result RemoveSong(const Paths& paths, const fs::path& song_file);
 
 // ---------------------------------------------------------------------------------------------- launch
-// The exact command line and environment the current launcher uses (launcher/main.cpp BuildArguments /
-// BuildEnvironmentOverrides), from Settings: game folder, --fullscreen, --user_data_root, --log_file,
-// --vulkan_device_id, --resolution. Only the diagnostics the 2K14 runtime reads
+// The exact command line and environment the launcher uses from Settings: output size/display, optional
+// letterbox and renderer scale, and host frame sync. Only the diagnostics the 2K14 runtime reads
 // (WWE13_THREAD_PROFILE*) are passed through; the WWE '13-only override variables are not.
 struct LaunchPlan {
   fs::path executable;
@@ -169,7 +178,14 @@ struct LaunchPlan {
   fs::path working_directory;
 };
 LaunchPlan BuildLaunchPlan(const Paths& paths, const Settings& settings, const std::vector<GpuInfo>& gpus);
-Result StartGame(const LaunchPlan& plan);  // detached; returns once the process started
+inline constexpr const char* kGameClosedEarlyMessage =
+    "The game closed unexpectedly while starting. Please use 'Save a Bug Report' and attach it to your "
+    "GitHub report. On Intel graphics, installing the newest Intel graphics driver may help.";
+// Detached start. process_started is set immediately after creation; with watch_seconds > 0 an
+// unsuccessful early exit is reported so the launcher can offer diagnostics instead of closing silently.
+// cancel is observed during the watch; an unclassifiable wait result returns Result::Unknown().
+Result StartGame(const LaunchPlan& plan, double watch_seconds = 0.0,
+                 std::atomic<bool>* process_started = nullptr, const CancelFlag* cancel = nullptr);
 
 // ---------------------------------------------------------------------------------------------- keyboard controls
 // The game's keyboard keys: keybind_* in wwe2k14.toml beside the game executable (read by the game at start).

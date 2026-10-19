@@ -1,0 +1,260 @@
+From d44f9781f9380da66ee488b9889d59c0dc372e88 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 07:04:23 -0700
+Subject: [PATCH 101/103] Vulkan: name failed VkResults in the log and decode
+ Intel driver versions (GitHub #8, #23)
+
+---
+ include/rex/ui/vulkan/util.h                |  3 +++
+ src/ui/vulkan/vulkan_device.cpp             |  9 +++++++
+ src/ui/vulkan/vulkan_presenter.cpp          | 26 +++++++++++++++---
+ src/ui/vulkan/vulkan_submission_tracker.cpp | 29 ++++++++++++++++-----
+ src/ui/vulkan/vulkan_util.cpp               | 24 ++++++++++++++---
+ 5 files changed, 77 insertions(+), 14 deletions(-)
+
+diff --git a/include/rex/ui/vulkan/util.h b/include/rex/ui/vulkan/util.h
+index 27a51364..876df813 100644
+--- a/include/rex/ui/vulkan/util.h
++++ b/include/rex/ui/vulkan/util.h
+@@ -21,6 +21,9 @@ namespace ui {
+ namespace vulkan {
+ namespace util {
+ 
++const char* VkResultName(VkResult result);
++void LogVkResultFailure(const char* operation, VkResult result);
++
+ template <typename DestroyFunction, typename Object>
+ inline bool DestroyAndNullHandle(DestroyFunction* const destroy_function, Object& handle) {
+   if (handle != VK_NULL_HANDLE) {
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 14504370..2db31d9f 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -591,6 +591,15 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+                 properties_1_2_KHR_driver_properties.conformanceVersion.patch);
+   }
+ 
++  if (REX_PLATFORM_WIN32 &&
++      (device->properties_.driverID == VK_DRIVER_ID_INTEL_PROPRIETARY_WINDOWS ||
++       (device->properties_.driverID == VkDriverId(0) && device->properties_.vendorID == 0x8086))) {
++    const uint32_t version = device->properties_.driverVersion;
++    REXLOG_INFO(
++        "VulkanDriverVersion: vendor=Intel scheme=intel-windows driver=x.x.{}.{} raw=0x{:X}",
++        version >> 14, version & 0x3FFF, version);
++  }
++
+   XE_UI_VULKAN_LIMIT(maxImageDimension2D)
+   XE_UI_VULKAN_LIMIT(maxImageDimension3D)
+   XE_UI_VULKAN_LIMIT(maxImageDimensionCube)
+diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
+index 2fa9642f..522b86a2 100644
+--- a/src/ui/vulkan/vulkan_presenter.cpp
++++ b/src/ui/vulkan/vulkan_presenter.cpp
+@@ -604,6 +604,7 @@ bool VulkanPresenter::CaptureGuestOutput(RawImage& image_out) {
+             dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+       }
+       if (submit_result != VK_SUCCESS) {
++        util::LogVkResultFailure("vkQueueSubmit (guest output capture)", submit_result);
+         REXLOG_ERROR(
+             "VulkanPresenter: Failed to submit the guest output capturing "
+             "command buffer");
+@@ -1063,8 +1064,10 @@ bool VulkanPresenter::RefreshGuestOutputImpl(
+         guest_output_image_refresher_submission_tracker_.AcquireFenceToAdvanceSubmission());
+     const VulkanDevice::Queue::Acquisition queue_acquisition =
+         vulkan_device_->AcquireQueue(vulkan_device_->queue_family_graphics_compute(), 0);
+-    if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence()) !=
+-        VK_SUCCESS) {
++    const VkResult fence_submit_result =
++        dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, fence_acqusition.fence());
++    if (fence_submit_result != VK_SUCCESS) {
++      util::LogVkResultFailure("vkQueueSubmit (guest output refresh fence)", fence_submit_result);
+       fence_acqusition.SubmissionSucceededSignalFailed();
+     }
+   }
+@@ -1546,6 +1549,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+   VkResult acquire_result =
+       dfn.vkAcquireNextImageKHR(device, paint_context_.swapchain, UINT64_MAX, acquire_semaphore,
+                                 VK_NULL_HANDLE, &swapchain_image_index);
++  // Out-of-date / surface-lost / exclusive-mode-lost are normal while resizing or switching apps; the
++  // switch below logs those as info.
++  if (acquire_result != VK_SUCCESS && acquire_result != VK_SUBOPTIMAL_KHR && acquire_result != VK_ERROR_OUT_OF_DATE_KHR &&
++      acquire_result != VK_ERROR_SURFACE_LOST_KHR && acquire_result != VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
++    util::LogVkResultFailure("vkAcquireNextImageKHR", acquire_result);
++  }
+   switch (acquire_result) {
+     case VK_SUCCESS:
+     case VK_SUBOPTIMAL_KHR:
+@@ -2175,13 +2184,16 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+       submit_result =
+           dfn.vkQueueSubmit(queue_acquisition.queue(), 1, &submit_info, fence_acqusition.fence());
+       if (ui_fence_acquisition.fence() != VK_NULL_HANDLE && submit_result == VK_SUCCESS) {
+-        if (dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr,
+-                              ui_fence_acquisition.fence()) != VK_SUCCESS) {
++        const VkResult ui_fence_submit_result =
++            dfn.vkQueueSubmit(queue_acquisition.queue(), 0, nullptr, ui_fence_acquisition.fence());
++        if (ui_fence_submit_result != VK_SUCCESS) {
++          util::LogVkResultFailure("vkQueueSubmit (UI submission fence)", ui_fence_submit_result);
+           ui_fence_acquisition.SubmissionSucceededSignalFailed();
+         }
+       }
+     }
+     if (submit_result != VK_SUCCESS) {
++      util::LogVkResultFailure("vkQueueSubmit (present command buffers)", submit_result);
+       REXLOG_ERROR("VulkanPresenter: Failed to submit command buffers");
+       fence_acqusition.SubmissionFailedOrDropped();
+       ui_fence_acquisition.SubmissionFailedOrDropped();
+@@ -2216,6 +2228,12 @@ Presenter::PaintResult VulkanPresenter::PaintAndPresentImpl(bool execute_ui_draw
+         vulkan_device_->AcquireQueue(paint_context_.present_queue_family, 0);
+     present_result = dfn.vkQueuePresentKHR(queue_acquisition.queue(), &present_info);
+   }
++  // Out-of-date / surface-lost / exclusive-mode-lost are normal while resizing or switching apps; the
++  // switch below logs those as info.
++  if (present_result != VK_SUCCESS && present_result != VK_SUBOPTIMAL_KHR && present_result != VK_ERROR_OUT_OF_DATE_KHR &&
++      present_result != VK_ERROR_SURFACE_LOST_KHR && present_result != VK_ERROR_FULL_SCREEN_EXCLUSIVE_MODE_LOST_EXT) {
++    util::LogVkResultFailure("vkQueuePresentKHR", present_result);
++  }
+   if (present_result == VK_SUCCESS || present_result == VK_SUBOPTIMAL_KHR) {
+     host_present_count_.fetch_add(1, std::memory_order_relaxed);
+   }
+diff --git a/src/ui/vulkan/vulkan_submission_tracker.cpp b/src/ui/vulkan/vulkan_submission_tracker.cpp
+index 07a07b2b..e406e02c 100644
+--- a/src/ui/vulkan/vulkan_submission_tracker.cpp
++++ b/src/ui/vulkan/vulkan_submission_tracker.cpp
+@@ -77,7 +77,11 @@ uint64_t VulkanSubmissionTracker::UpdateAndGetCompletedSubmission() {
+     while (!fences_pending_.empty()) {
+       const std::pair<uint64_t, VkFence>& pending_pair = fences_pending_.front();
+       assert_true(pending_pair.first > submission_completed_on_gpu_);
+-      if (dfn.vkGetFenceStatus(device, pending_pair.second) != VK_SUCCESS) {
++      const VkResult fence_status = dfn.vkGetFenceStatus(device, pending_pair.second);
++      if (fence_status != VK_SUCCESS) {
++        if (fence_status != VK_NOT_READY) {
++          util::LogVkResultFailure("vkGetFenceStatus (submission tracker)", fence_status);
++        }
+         break;
+       }
+       fences_reclaimed_.push_back(pending_pair.second);
+@@ -119,15 +123,21 @@ bool VulkanSubmissionTracker::AwaitSubmissionCompletion(uint64_t submission_inde
+       assert_true(pending_pair.first > submission_completed_on_gpu_);
+       if (pending_pair.first <= submission_index) {
+         // Wait if requested.
+-        if (dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX) ==
+-            VK_SUCCESS) {
++        const VkResult wait_result =
++            dfn.vkWaitForFences(device, 1, &pending_pair.second, VK_TRUE, UINT64_MAX);
++        if (wait_result == VK_SUCCESS) {
+           break;
+         }
++        util::LogVkResultFailure("vkWaitForFences (submission tracker)", wait_result);
+       }
+       // Just refresh the completed submission.
+-      if (dfn.vkGetFenceStatus(device, pending_pair.second) == VK_SUCCESS) {
++      const VkResult fence_status = dfn.vkGetFenceStatus(device, pending_pair.second);
++      if (fence_status == VK_SUCCESS) {
+         break;
+       }
++      if (fence_status != VK_NOT_READY) {
++        util::LogVkResultFailure("vkGetFenceStatus (submission tracker)", fence_status);
++      }
+       --reclaim_end;
+     }
+     if (reclaim_end) {
+@@ -151,9 +161,12 @@ VulkanSubmissionTracker::AcquireFenceToAdvanceSubmission() {
+   const VkDevice device = vulkan_device_->device();
+   if (!fences_reclaimed_.empty()) {
+     VkFence reclaimed_fence = fences_reclaimed_.back();
+-    if (dfn.vkResetFences(device, 1, &reclaimed_fence) == VK_SUCCESS) {
++    const VkResult reset_result = dfn.vkResetFences(device, 1, &reclaimed_fence);
++    if (reset_result == VK_SUCCESS) {
+       fence_acquired_ = fences_reclaimed_.back();
+       fences_reclaimed_.pop_back();
++    } else {
++      util::LogVkResultFailure("vkResetFences (submission tracker)", reset_result);
+     }
+   }
+   if (fence_acquired_ == VK_NULL_HANDLE) {
+@@ -162,7 +175,11 @@ VulkanSubmissionTracker::AcquireFenceToAdvanceSubmission() {
+     fence_create_info.pNext = nullptr;
+     fence_create_info.flags = 0;
+     // May fail, a null fence is handled in FenceAcquisition.
+-    dfn.vkCreateFence(device, &fence_create_info, nullptr, &fence_acquired_);
++    const VkResult create_result =
++        dfn.vkCreateFence(device, &fence_create_info, nullptr, &fence_acquired_);
++    if (create_result != VK_SUCCESS) {
++      util::LogVkResultFailure("vkCreateFence (submission tracker)", create_result);
++    }
+   }
+   return FenceAcquisition(*this, fence_acquired_);
+ }
+diff --git a/src/ui/vulkan/vulkan_util.cpp b/src/ui/vulkan/vulkan_util.cpp
+index a93dcd7f..3f4760aa 100644
+--- a/src/ui/vulkan/vulkan_util.cpp
++++ b/src/ui/vulkan/vulkan_util.cpp
+@@ -37,6 +37,7 @@ namespace {
+ // long failing run cannot flood the log.
+ constexpr uint32_t kAllocationFailureDetailLimit = 8;
+ constexpr uint32_t kAllocationFailureCounterInterval = 1024;
++std::atomic<uint64_t> vk_failure_count{0};
+ 
+ struct AllocationFailureLogState {
+   std::atomic<uint32_t> count{0};
+@@ -49,7 +50,12 @@ bool ShouldLogAllocationFailure(AllocationFailureLogState& state, uint32_t* cons
+          (ordinal % kAllocationFailureCounterInterval) == 0;
+ }
+ 
+-const char* VkResultName(const VkResult result) {
++bool ShouldLogVkFailure() {
++  const uint64_t ordinal = vk_failure_count.fetch_add(1, std::memory_order_relaxed) + 1;
++  return ordinal <= 8 || (ordinal & (ordinal - 1)) == 0;
++}
++
++const char* VkResultNameImpl(const VkResult result) {
+   switch (result) {
+     case VK_SUCCESS:
+       return "VK_SUCCESS";
+@@ -210,6 +216,16 @@ AllocationFailureLogState bind_image_memory_failure_log_state;
+ 
+ }  // namespace
+ 
++const char* VkResultName(const VkResult result) { return VkResultNameImpl(result); }
++
++void LogVkResultFailure(const char* const operation, const VkResult result) {
++  if (!ShouldLogVkFailure()) {
++    return;
++  }
++  REXGPU_ERROR("VulkanResult: {} returned {} ({})", operation ? operation : "unknown operation",
++               VkResultNameImpl(result), static_cast<int32_t>(result));
++}
++
+ void FlushMappedMemoryRange(const VulkanDevice* const vulkan_device, const VkDeviceMemory memory,
+                             const uint32_t memory_type, const VkDeviceSize offset,
+                             const VkDeviceSize memory_size, const VkDeviceSize size) {
+@@ -319,7 +335,7 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+           "VulkanAllocDiag: vkCreateImage failed #{} result={} ({}) extent={}x{}x{} "
+           "mipLevels={} arrayLayers={} samples=0x{:X} format={} usage=0x{:X} tiling={} "
+           "flags=0x{:X}",
+-          failure_ordinal, int32_t(create_image_result), VkResultName(create_image_result),
++          failure_ordinal, int32_t(create_image_result), VkResultNameImpl(create_image_result),
+           create_info.extent.width, create_info.extent.height, create_info.extent.depth,
+           create_info.mipLevels, create_info.arrayLayers, uint32_t(create_info.samples),
+           uint32_t(create_info.format), uint32_t(create_info.usage), uint32_t(create_info.tiling),
+@@ -368,7 +384,7 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+       REXGPU_ERROR(
+           "VulkanAllocDiag: vkAllocateMemory failed #{} result={} ({}) allocationSize={} "
+           "memoryTypeIndex={} heapIndex={} memoryTypeBits=0x{:X}",
+-          failure_ordinal, int32_t(allocate_memory_result), VkResultName(allocate_memory_result),
++          failure_ordinal, int32_t(allocate_memory_result), VkResultNameImpl(allocate_memory_result),
+           memory_allocate_info.allocationSize, memory_type,
+           GetMemoryHeapIndex(vulkan_device, memory_type), memory_requirements.memoryTypeBits);
+     }
+@@ -385,7 +401,7 @@ bool CreateDedicatedAllocationImage(const VulkanDevice* const vulkan_device,
+           "VulkanAllocDiag: vkBindImageMemory failed #{} result={} ({}) allocationSize={} "
+           "memoryTypeIndex={} heapIndex={}",
+           failure_ordinal, int32_t(bind_image_memory_result),
+-          VkResultName(bind_image_memory_result), memory_allocate_info.allocationSize, memory_type,
++          VkResultNameImpl(bind_image_memory_result), memory_allocate_info.allocationSize, memory_type,
+           GetMemoryHeapIndex(vulkan_device, memory_type));
+     }
+     LogMemoryBudgetOnce(vulkan_device);
+-- 
+2.43.0
+

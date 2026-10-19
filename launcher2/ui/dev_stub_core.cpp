@@ -158,7 +158,12 @@ LaunchPlan BuildLaunchPlan(const Paths& paths, const Settings&, const std::vecto
   return plan;
 }
 
-Result StartGame(const LaunchPlan&) { return Result::Ok(); }
+Result StartGame(const LaunchPlan&, double, std::atomic<bool>* process_started, const CancelFlag*) {
+  if (process_started) process_started->store(true);
+  return Result::Ok();
+}
+
+bool IsUnderOneDrive(const fs::path&) { return false; }
 
 Result SaveBugReport(const Paths& paths, fs::path* created_zip) {
   if (created_zip) *created_zip = paths.exe_dir / "wwe2k14-bug-report-sample.zip";

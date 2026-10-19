@@ -214,7 +214,7 @@ build above. No game launch is necessary to produce either binary.
 ```bash
 WIN_BUILD=<folder with wwe2k14.exe + avcodec/avutil DLLs> \
 LINUX_BUILD=<folder with wwe2k14 + libavcodec/libavutil .so> \
-OUT_DIR=out/release ARCHIVE=out/release/WWE2K14-Recomp-v1.0.0-x64.zip bash tools/package-release.sh
+OUT_DIR=out/release ARCHIVE=out/release/WWE2K14-Recomp-v1.0.1-x64.zip bash tools/package-release.sh
 ```
 
 It also needs the two launcher builds (`launcher2/`, see the variables at the top of the script). The ZIP never

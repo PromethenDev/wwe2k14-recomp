@@ -1,0 +1,458 @@
+From 2fed72347370091487b10e60abce2625a25f33a9 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 07:04:23 -0700
+Subject: [PATCH 102/103] Windows: non-ASCII paths for config, log, game and
+ user folders; a log file that cannot be opened is not fatal (GitHub #21)
+
+---
+ src/core/cvar.cpp                  | 41 +++++++++++--
+ src/core/logging.cpp               | 93 +++++++++++++++++++++++++++++-
+ src/input/sdl/sdl_input_driver.cpp |  3 +-
+ src/system/cache_drive.cpp         | 12 ++--
+ src/system/runtime.cpp             |  8 ++-
+ src/ui/rex_app.cpp                 | 31 +++++-----
+ 6 files changed, 157 insertions(+), 31 deletions(-)
+
+diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
+index 23b40916..db43704a 100644
+--- a/src/core/cvar.cpp
++++ b/src/core/cvar.cpp
+@@ -8,15 +8,18 @@
+ 
+ #include <algorithm>
+ #include <cctype>
++#include <cstdio>
+ #include <cstdlib>
+ #include <filesystem>
+ #include <fstream>
++#include <memory>
+ #include <mutex>
+ #include <unordered_map>
+ 
+ #include <CLI/CLI.hpp>
+ 
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
+ 
+ #include <toml++/toml.hpp>
+@@ -29,6 +32,18 @@ bool g_finalized = false;
+ bool g_lifecycle_override = false;
+ std::mutex g_mutex;
+ 
++// Read a config stream into memory so parsing is independent of the host
++// filesystem's narrow-path encoding. Kept separate from LoadConfig so the
++// byte-reading behavior can be exercised through the cvar config-loading API.
++bool ReadFileContents(FILE* file, std::string& contents) {
++  char buffer[65536];
++  size_t read_count;
++  while ((read_count = std::fread(buffer, 1, sizeof(buffer), file)) > 0) {
++    contents.append(buffer, read_count);
++  }
++  return std::ferror(file) == 0;
++}
++
+ // Flag registry - use functions to avoid static init order issues
+ std::vector<FlagEntry>& GetRegistryStorage() {
+   static std::vector<FlagEntry> registry;
+@@ -383,16 +398,30 @@ InitResult Init(int argc, char** argv) {
+ 
+ void LoadConfig(const std::filesystem::path& config_path) {
+   if (!std::filesystem::exists(config_path)) {
+-    REXLOG_DEBUG("Config file not found: {}", config_path.string());
++    REXLOG_DEBUG("Config file not found: {}", rex::path_to_utf8(config_path));
+     return;
+   }
+ 
+   try {
+-    auto config = toml::parse_file(config_path.string());
++    // Open through the SDK path helper so Windows uses _wfopen for UTF-16
++    // paths. TOML itself parses the UTF-8 bytes after the file is read.
++    std::unique_ptr<FILE, decltype(&std::fclose)> file(
++        rex::filesystem::OpenFile(config_path, "rb"), &std::fclose);
++    if (!file) {
++      REXLOG_ERROR("Failed to open config {}", rex::path_to_utf8(config_path));
++      return;
++    }
++    std::string contents;
++    if (!ReadFileContents(file.get(), contents)) {
++      REXLOG_ERROR("Failed to read config {}", rex::path_to_utf8(config_path));
++      return;
++    }
++
++    auto config = toml::parse(contents, rex::path_to_utf8(config_path));
+     ApplyTomlTable(config, "");
+-    REXLOG_INFO("Loaded config from {}", config_path.string());
++    REXLOG_INFO("Loaded config from {}", rex::path_to_utf8(config_path));
+   } catch (const toml::parse_error& err) {
+-    REXLOG_ERROR("Failed to parse config {}: {}", config_path.string(), err.what());
++    REXLOG_ERROR("Failed to parse config {}: {}", rex::path_to_utf8(config_path), err.what());
+   }
+ }
+ 
+@@ -436,12 +465,12 @@ void SaveConfig(const std::filesystem::path& config_path) {
+   try {
+     std::ofstream file(config_path);
+     if (!file) {
+-      REXLOG_ERROR("SaveConfig: failed to open {}", config_path.string());
++      REXLOG_ERROR("SaveConfig: failed to open {}", rex::path_to_utf8(config_path));
+       return;
+     }
+     file << "# Auto-generated cvar configuration\n";
+     file << content;
+-    REXLOG_INFO("Saved config to {}", config_path.string());
++    REXLOG_INFO("Saved config to {}", rex::path_to_utf8(config_path));
+   } catch (const std::exception& e) {
+     REXLOG_ERROR("SaveConfig: {}", e.what());
+   }
+diff --git a/src/core/logging.cpp b/src/core/logging.cpp
+index 06ddcbba..5fa50226 100644
+--- a/src/core/logging.cpp
++++ b/src/core/logging.cpp
+@@ -9,18 +9,27 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ 
++#include <thread>
+ #include <algorithm>
+ #include <cctype>
++#include <cerrno>
+ #include <chrono>
++#include <cstdio>
++#include <filesystem>
++#include <memory>
+ #include <mutex>
++#include <system_error>
+ #include <unordered_map>
+ #include <vector>
+ 
++#include <spdlog/sinks/base_sink.h>
+ #include <spdlog/sinks/basic_file_sink.h>
+ #include <spdlog/sinks/stdout_color_sinks.h>
+ 
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/logging.h>
++#include <rex/platform.h>
+ 
+ REXCVAR_DEFINE_STRING(log_level, "info", "Log",
+                       "Global log level: trace, debug, info, warn, error, critical, off")
+@@ -36,6 +45,77 @@ namespace rex {
+ 
+ namespace {
+ 
++#if REX_PLATFORM_WIN32
++// spdlog's default file sink opens narrow paths using the active Windows code
++// page. This sink accepts UTF-8 paths and opens them with the SDK's _wfopen
++// wrapper instead.
++class Utf8PathFileSink final : public spdlog::sinks::base_sink<std::mutex> {
++ public:
++  Utf8PathFileSink(const std::string& utf8_path, bool truncate) : utf8_path_(utf8_path) {
++    const std::filesystem::path path = rex::to_path(utf8_path);
++    std::error_code ec;
++    if (!path.parent_path().empty()) {
++      std::filesystem::create_directories(path.parent_path(), ec);
++    }
++    // Same open policy as spdlog's file_helper: truncate first, then keep the live stream in
++    // append mode, and retry a few times (a sync client or virus scanner may hold the file briefly).
++    constexpr int kOpenTries = 5;
++    for (int attempt = 0; attempt < kOpenTries && !file_; ++attempt) {
++      if (attempt) {
++        std::this_thread::sleep_for(std::chrono::milliseconds(10));
++      }
++      if (truncate) {
++        if (FILE* truncated = rex::filesystem::OpenFile(path, "wb")) {
++          std::fclose(truncated);
++        } else {
++          continue;
++        }
++      }
++      file_ = rex::filesystem::OpenFile(path, "ab");
++    }
++    if (!file_) {
++      throw spdlog::spdlog_ex("Failed opening log file " + utf8_path + " for writing", errno);
++    }
++  }
++
++  ~Utf8PathFileSink() override {
++    if (file_) {
++      std::fclose(file_);
++      file_ = nullptr;
++    }
++  }
++
++ protected:
++  void sink_it_(const spdlog::details::log_msg& msg) override {
++    spdlog::memory_buf_t formatted;
++    formatter_->format(msg, formatted);
++    if (std::fwrite(formatted.data(), 1, formatted.size(), file_) != formatted.size()) {
++      throw spdlog::spdlog_ex("Failed writing to log file " + utf8_path_, errno);
++    }
++  }
++
++  void flush_() override {
++    if (file_ && std::fflush(file_) != 0) {
++      throw spdlog::spdlog_ex("Failed flushing log file " + utf8_path_, errno);
++    }
++  }
++
++ private:
++  std::string utf8_path_;
++  FILE* file_ = nullptr;
++};
++#endif  // REX_PLATFORM_WIN32
++
++// Use the ordinary spdlog sink off Windows; on Windows route the same UTF-8
++// cvar path through the SDK's wide-file API.
++spdlog::sink_ptr MakeFileSink(const std::string& utf8_path, bool truncate) {
++#if REX_PLATFORM_WIN32
++  return std::make_shared<Utf8PathFileSink>(utf8_path, truncate);
++#else
++  return std::make_shared<spdlog::sinks::basic_file_sink_mt>(utf8_path, truncate);
++#endif
++}
++
+ // Category registry — indices 0..kBuiltinCount-1 are SDK built-ins.
+ std::vector<LogCategoryEntry> g_registry;
+ 
+@@ -123,8 +203,17 @@ void InitLogging(const LogConfig& config) {
+       new_sinks.push_back(std::move(sink));
+     }
+ 
++    spdlog::sink_ptr file_sink;
+     if (config.log_file && (!g_file_sink || g_file_path != config.log_file)) {
+-      auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(config.log_file, true);
++      // A log file that cannot be opened (read-only or cloud-synced folder) must not stop the game.
++      try {
++        file_sink = MakeFileSink(config.log_file, true);
++      } catch (const spdlog::spdlog_ex& e) {
++        std::fprintf(stderr, "Logging: %s; continuing without a log file\n", e.what());
++      }
++    }
++    if (file_sink) {
++      auto sink = std::move(file_sink);
+       sink->set_level(spdlog::level::trace);
+       sink->set_pattern(config.file_pattern);
+       replaced_file_sink = std::move(g_file_sink);
+@@ -163,7 +252,7 @@ void InitLogging(const LogConfig& config) {
+ 
+   // Create file sink
+   if (config.log_file) {
+-    auto sink = std::make_shared<spdlog::sinks::basic_file_sink_mt>(config.log_file, true);
++    auto sink = MakeFileSink(config.log_file, true);
+     sink->set_level(spdlog::level::trace);
+     sink->set_pattern(config.file_pattern);
+     g_file_sink = sink;
+diff --git a/src/input/sdl/sdl_input_driver.cpp b/src/input/sdl/sdl_input_driver.cpp
+index bdef5857..cc6cf528 100644
+--- a/src/input/sdl/sdl_input_driver.cpp
++++ b/src/input/sdl/sdl_input_driver.cpp
+@@ -15,6 +15,7 @@
+ #include <rex/assert.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/input/flags.h>
+ #include <rex/input/sdl/sdl_input_driver.h>
+ #include <rex/logging.h>
+@@ -91,7 +92,7 @@ void SDLInputDriver::OnWindowAvailable(rex::ui::Window* window) {
+ 
+       // Load custom controller mappings if available
+       if (!REXCVAR_GET(hid_mappings_file).empty()) {
+-        std::filesystem::path mappings_path(REXCVAR_GET(hid_mappings_file));
++        std::filesystem::path mappings_path = rex::to_path(REXCVAR_GET(hid_mappings_file));
+         if (!std::filesystem::exists(mappings_path)) {
+           REXLOG_WARN("SDL GameControllerDB: file '{}' does not exist.",
+                       REXCVAR_GET(hid_mappings_file));
+diff --git a/src/system/cache_drive.cpp b/src/system/cache_drive.cpp
+index 72dadd3b..fd965880 100644
+--- a/src/system/cache_drive.cpp
++++ b/src/system/cache_drive.cpp
+@@ -7,6 +7,7 @@
+ #include <memory>
+ #include <system_error>
+ 
++#include <rex/filesystem.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/vfs.h>
+ #include <rex/logging.h>
+@@ -63,17 +64,18 @@ bool SetupUtilityCacheDrive(rex::filesystem::VirtualFileSystem& file_system,
+   const auto host_path = std::filesystem::absolute(user_data_root) / "cache_drive";
+   auto device = std::make_unique<HostBackedCacheDevice>(host_path);
+   if (!device->Initialize()) {
+-    REXSYS_ERROR("Failed to initialize utility cache host path: {}", host_path.string());
++    REXSYS_ERROR("Failed to initialize utility cache host path: {}",
++                 rex::path_to_utf8(host_path));
+     return false;
+   }
+ 
+   std::error_code space_error;
+   const auto host_space = std::filesystem::space(host_path, space_error);
+   if (space_error) {
+-    REXSYS_WARN("Could not query free space for utility cache '{}': {}", host_path.string(),
+-                space_error.message());
++    REXSYS_WARN("Could not query free space for utility cache '{}': {}",
++                rex::path_to_utf8(host_path), space_error.message());
+   } else {
+-    REXSYS_INFO("Utility cache host path '{}' has {} bytes available", host_path.string(),
++    REXSYS_INFO("Utility cache host path '{}' has {} bytes available", rex::path_to_utf8(host_path),
+                 host_space.available);
+     if (host_space.available < kMinimumUtilityCacheBytes) {
+       REXSYS_WARN("Utility cache has less than 150 MiB available; title cache setup may fail");
+@@ -86,7 +88,7 @@ bool SetupUtilityCacheDrive(rex::filesystem::VirtualFileSystem& file_system,
+     return false;
+   }
+   file_system.RegisterSymbolicLink(kUtilityCacheSymbolicLink, kUtilityCacheDevicePath);
+-  REXSYS_INFO("Mounted {} at {}", host_path.string(), kUtilityCacheSymbolicLink);
++  REXSYS_INFO("Mounted {} at {}", rex::path_to_utf8(host_path), kUtilityCacheSymbolicLink);
+   return true;
+ }
+ 
+diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
+index f3504588..bffbab22 100644
+--- a/src/system/runtime.cpp
++++ b/src/system/runtime.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <rex/chrono/clock.h>
+ #include <rex/cvar.h>
++#include <rex/filesystem.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/filesystem/devices/null_device.h>
+ #include <rex/filesystem/vfs.h>
+@@ -243,7 +244,8 @@ bool Runtime::SetupVfs() {
+ 
+   auto abs_game_root = std::filesystem::absolute(game_data_root_);
+   if (!std::filesystem::exists(abs_game_root)) {
+-    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}", abs_game_root.string());
++    REXSYS_ERROR("Runtime::SetupVfs: game_data_root does not exist: {}",
++                 rex::path_to_utf8(abs_game_root));
+     return false;
+   }
+ 
+@@ -259,7 +261,7 @@ bool Runtime::SetupVfs() {
+     REXSYS_ERROR("Runtime::SetupVfs: Failed to register host path device");
+     return false;
+   }
+-  REXSYS_INFO("  Mounted {} at {}", abs_game_root.string(), mount_path);
++  REXSYS_INFO("  Mounted {} at {}", rex::path_to_utf8(abs_game_root), mount_path);
+ 
+   // Register symbolic links for game: and D:
+   file_system_->RegisterSymbolicLink("game:", mount_path);
+@@ -275,7 +277,7 @@ bool Runtime::SetupVfs() {
+           std::make_unique<rex::filesystem::HostPathDevice>(update_mount, abs_update_root, true);
+       if (update_device->Initialize() && file_system_->RegisterDevice(std::move(update_device))) {
+         file_system_->RegisterSymbolicLink("update:", update_mount);
+-        REXSYS_INFO("  Mounted {} at update:", abs_update_root.string());
++        REXSYS_INFO("  Mounted {} at update:", rex::path_to_utf8(abs_update_root));
+       }
+     }
+   }
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index ea655c1e..e8103ac2 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -87,7 +87,9 @@ bool ReXApp::OnInitialize() {
+   // Game directory: positional arg or default to exe_dir/assets
+   std::filesystem::path game_dir;
+   if (auto arg = GetArgument("game_directory")) {
+-    game_dir = *arg;
++    // The Windows entry point passes arguments as UTF-8; decode them explicitly
++    // instead of letting std::filesystem interpret the bytes as the ANSI page.
++    game_dir = rex::to_path(*arg);
+   } else {
+     game_dir = exe_dir / "assets";
+   }
+@@ -96,7 +98,7 @@ bool ReXApp::OnInitialize() {
+   std::filesystem::path user_dir;
+   std::string user_data_cvar = REXCVAR_GET(user_data_root);
+   if (!user_data_cvar.empty()) {
+-    user_dir = user_data_cvar;
++    user_dir = rex::to_path(user_data_cvar);
+   } else {
+     user_dir = rex::filesystem::GetUserFolder() / GetName();
+   }
+@@ -105,7 +107,7 @@ bool ReXApp::OnInitialize() {
+   std::filesystem::path update_dir;
+   std::string update_data_cvar = REXCVAR_GET(update_data_root);
+   if (!update_data_cvar.empty()) {
+-    update_dir = update_data_cvar;
++    update_dir = rex::to_path(update_data_cvar);
+   }
+ 
+   // Allow subclass to override path defaults
+@@ -134,7 +136,7 @@ bool ReXApp::OnInitialize() {
+   if (std::filesystem::exists(config_path)) {
+     rex::cvar::LoadConfig(config_path);
+     REXCVAR_SET(debug_ui, debug_ui_requested);
+-    REXLOG_INFO("Loaded config: {}", config_path.filename().string());
++    REXLOG_INFO("Loaded config: {}", rex::path_to_utf8(config_path.filename()));
+   }
+ 
+   // Capture logs only when the debug console is available.
+@@ -145,12 +147,12 @@ bool ReXApp::OnInitialize() {
+   REXLOG_INFO("[ui] debug_ui={}", REXCVAR_GET(debug_ui) ? "true" : "false");
+ 
+   REXLOG_INFO("{} starting", GetName());
+-  REXLOG_INFO("  Game directory: {}", game_data_root_.string());
++  REXLOG_INFO("  Game directory: {}", rex::path_to_utf8(game_data_root_));
+   if (!user_data_root_.empty()) {
+-    REXLOG_INFO("  User data:      {}", user_data_root_.string());
++    REXLOG_INFO("  User data:      {}", rex::path_to_utf8(user_data_root_));
+   }
+   if (!update_data_root_.empty()) {
+-    REXLOG_INFO("  Update data:    {}", update_data_root_.string());
++    REXLOG_INFO("  Update data:    {}", rex::path_to_utf8(update_data_root_));
+   }
+ 
+   // Create runtime
+@@ -289,8 +291,8 @@ bool ReXApp::OnInitialize() {
+     // save what the presenter shows. The title is never launched.
+     auto* replay_graphics = static_cast<rex::graphics::GraphicsSystem*>(runtime_->graphics_system());
+     module_thread_ = std::thread([this, replay_graphics]() {
+-      std::filesystem::path trace_path = REXCVAR_GET(replay_trace);
+-      std::filesystem::path out_path = REXCVAR_GET(replay_trace_out);
++      std::filesystem::path trace_path = rex::to_path(REXCVAR_GET(replay_trace));
++      std::filesystem::path out_path = rex::to_path(REXCVAR_GET(replay_trace_out));
+       if (out_path.empty()) {
+         out_path = trace_path;
+         out_path += ".ppm";
+@@ -298,8 +300,9 @@ bool ReXApp::OnInitialize() {
+       bool ok = false;
+       if (replay_graphics && replay_graphics->presenter()) {
+         auto player = std::make_unique<rex::graphics::TracePlayer>(replay_graphics);
+-        if (player->Open(trace_path.string()) && player->frame_count() > 0) {
+-          REXLOG_INFO("Replaying trace {} ({} frames)", trace_path.string(), player->frame_count());
++        if (player->Open(rex::path_to_utf8(trace_path)) && player->frame_count() > 0) {
++          REXLOG_INFO("Replaying trace {} ({} frames)", rex::path_to_utf8(trace_path),
++                      player->frame_count());
+           player->SeekFrame(0);
+           player->SeekCommand(static_cast<int>(player->current_frame()->commands.size() - 1));
+           player->WaitOnPlayback();
+@@ -318,7 +321,7 @@ bool ReXApp::OnInitialize() {
+           }
+           ui::RawImage image;
+           if (replay_graphics->presenter()->CaptureGuestOutput(image)) {
+-            if (FILE* f = std::fopen(out_path.string().c_str(), "wb")) {
++            if (FILE* f = rex::filesystem::OpenFile(out_path, "wb")) {
+               std::fprintf(f, "P6\n%u %u\n255\n", image.width, image.height);
+               for (uint32_t y = 0; y < image.height; ++y) {
+                 const uint8_t* row = image.data.data() + y * image.stride;
+@@ -333,12 +336,12 @@ bool ReXApp::OnInitialize() {
+             REXLOG_ERROR("Replay: CaptureGuestOutput failed");
+           }
+         } else {
+-          REXLOG_ERROR("Replay: could not open trace {}", trace_path.string());
++          REXLOG_ERROR("Replay: could not open trace {}", rex::path_to_utf8(trace_path));
+         }
+       } else {
+         REXLOG_ERROR("Replay: no graphics system / presenter");
+       }
+-      REXLOG_INFO("Replay {}: {}", ok ? "wrote" : "FAILED", out_path.string());
++      REXLOG_INFO("Replay {}: {}", ok ? "wrote" : "FAILED", rex::path_to_utf8(out_path));
+       app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
+     });
+     return true;
+-- 
+2.43.0
+

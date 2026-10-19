@@ -1,0 +1,86 @@
+From 449ee11b2637b8014507f0d0a7e0ebd8919d764a Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 07:04:23 -0700
+Subject: [PATCH 100/103] Cores: log the too-few-cores warning once; count
+ allowed CPUs on Linux (GitHub #8)
+
+---
+ include/rex/thread.h   |  2 +-
+ src/core/threading.cpp | 20 ++++++++++++++++++++
+ src/system/xthread.cpp |  7 ++++++-
+ 3 files changed, 27 insertions(+), 2 deletions(-)
+
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207dd..91e40ac6 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -85,7 +85,7 @@ class Fence {
+   std::atomic<state_t_> signal_state_;
+ };
+ 
+-// Returns the total number of logical processors in the host system.
++// Returns the logical processor count used for thread scheduling.
+ uint32_t logical_processor_count();
+ 
+ // Enables the current process to set thread affinity.
+diff --git a/src/core/threading.cpp b/src/core/threading.cpp
+index fd06c662..91ab28d0 100644
+--- a/src/core/threading.cpp
++++ b/src/core/threading.cpp
+@@ -11,8 +11,13 @@
+ 
+ #include <thread>
+ 
++#include <rex/platform.h>
+ #include <rex/thread.h>
+ 
++#if REX_PLATFORM_LINUX
++#include <sched.h>
++#endif
++
+ namespace rex::thread {
+ 
+ // =============================================================================
+@@ -23,6 +28,21 @@ uint32_t logical_processor_count() {
+   static uint32_t value = 0;
+   if (!value) {
+     value = std::thread::hardware_concurrency();
++#if REX_PLATFORM_LINUX
++    // hardware_concurrency() may report online system CPUs even when this
++    // process is restricted with sched_setaffinity (for example, by taskset),
++    // or return unknown. Use a sub-six affinity count in those cases.
++    cpu_set_t cpu_set;
++    if (sched_getaffinity(0, sizeof(cpu_set), &cpu_set) == 0) {
++      const int available_processor_count = CPU_COUNT(&cpu_set);
++      // Preserve the 1.0.0 count on six-or-more-CPU process masks; only use
++      // the affinity count to identify a constrained low-core environment.
++      if ((value == 0 || value >= 6) && available_processor_count > 0 &&
++          available_processor_count < 6) {
++        value = static_cast<uint32_t>(available_processor_count);
++      }
++    }
++#endif
+   }
+   return value;
+ }
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index f648300c..2281da4d 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -882,7 +882,12 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+     }
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    // SetActiveCpu is also used for every vblank interrupt; do not flood the
++    // log with the same scheduling diagnostic once per frame.
++    static std::atomic_flag low_processor_warning_logged = ATOMIC_FLAG_INIT;
++    if (!low_processor_warning_logged.test_and_set(std::memory_order_relaxed)) {
++      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    }
+   }
+ }
+ 
+-- 
+2.43.0
+

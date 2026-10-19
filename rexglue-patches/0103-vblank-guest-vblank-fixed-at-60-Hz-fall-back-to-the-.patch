@@ -1,0 +1,196 @@
+From dca01c55bfd544fc7676e2ad16e0b804aafb3890 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 07:04:23 -0700
+Subject: [PATCH 103/103] vblank: guest vblank fixed at 60 Hz; fall back to the
+ timer when host vsync measures off 60 (G-SYNC/VRR 2x speed, GitHub #6)
+
+---
+ src/graphics/graphics_system.cpp | 86 +++++++++++++++++++++++++++-----
+ src/ui/window_win.cpp            |  9 ++++
+ 2 files changed, 83 insertions(+), 12 deletions(-)
+
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index a56393f9..f779bd89 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -59,6 +59,10 @@ REXCVAR_DEFINE_BOOL(vsync_host_display, false, "GPU",
+                     "multiple of the guest refresh (Windows); otherwise a timer is used");
+ 
+ namespace {
++// WWE 2K14 game timing uses a 60 Hz guest vblank. Host monitor refresh is only
++// used as a phase source below; it must never change this guest clock rate.
++constexpr double kGuestVblankRefreshRateHz = 60.0;
++
+ rex::graphics::CommandProcessor::SwapPostEffect ParseSwapPostEffect(
+     const std::string& effect_name) {
+   std::string lowered = effect_name;
+@@ -140,10 +144,8 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+                                  reinterpret_cast<runtime::MMIOReadCallback>(ReadRegisterThunk),
+                                  reinterpret_cast<runtime::MMIOWriteCallback>(WriteRegisterThunk));
+ 
+-  // Guest vblank timer based on the configured guest video mode.
+-  system::X_VIDEO_MODE census_video_mode;
+-  kernel::xboxkrnl::VdQueryVideoMode(&census_video_mode);
+-  double census_refresh_rate_hz = std::max(1.0, double(float(census_video_mode.refresh_rate)));
++  // Count diagnostics against the fixed game vblank rate, not the host display refresh.
++  const double census_refresh_rate_hz = kGuestVblankRefreshRateHz;
+   uint64_t census_guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+   uint64_t census_vsync_interval_ticks = std::max(
+       uint64_t(1), uint64_t(double(census_guest_tick_frequency) / census_refresh_rate_hz));
+@@ -152,15 +154,13 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+   vsync_worker_running_ = true;
+   vsync_worker_thread_ = system::object_ref<system::XHostThread>(
+       new system::XHostThread(kernel_state_, 128 * 1024, 0, [this]() {
+-        system::X_VIDEO_MODE video_mode;
+-        kernel::xboxkrnl::VdQueryVideoMode(&video_mode);
+-        double refresh_rate_hz = std::max(1.0, double(float(video_mode.refresh_rate)));
++        const double refresh_rate_hz = kGuestVblankRefreshRateHz;
+         uint64_t guest_tick_frequency = chrono::Clock::guest_tick_frequency();
+         uint64_t vsync_interval_ticks =
+             std::max(uint64_t(1), uint64_t(double(guest_tick_frequency) / refresh_rate_hz));
+-        uint64_t no_vsync_interval_ticks = std::max(uint64_t(1), guest_tick_frequency / 1000);
+         bool vsync_enabled = REXCVAR_GET(vsync);
+-        uint64_t interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
++        // Keep guest vblank at 60 Hz even when host presentation vsync is off.
++        const uint64_t interval_ticks = vsync_interval_ticks;
+         uint64_t next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
+         // Avoid replaying missed vblanks after a long stall or suspend.
+         constexpr uint64_t kResyncAfterIntervals = 3;
+@@ -172,14 +172,26 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+         using SteadyClock = std::chrono::steady_clock;
+         const auto guest_period =
+             std::chrono::duration_cast<SteadyClock::duration>(std::chrono::duration<double>(1.0 / refresh_rate_hz));
++        constexpr auto kHostRateMeasurementWindow = std::chrono::seconds(1);
++        constexpr double kHostRateToleranceHz = kGuestVblankRefreshRateHz * 0.08;
+         auto host_refresh_check_time = SteadyClock::time_point();
+         auto host_sync_suspended_until = SteadyClock::time_point();
+         auto last_host_vblank_time = SteadyClock::time_point();
++        auto host_rate_sample_start = SteadyClock::time_point();
+         uint32_t host_divider = 0;
+         uint32_t logged_host_divider = UINT32_MAX;
++        uint32_t sampled_host_divider = UINT32_MAX;
+         uint64_t host_vblank_index = 0;
++        uint64_t host_rate_sample_vblanks = 0;
++        uint32_t host_rate_mismatches = 0;
++        bool host_sync_disabled_for_session = false;
++        const auto reset_host_rate_sample = [&]() {
++          host_rate_sample_start = SteadyClock::time_point();
++          host_rate_sample_vblanks = 0;
++        };
+         while (vsync_worker_running_) {
+-          if (vsync_enabled && REXCVAR_GET(vsync_host_display) && presenter()) {
++          if (vsync_enabled && REXCVAR_GET(vsync_host_display) && presenter() &&
++              !host_sync_disabled_for_session) {
+             auto now = SteadyClock::now();
+             if (now >= host_refresh_check_time) {
+               host_refresh_check_time = now + std::chrono::seconds(1);
+@@ -195,7 +207,11 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+                 logged_host_divider = host_divider;
+                 REXGPU_INFO("[host-vsync] display {} Hz: {}", host_hz,
+                             host_divider ? fmt::format("guest vblank on every {} display vblank(s)", host_divider)
+-                                         : std::string("not a multiple of the guest rate, timer vblank"));
++                                          : std::string("not a multiple of the guest rate, timer vblank"));
++              }
++              if (host_divider != sampled_host_divider) {
++                sampled_host_divider = host_divider;
++                reset_host_rate_sample();
+               }
+             }
+             if (host_divider && now >= host_sync_suspended_until) {
+@@ -208,6 +224,7 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+                 REXGPU_WARN("[host-vsync] display vblank wait took {} ms, timer vblank for 5 s",
+                             std::chrono::duration_cast<std::chrono::milliseconds>(now - wait_start).count());
+                 host_sync_suspended_until = now + std::chrono::seconds(5);
++                reset_host_rate_sample();
+               } else if (waited && now - last_host_vblank_time >= host_period / 2) {
+                 last_host_vblank_time = now;
+                 if (++host_vblank_index % host_divider == 0) {
+@@ -220,19 +237,64 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,
+                   if (phase_percent) {
+                     std::this_thread::sleep_until(now + host_period * phase_percent / 100);
+                   }
++                  const auto guest_vblank_time = SteadyClock::now();
+                   MarkVblank();
+                   // Keep the timer path's phase right after this vblank if it takes over.
+                   next_deadline = chrono::Clock::QueryGuestTickCount() + interval_ticks;
++
++                  // Display refresh is only a hint: VRR, a mode transition, or an early
++                  // WaitForVBlank return can make the actual guest cadence differ. Verify
++                  // the host-driven guest-vblank rate once per measured one-second window.
++                  if (host_rate_sample_start == SteadyClock::time_point()) {
++                    host_rate_sample_start = guest_vblank_time;
++                    host_rate_sample_vblanks = 1;
++                  } else {
++                    ++host_rate_sample_vblanks;
++                    const auto sample_duration = guest_vblank_time - host_rate_sample_start;
++                    if (sample_duration >= kHostRateMeasurementWindow) {
++                      const double elapsed_seconds =
++                          std::chrono::duration<double>(sample_duration).count();
++                      const double measured_rate_hz =
++                          double(host_rate_sample_vblanks - 1) / elapsed_seconds;
++                      if (std::abs(measured_rate_hz - refresh_rate_hz) > kHostRateToleranceHz) {
++                        ++host_rate_mismatches;
++                        const bool disable_for_session = host_rate_mismatches >= 3;
++                        const int backoff_seconds = host_rate_mismatches == 1 ? 5 : 30;
++                        if (disable_for_session) {
++                          host_sync_disabled_for_session = true;
++                          host_sync_suspended_until = SteadyClock::time_point::max();
++                        } else {
++                          host_sync_suspended_until =
++                              guest_vblank_time + std::chrono::seconds(backoff_seconds);
++                        }
++                        const std::string fallback_duration =
++                            disable_for_session ? "for rest of session"
++                                                : fmt::format("for {} s", backoff_seconds);
++                        REXGPU_WARN(
++                            "[host-vsync] measured {:.1f} Hz guest vblank, expected 60: timer vblank {}",
++                            measured_rate_hz, fallback_duration);
++                      }
++                      reset_host_rate_sample();
++                    }
++                  }
+                 }
+                 continue;
++              } else if (!waited) {
++                // A failed host wait breaks a contiguous sample of host-sourced guest vblanks.
++                // Implausibly early returns are skipped above but keep the sample: under VRR they
++                // are exactly the irregular wakeups the measured-rate check has to see through.
++                reset_host_rate_sample();
+               }
++            } else {
++              reset_host_rate_sample();
+             }
++          } else {
++            reset_host_rate_sample();
+           }
+           uint64_t current_time = chrono::Clock::QueryGuestTickCount();
+           const bool current_vsync_enabled = REXCVAR_GET(vsync);
+           if (current_vsync_enabled != vsync_enabled) {
+             vsync_enabled = current_vsync_enabled;
+-            interval_ticks = vsync_enabled ? vsync_interval_ticks : no_vsync_interval_ticks;
+             next_deadline = current_time + interval_ticks;
+           } else if (current_time >= next_deadline) {
+             MarkVblank();
+diff --git a/src/ui/window_win.cpp b/src/ui/window_win.cpp
+index 2a38ebd3..248e8129 100644
+--- a/src/ui/window_win.cpp
++++ b/src/ui/window_win.cpp
+@@ -768,6 +768,15 @@ void Win32Window::ApplyDisplayRefreshMatch(
+     REXLOG_INFO("[display-refresh-match] apply result: not attempted");
+     return;
+   }
++  // Windows commonly reports 59/119/239 for NTSC-style 59.94/119.88/239.76 Hz
++  // modes. Keep these near-multiples: changing to 60/120/240 can resync the
++  // display and leave the new swapchain black on some drivers.
++  if ((original_mode.dmDisplayFrequency + 1) % 60 == 0) {
++    REXLOG_INFO(
++        "[display-refresh-match] chosen mode: none (original refresh is a 59.94 Hz-style multiple of 60)");
++    REXLOG_INFO("[display-refresh-match] apply result: not attempted");
++    return;
++  }
+   if (original_mode.dmDisplayFrequency % 60 == 0) {
+     REXLOG_INFO(
+         "[display-refresh-match] chosen mode: none (original refresh is already a multiple of 60)");
+-- 
+2.43.0
+
