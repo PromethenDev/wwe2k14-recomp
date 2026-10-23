@@ -1,8 +1,32 @@
 # WWE 2K14 Recomp
 
-An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original
-PowerPC game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this
-is not an Xbox 360 emulator.
+An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
+game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
+Xbox 360 emulator.
+
+> [!NOTE]
+> **Downloads**: get the latest version from the **Releases** page. Version 1.1.0 is distributed as a download only;
+> the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
+> extend to v1.1.0.
+
+## What's new in v1.1.0
+
+- **New Native renderer (default).** The game is drawn directly with Vulkan instead of through an emulated Xbox 360
+  graphics chip. It is much faster, especially on integrated graphics (AMD Radeon 780M, Intel UHD), and adds:
+  - **Picture size**: 480p, 720p, 1080p, 1440p or 4K (480p is a good start on integrated graphics).
+  - **Frame rate**: **Locked 30**, **30 / 60** (60 in matches, 30 in entrances, like the console) or **60 everywhere**.
+  - **Anti-aliasing** on or off.
+  - Keeps fast video memory within the graphics driver's limit, which fixes stutter and crashes on laptops with AMD
+    integrated graphics.
+- **Xbox renderer**: the previous, emulated renderer is still included. Choose it if something looks wrong with
+  Native, or if you prefer the original picture. It uses the 720p / 1080p / 1440p sizes of v1.0.1.
+- Choose between them in the launcher: **Settings -> Renderer -> Native / Xbox** (hover over a button for a short
+  description).
+- Fewer first-time pauses: the Native renderer prepares its graphics effects when the game starts.
+- **Coming from an older version?** Extract v1.1.0 into a new folder and start the launcher: it finds your previous
+  installation and offers to **bring everything over** - game folder and title update, DLC, saves, created
+  superstars, music, keyboard keys and settings (nothing in the old folder is changed). You can also do it later with
+  **Game files -> Import Previous Installation**. Updating with the launcher's **Update** button keeps everything in place.
 
 ## Before you download
 
@@ -23,15 +47,13 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 - **Windows 10 or 11 (64-bit)**, or **Linux** (glibc 2.38 or newer, e.g. Ubuntu 24.04, with GTK3; on Wayland the
   game window runs through XWayland, installed by default on most distributions).
 - **CPU**: a 64-bit processor with AVX2 (most PCs from 2013 onward: Intel Haswell / AMD Ryzen or newer).
-- **Graphics**: a graphics card with up-to-date Vulkan drivers. A dedicated graphics card is recommended:
-  integrated graphics are not supported well yet (on Intel UHD 630 entrances and matches can show a black picture,
-  AMD Radeon 780M laptops run slowly, and older Intel HD/UHD graphics such as the HD 520 can close at the title
-  screen).
+- **Graphics**: up-to-date Vulkan drivers. With the **Native** renderer, integrated graphics such as AMD Radeon 780M
+  and Intel UHD 630 are supported (start with 480p). The **Xbox** renderer needs a dedicated graphics card.
 - About 10 GB of free space for the game files.
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.0.1-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.1.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -51,8 +73,9 @@ WWE2K14-Recomp-x64/
 ├── wwe2k14.exe                 # the game (started by the launcher)
 ├── wwe2k14.toml                # keyboard keys (change them on the launcher's Controls page)
 ├── avcodec-58.dll, avutil-56.dll
+├── shaders/                    # Native renderer shaders (shared by Windows and Linux)
 ├── Linux-x86_64/               # Linux launcher + game
-├── README.md, DISCLAIMER.md, LICENSE, SHA256SUMS
+├── README.md, CHANGELOG.md, DISCLAIMER.md, CONTRIBUTORS.md, SHA256SUMS
 ├── licenses/, third-party-licenses/, ffmpeg-source-*.zip
 ├── WWE 2K14/                   # your game folder (default.xex + default.xexp + data)
 ├── userdata/                   # saves, DLC and settings (created on first run)
@@ -63,23 +86,15 @@ WWE2K14-Recomp-x64/
 
 The launcher shows a recommended setup for your graphics card. You can also choose:
 
-- **Output size** – the size of the game window or fullscreen picture (720p, 1080p or 1440p). The game itself draws at
-  1280x720, like the Xbox 360, and is scaled to this size.
-- **Picture detail (experimental)** – **1440p** or **4K** make the game draw at 2x or 3x its normal size, a true
-  2560x1440 or 3840x2160 picture, on any screen. They need a stronger graphics card (4K a high-end one), and some
-  effects (for example Batista's entrance pyro) can be missing.
-- **Stretch to fill wide screens** – fill a 21:9 or 16:10 screen instead of showing black bars.
-- **Sync frames to the monitor** (Windows, on by default) – turn it off if the game runs too fast or stutters in
-  fullscreen on a high-refresh, G-SYNC or FreeSync monitor.
-- **Display** – fullscreen or windowed (press **F11** in the game to switch at any time); **Graphics card** – for PCs
-  with two GPUs.
-- **Start straight away next time** – skip the launcher on later starts. Hold **Shift** while it starts to come back
-  to the settings.
-- **Music** – drop your own songs in to use them in the game's custom music.
-- **Saves** – **Back Up Now** and **Restore** your saves with one click.
-
-WWE 2K14 does not have working in-game frame-rate or anti-aliasing overrides in this recompilation, so the launcher
-no longer offers those options; the picture runs at the game's own pace.
+- **Renderer** - **Native** (default, recommended) or **Xbox** (the previous renderer).
+- With **Native**: **Picture size** (480p, 720p, 1080p, 1440p, 4K - how sharp the 3D picture is drawn), **Frame
+  rate** (Locked 30, 30 / 60, 60 everywhere) and **Anti-aliasing**.
+- With **Xbox**: **Resolution** 720p, 1080p or 1440p (the game draws at 1280x720 like the Xbox 360 and is scaled).
+- **Display** - fullscreen or windowed (press **F11** in the game to switch at any time); **Graphics card** - for PCs
+  with two GPUs (laptops: pick the one you want to play on).
+- **Stretch to fill wide screens** - fill a 21:9 or 16:10 screen instead of showing black bars.
+- **Music** - drop your own songs in to use them in the game's custom music.
+- **Saves** - **Back Up Now** and **Restore** your saves with one click.
 
 ## Updates
 
@@ -88,7 +103,7 @@ the **Play** page shows it with **What's new**, **Update**, **Not now** and **Sk
 downloads the new release, checks that the download is intact, replaces only the program files and restarts the
 launcher. Your game files, saves, DLC, settings, keyboard keys and music are never touched; the previous version's
 program files are kept in `backups/update-<version>/`. Nothing about you or your PC is sent. Turn the check off with
-**Check for updates when the launcher starts** on the **Settings** page.
+**Check for updates** on the **Settings** page.
 
 ## Controls
 
@@ -116,6 +131,10 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 
 ## Known issues
 
+- **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; rope shadows can show as solid
+  lines on the mat on some graphics cards; John Cena's title belt can shake with **60 everywhere** (use **30 / 60**);
+  rarely, the loading screen after choosing wrestlers does not finish (restart the game). If something blocks you,
+  switch to the **Xbox** renderer.
 - **The Back button does not toggle the pre-match options; use the D-pad (arrow keys) instead.** In the
   Create-a-Superstar editor, holding Back (**Tab**) shows a controls legend. Save a created superstar from the
   **OTHER** tab's **ACCEPT** row (see "On-screen prompts and saving a created superstar" above).
@@ -138,25 +157,18 @@ If the game freezes, wait a few seconds and then use **Save a Bug Report** and s
 `wwe2k14-freeze-<date>.txt` into its `logs` folder (and the report zip always includes it) that records every guest
 thread and what it was waiting on at the moment it stopped presenting.
 
-## Building from source
+## Legal
 
-This is a developer build, not a one-command player install. Full guide: [docs/BUILDING.md](docs/BUILDING.md).
-
-1. Run `tools/setup.sh`: it clones the public ReXGlue fork at a pinned commit into `../tools/rexglue`, applies this
-   project's SDK fixes from `rexglue-patches/` and builds the SDK.
-2. Copy your own `default.xex` and `default.xexp` (title update 1.0.3) into `game/`, then run `tools/codegen.sh`.
-3. Build the game (`tools/build-linux.sh`, `tools/build-windows.sh`) and the launcher, then package with
-   `tools/package-release.sh`.
-
-`game/`, `generated/` and all retail files stay local: they are never committed or redistributed.
-
-## Credits
-
-- **ReXGlue SDK** — Xbox 360 PowerPC-to-x64 recompilation runtime and tooling; this project builds on the
-  [rexglue-sdk-yukes](https://github.com/HollywoodAkeem/rexglue-sdk-yukes) fork. ReXGlue is based in part on work from
-  **Xenia**, the Xbox 360 emulator project.
-- **Xenia contributors** — foundational Xbox 360 system and GPU research/code acknowledged by the ReXGlue SDK.
-- WWE 2K14 and all related game material are the property of their respective rights holders. This project is
-  unofficial and is not endorsed by them.
-
-Licensed under the BSD 3-Clause License ([LICENSE](LICENSE)); see also [DISCLAIMER.md](DISCLAIMER.md).
+- This is an unofficial fan project. It isn't affiliated with or endorsed by WWE, 2K, Take-Two Interactive, Yuke's or
+  Microsoft. *WWE 2K14* and all related names, characters and game material belong to their respective owners.
+- **No game material is included**: no `default.xex`, title update, game data, audio, video, DLC or saves. You must
+  own the game and supply your own files. See [DISCLAIMER.md](DISCLAIMER.md).
+- **Recompiler and runtime**: the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) (this project builds on the
+  [rexglue-sdk-yukes](https://github.com/HollywoodAkeem/rexglue-sdk-yukes) fork), which is derived from
+  [Xenia](https://github.com/xenia-project/xenia). See their licenses in `third-party-licenses/`.
+- **Native renderer**: draws through [plume](https://github.com/renderbag/plume) (MIT license); its shaders are converted
+  with [XenosRecomp](https://github.com/hedge-dev/XenosRecomp). Memory is managed with the Vulkan Memory Allocator (MIT).
+- **Video**: [FFmpeg](https://ffmpeg.org/) libraries under the LGPL 2.1 or later; the corresponding source is included
+  (`ffmpeg-source-*.zip`).
+- Other components and their licenses are listed in `licenses/` and `third-party-licenses/`.
+- Contributors: see [CONTRIBUTORS.md](CONTRIBUTORS.md).

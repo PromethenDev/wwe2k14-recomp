@@ -1,5 +1,19 @@
 # Changelog
 
+## v1.1.0 - 2026-10-23
+
+- New **Native renderer** (default): draws the game directly with Vulkan; much faster, especially on integrated
+  graphics. Picture size 480p / 720p / 1080p / 1440p / 4K, frame rate Locked 30 / 30-60 / 60 everywhere,
+  anti-aliasing on or off.
+- Launcher **Renderer** choice: **Native** or **Xbox** (the previous renderer), with hover descriptions.
+- Fixed stutter and crashes on laptops with AMD integrated graphics (Radeon 780M): the renderer keeps fast video
+  memory within the driver's limit.
+- Fewer first-time pauses: graphics effects are prepared when the game starts.
+- Moving to a new folder: on its first start the launcher finds your previous installation and offers to bring
+  everything over (game folder with the title update, DLC, saves, created superstars, music, keys, settings);
+  later via **Game files -> Import Previous Installation**.
+- Windows and Linux builds, as in v1.0.1.
+
 ## 1.0.1
 
 Fixes
