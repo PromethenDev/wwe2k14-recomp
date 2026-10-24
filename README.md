@@ -5,28 +5,29 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Version 1.1.0 is distributed as a download only;
-> the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
-> extend to v1.1.0.
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0 and 1.2.0 are distributed as downloads
+> only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
+> extend to v1.1.0 or later.
 
-## What's new in v1.1.0
+## What's new in v1.2.0
 
-- **New Native renderer (default).** The game is drawn directly with Vulkan instead of through an emulated Xbox 360
-  graphics chip. It is much faster, especially on integrated graphics (AMD Radeon 780M, Intel UHD), and adds:
-  - **Picture size**: 480p, 720p, 1080p, 1440p or 4K (480p is a good start on integrated graphics).
-  - **Frame rate**: **Locked 30**, **30 / 60** (60 in matches, 30 in entrances, like the console) or **60 everywhere**.
-  - **Anti-aliasing** on or off.
-  - Keeps fast video memory within the graphics driver's limit, which fixes stutter and crashes on laptops with AMD
-    integrated graphics.
-- **Xbox renderer**: the previous, emulated renderer is still included. Choose it if something looks wrong with
-  Native, or if you prefer the original picture. It uses the 720p / 1080p / 1440p sizes of v1.0.1.
-- Choose between them in the launcher: **Settings -> Renderer -> Native / Xbox** (hover over a button for a short
-  description).
-- Fewer first-time pauses: the Native renderer prepares its graphics effects when the game starts.
-- **Coming from an older version?** Extract v1.1.0 into a new folder and start the launcher: it finds your previous
-  installation and offers to **bring everything over** - game folder and title update, DLC, saves, created
-  superstars, music, keyboard keys and settings (nothing in the old folder is changed). You can also do it later with
-  **Game files -> Import Previous Installation**. Updating with the launcher's **Update** button keeps everything in place.
+- **Created superstars save fix**: saving a created superstar several times in a row (and the signatures / finishers
+  screens) no longer freezes the game.
+- **Lower CPU use** (Native renderer, on by default): the processor rests while the game waits for the graphics card -
+  about two-thirds less CPU on the game's main thread, same speed. Turn it off in **Settings** if a game feels less
+  smooth. Tip: keep **Sync frames to the monitor** on for the smoothest picture.
+- **Language** setting: English, Français, Deutsch, Italiano or Español (**Settings -> Language**).
+- **Xbox renderer**: new **Frame rate** (Locked 30 / 30 / 60 / 60 everywhere) and **Anti-aliasing** (FXAA) options.
+- **Custom music** from the Music Jukebox now repeats properly and stops when a match loads.
+- Fixed **Superstar Threads** faces (for example Batista and Big John Studd).
+- Fixed the in-game **F3** frame counter showing about 300 fps.
+- Fixed a crash at 4K picture size when the PC runs out of memory.
+- Linux: the launcher now fixes the game file's run permission and shows the real error if the game cannot start.
+- The game and launcher now have an icon.
+- Bug reports now record what the game was waiting on if the loading screen after choosing wrestlers never finishes.
+- **Coming from an older version?** Extract v1.2.0 into a new folder and start the launcher: it offers to **bring
+  everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
+  with the launcher's **Update** button keeps everything in place.
 
 ## Before you download
 
@@ -53,7 +54,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.1.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.2.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -88,8 +89,10 @@ The launcher shows a recommended setup for your graphics card. You can also choo
 
 - **Renderer** - **Native** (default, recommended) or **Xbox** (the previous renderer).
 - With **Native**: **Picture size** (480p, 720p, 1080p, 1440p, 4K - how sharp the 3D picture is drawn), **Frame
-  rate** (Locked 30, 30 / 60, 60 everywhere) and **Anti-aliasing**.
-- With **Xbox**: **Resolution** 720p, 1080p or 1440p (the game draws at 1280x720 like the Xbox 360 and is scaled).
+  rate** (Locked 30, 30 / 60, 60 everywhere), **Anti-aliasing** and **Lower CPU use**.
+- With **Xbox**: **Resolution** 720p, 1080p or 1440p (the game draws at 1280x720 like the Xbox 360 and is scaled),
+  **Frame rate** and **Anti-aliasing** (FXAA).
+- **Language** - the game's language (English, Français, Deutsch, Italiano, Español).
 - **Display** - fullscreen or windowed (press **F11** in the game to switch at any time); **Graphics card** - for PCs
   with two GPUs (laptops: pick the one you want to play on).
 - **Stretch to fill wide screens** - fill a 21:9 or 16:10 screen instead of showing black bars.
@@ -132,7 +135,8 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 ## Known issues
 
 - **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; rope shadows can show as solid
-  lines on the mat on some graphics cards; John Cena's title belt can shake with **60 everywhere** (use **30 / 60**);
+  lines on the mat on some AMD and Intel graphics (for example 6-man ladder, matches with managers, 30 Years of
+  WrestleMania); John Cena's title belt can shake with **60 everywhere** (use **30 / 60**);
   rarely, the loading screen after choosing wrestlers does not finish (restart the game). If something blocks you,
   switch to the **Xbox** renderer.
 - **The Back button does not toggle the pre-match options; use the D-pad (arrow keys) instead.** In the

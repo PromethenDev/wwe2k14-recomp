@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.2.0 - 2026-10-24
+
+- Fixed the game freezing when a created superstar is saved several times in a row (also signatures / finishers).
+- New launcher option **Lower CPU use** (Native renderer, on by default): about two-thirds less CPU on the game's main
+  thread at the same speed.
+- New **Language** setting (English, Français, Deutsch, Italiano, Español).
+- Xbox renderer: **Frame rate** (Locked 30 / 30-60 / 60 everywhere) and **Anti-aliasing** (FXAA) options.
+- Custom Music Jukebox songs repeat properly and stop when a match loads.
+- Fixed Superstar Threads faces (Batista, Big John Studd and others).
+- Fixed the F3 frame counter showing about 300 fps.
+- Fixed a crash at 4K picture size when memory runs out.
+- Linux launcher: restores the game file's run permission and shows the real start error.
+- Game and launcher icon.
+- Bug reports record what the game waits on if the loading screen after choosing wrestlers never finishes.
+
 ## v1.1.0 - 2026-10-23
 
 - New **Native renderer** (default): draws the game directly with Vulkan; much faster, especially on integrated
