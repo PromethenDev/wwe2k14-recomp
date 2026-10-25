@@ -1,5 +1,20 @@
 # Changelog
 
+## v1.2.1 - 2026-10-25
+
+- Fixed rope shadows showing as solid coloured lines on the mat (Native renderer).
+- New launcher **Crowd** setting (Native renderer): Full or None.
+- Restored v1.0.1 fixes that were missing in v1.1.0 and v1.2.0: no double speed on G-SYNC / FreeSync / high-refresh
+  monitors (#6); the game starts with non-English letters in user or folder names and keeps running when its log
+  cannot be written (#21); graphics errors and the Intel driver version in the log (#8, #23); Linux counts the
+  processor cores the game may use.
+- The "too few processor cores" warning is logged once.
+- The launcher shows the Xbox renderer's picture size.
+- The v1.2.0 created-superstar save fix and Custom Music fix now take effect (the v1.2.0 launcher did not pass
+  them to the game).
+- Known issue: Randy Savage, Hulk Hogan and Miss Elizabeth can look white in 30 Years of WrestleMania
+  (WrestleMania V) with the Native renderer (#18).
+
 ## v1.2.0 - 2026-10-24
 
 - Fixed the game freezing when a created superstar is saved several times in a row (also signatures / finishers).

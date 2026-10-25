@@ -5,27 +5,34 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0 and 1.2.0 are distributed as downloads
-> only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0 and 1.2.1 are distributed as
+> downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
 
-## What's new in v1.2.0
+## What's new in v1.2.1
+
+- **Rope shadows fixed** (Native renderer): the solid coloured lines on the mat (matches with managers, 6-man ladder,
+  30 Years of WrestleMania) are gone.
+- **Crowd** setting (Native renderer, **Settings**): **Full** or **None**. None draws an empty arena and gives weak
+  PCs a little more headroom.
+- **G-SYNC / FreeSync / high-refresh monitors**: the game no longer runs at double speed (fix from v1.0.1 restored).
+- **Non-English letters in the Windows user or folder name** (for example "Masaüstü"): the game starts again, and it
+  keeps running when its log file cannot be written (fix from v1.0.1 restored).
+- The game log names graphics errors and shows the Intel driver version again (helps bug reports).
+- The "too few processor cores" warning is logged once instead of filling the log; Linux counts the processor cores
+  the game is allowed to use.
+- The launcher shows the picture size used by the Xbox renderer.
+- The v1.2.0 **created superstar save fix** and **Custom Music fix** are now really switched on: the v1.2.0
+  launcher did not pass them to the game.
+
+### From v1.2.0
 
 - **Created superstars save fix**: saving a created superstar several times in a row (and the signatures / finishers
   screens) no longer freezes the game.
-- **Lower CPU use** (Native renderer, on by default): the processor rests while the game waits for the graphics card -
-  about two-thirds less CPU on the game's main thread, same speed. Turn it off in **Settings** if a game feels less
-  smooth. Tip: keep **Sync frames to the monitor** on for the smoothest picture.
-- **Language** setting: English, Français, Deutsch, Italiano or Español (**Settings -> Language**).
-- **Xbox renderer**: new **Frame rate** (Locked 30 / 30 / 60 / 60 everywhere) and **Anti-aliasing** (FXAA) options.
-- **Custom music** from the Music Jukebox now repeats properly and stops when a match loads.
-- Fixed **Superstar Threads** faces (for example Batista and Big John Studd).
-- Fixed the in-game **F3** frame counter showing about 300 fps.
-- Fixed a crash at 4K picture size when the PC runs out of memory.
-- Linux: the launcher now fixes the game file's run permission and shows the real error if the game cannot start.
-- The game and launcher now have an icon.
-- Bug reports now record what the game was waiting on if the loading screen after choosing wrestlers never finishes.
-- **Coming from an older version?** Extract v1.2.0 into a new folder and start the launcher: it offers to **bring
+- **Lower CPU use** (Native renderer, on by default), **Language** setting, Xbox renderer **Frame rate** and
+  **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
+  start fixes and the game/launcher icon.
+- **Coming from an older version?** Extract v1.2.1 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -54,7 +61,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.2.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.2.1-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -134,9 +141,9 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 
 ## Known issues
 
-- **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; rope shadows can show as solid
-  lines on the mat on some AMD and Intel graphics (for example 6-man ladder, matches with managers, 30 Years of
-  WrestleMania); John Cena's title belt can shake with **60 everywhere** (use **30 / 60**);
+- **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; Randy Savage, Hulk Hogan
+  and Miss Elizabeth can look white in 30 Years of WrestleMania (WrestleMania V); John Cena's title belt can shake
+  with **60 everywhere** (use **30 / 60**);
   rarely, the loading screen after choosing wrestlers does not finish (restart the game). If something blocks you,
   switch to the **Xbox** renderer.
 - **The Back button does not toggle the pre-match options; use the D-pad (arrow keys) instead.** In the
