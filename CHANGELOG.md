@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.3.0 - 2026-10-26
+
+- New launcher **Creation Suite** (Beta): one place for Superstars, Arenas and Music, in tabs.
+  - Import a created superstar (CAW) or created arena from a .cas/.car file, a .zip or an unpacked folder; the game
+    lists it with its name under Creations > Edit. Downloaded .rar files must be
+    extracted first.
+  - CAWs and arenas already in your save folder (for example copied in by hand) are set up automatically, so the game
+    lists them too; older imports are repaired the same way.
+  - Remove an imported creation again. A full save backup is made before every change.
+- Type names with your PC keyboard in the game's name boxes (#53).
+- Fixed white or yellow skin in 30 Years of WrestleMania (WrestleMania V: Hulk Hogan, Randy Savage, Miss Elizabeth;
+  also Bobby Heenan and nWo Macho Man) with the Native renderer (#18): shiny / reflective surfaces now use the same
+  reflection maths as the Xbox renderer.
+- Fixed Hollywood Hogan's nWo t-shirt missing until he rips it off (Native renderer).
+- The PC and screen no longer go to sleep while you play with a controller (#49).
+- Known issues: with Frame rate "60 everywhere" championship belts can shake during entrances (use 30/60);
+  if the intro video plays and the game returns to the title screen, choosing a mode can hang on a black screen -
+  press Start on the first title screen.
+
 ## v1.2.1 - 2026-10-25
 
 - Fixed rope shadows showing as solid coloured lines on the mat (Native renderer).

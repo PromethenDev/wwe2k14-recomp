@@ -5,25 +5,33 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0 and 1.2.1 are distributed as
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1 and 1.3.0 are distributed as
 > downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
 
-## What's new in v1.2.1
+## What's new in v1.3.0
 
-- **Rope shadows fixed** (Native renderer): the solid coloured lines on the mat (matches with managers, 6-man ladder,
-  30 Years of WrestleMania) are gone.
-- **Crowd** setting (Native renderer, **Settings**): **Full** or **None**. None draws an empty arena and gives weak
-  PCs a little more headroom.
-- **G-SYNC / FreeSync / high-refresh monitors**: the game no longer runs at double speed (fix from v1.0.1 restored).
-- **Non-English letters in the Windows user or folder name** (for example "Masaüstü"): the game starts again, and it
-  keeps running when its log file cannot be written (fix from v1.0.1 restored).
-- The game log names graphics errors and shows the Intel driver version again (helps bug reports).
-- The "too few processor cores" warning is logged once instead of filling the log; Linux counts the processor cores
-  the game is allowed to use.
-- The launcher shows the picture size used by the Xbox renderer.
-- The v1.2.0 **created superstar save fix** and **Custom Music fix** are now really switched on: the v1.2.0
-  launcher did not pass them to the game.
+- **Creation Suite** (Beta, new launcher page): **Superstars**, **Arenas** and **Music** in one place.
+  - **Import** a created superstar (CAW) or created arena from a `.cas` / `.car` file, a `.zip` or an unpacked
+    folder. The game lists it with its name under **Creations > Edit**. Downloaded `.rar` files: extract them first
+    (for example with 7-Zip).
+  - CAWs and arenas that are already in your save folder (for example copied in by hand) are set up automatically
+    with every import or removal, so the game lists them too. **Fix / find existing** does the same on demand.
+  - **Remove** an imported creation again. A full save backup is made before every change.
+- **Type names with your PC keyboard** in the game's name boxes (#53).
+- **White / yellow skin fixed** in 30 Years of WrestleMania (WrestleMania V: Hulk Hogan, Randy Savage, Miss
+  Elizabeth; also Bobby Heenan and nWo Macho Man) with the Native renderer (#18).
+- **Hollywood Hogan's nWo t-shirt** shows again (Native renderer).
+- The **PC and screen no longer go to sleep** while you play with a controller (#49).
+- Known issues: with **Frame rate: 60 everywhere** championship belts can shake during entrances (use 30 / 60);
+  if the intro video plays and the game goes back to the title screen, choosing a mode can hang on a black
+  screen - press **Start** on the first title screen.
+
+### From v1.2.1
+
+- **Rope shadows fixed** (Native renderer), **Crowd** setting (Full / None), G-SYNC / FreeSync double speed and
+  non-English folder name fixes restored from v1.0.1, better graphics errors in the log, Xbox renderer picture size
+  shown in the launcher.
 
 ### From v1.2.0
 
@@ -32,7 +40,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer, on by default), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.2.1 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.3.0 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -61,7 +69,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.2.1-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.3.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -103,7 +111,8 @@ The launcher shows a recommended setup for your graphics card. You can also choo
 - **Display** - fullscreen or windowed (press **F11** in the game to switch at any time); **Graphics card** - for PCs
   with two GPUs (laptops: pick the one you want to play on).
 - **Stretch to fill wide screens** - fill a 21:9 or 16:10 screen instead of showing black bars.
-- **Music** - drop your own songs in to use them in the game's custom music.
+- **Creation Suite** - import created superstars and arenas (Beta), and drop your own songs in for the game's
+  custom music.
 - **Saves** - **Back Up Now** and **Restore** your saves with one click.
 
 ## Updates
