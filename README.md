@@ -20,7 +20,6 @@ Xbox 360 emulator.
 - **Creation Suite**: imports now work with more save files (#63, #64); **export** created superstars and arenas;
   new **Logos** tab (your own pictures as
   custom logos, 256 x 256 or 128 x 128) and **Stories** tab; **Discord** button in the launcher.
-- Linux: no RenderDoc "Capturing Vulkan" overlay any more when RenderDoc is installed (#33).
 - Known issues: on **AMD Radeon integrated graphics** (for example Radeon 780M) the game can stall for a moment or
   drop to 30 fps, most often the first time a new arena or superstar is shown - **this will be fixed in the next
   build**. Linux: post-match replays stay off for now. With **Frame rate: 60 everywhere** championship belts can
