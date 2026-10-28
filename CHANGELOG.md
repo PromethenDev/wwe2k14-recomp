@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.2 - 2026-10-28
+
+- New launcher look.
+- F11 switches between fullscreen and windowed (#58).
+- Fixed white skin on AMD Radeon graphics (#18).
+- Fixed the invisible Money in the Bank briefcase and Create a Championship title belts (#71).
+- Fixed Creation Suite "unsupported" saves with a CAW that uses a WWE Superstar head.
+- Fixed importing an older install into a deep folder.
+- Fixed dual-graphics laptops starting at lower settings than shown.
+- "Preparing shaders" box before play is back.
+- Known issues: as v1.4.1; choosing a mode after the title-screen demo played can hang (press Start within ~20 s).
+
 ## v1.4.1 - 2026-10-28
 
 - Creation Suite (launcher only; the game is unchanged from v1.4.0):

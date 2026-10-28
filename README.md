@@ -5,11 +5,24 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0 and 1.4.1 are distributed as
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1 and 1.4.2 are distributed as
 > downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
 
-## What's new in v1.4.1
+## What's new in v1.4.2
+
+- New launcher look.
+- F11 switches between fullscreen and windowed (#58).
+- Fixed white skin on AMD Radeon graphics (Hogan, Savage, Elizabeth and others) (#18).
+- Fixed the invisible Money in the Bank briefcase and title belts in Create a Championship (#71).
+- Fixed Creation Suite saying "unsupported" for saves with a CAW that uses a WWE Superstar head.
+- Fixed bringing saves over from an older install when extracted into a deep folder.
+- Fixed laptops with two graphics chips starting at lower settings than the Settings page shows.
+- "Preparing shaders" box before play is back.
+- Known issues: as v1.4.1. If the title-screen demo has played, choosing a mode can hang - press Start within about
+  20 seconds.
+
+### From v1.4.1
 
 - **Creation Suite fixes** (launcher only; the game itself is the same as v1.4.0):
   - Importing some arenas no longer leaves the save "unsupported" (#64). The launcher now checks the save before it
@@ -56,7 +69,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.1 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.2 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -85,7 +98,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.1-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.2-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -106,6 +119,7 @@ WWE2K14-Recomp-x64/
 ├── wwe2k14.toml                # keyboard keys (change them on the launcher's Controls page)
 ├── avcodec-58.dll, avutil-56.dll
 ├── shaders/                    # Native renderer shaders (shared by Windows and Linux)
+├── shadertools/                # converts rare missing shaders at run time (Linux: Linux-x86_64/shadertools)
 ├── Linux-x86_64/               # Linux launcher + game
 ├── README.md, CHANGELOG.md, DISCLAIMER.md, CONTRIBUTORS.md, SHA256SUMS
 ├── licenses/, third-party-licenses/, ffmpeg-source-*.zip
