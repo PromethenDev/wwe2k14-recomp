@@ -1,5 +1,23 @@
 # Changelog
 
+## v1.4.0 - 2026-10-27
+
+- Fixed the crash when backing out of the Beat the Streak "Past WrestleMania Victims" page (#46).
+- Fixed the slowdown after a few matches in a row (for example 30 Years of WrestleMania) on graphics cards with less
+  video memory (#69, #70): old render surfaces are released when video memory runs low.
+- Fixed "device lost" crashes on AMD Radeon integrated graphics (for example Radeon 780M).
+- Post-match replays play again on Windows (#7).
+- "Lower CPU use" is now off by default (it could cost smoothness on some PCs).
+- Creation Suite: imports work with more save files (#63, #64); export created superstars and arenas; custom logos
+  can be 128 x 128 as well as 256 x 256; new Logos and Stories tabs; Discord button.
+- Linux: no more RenderDoc "Capturing Vulkan" overlay when RenderDoc is installed (#33).
+- Updated Native shaders (reflections).
+- Known issues: on AMD Radeon integrated graphics (for example Radeon 780M) the game can stall for a moment or drop
+  to 30 fps, most often the first time a new arena or superstar is shown - this will be fixed in the next build.
+  Linux: post-match replays stay off for now. With Frame rate "60 everywhere" championship belts can shake during
+  entrances (use 30/60). If the intro video plays and the game returns to the title screen, choosing a mode can hang
+  on a black screen - press Start on the first title screen.
+
 ## v1.3.0 - 2026-10-26
 
 - New launcher **Creation Suite** (Beta): one place for Superstars, Arenas and Music, in tabs.

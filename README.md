@@ -5,27 +5,33 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1 and 1.3.0 are distributed as
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0 and 1.4.0 are distributed as
 > downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
 
-## What's new in v1.3.0
+## What's new in v1.4.0
 
-- **Creation Suite** (Beta, new launcher page): **Superstars**, **Arenas** and **Music** in one place.
-  - **Import** a created superstar (CAW) or created arena from a `.cas` / `.car` file, a `.zip` or an unpacked
-    folder. The game lists it with its name under **Creations > Edit**. Downloaded `.rar` files: extract them first
-    (for example with 7-Zip).
-  - CAWs and arenas that are already in your save folder (for example copied in by hand) are set up automatically
-    with every import or removal, so the game lists them too. **Fix / find existing** does the same on demand.
-  - **Remove** an imported creation again. A full save backup is made before every change.
-- **Type names with your PC keyboard** in the game's name boxes (#53).
-- **White / yellow skin fixed** in 30 Years of WrestleMania (WrestleMania V: Hulk Hogan, Randy Savage, Miss
-  Elizabeth; also Bobby Heenan and nWo Macho Man) with the Native renderer (#18).
-- **Hollywood Hogan's nWo t-shirt** shows again (Native renderer).
-- The **PC and screen no longer go to sleep** while you play with a controller (#49).
-- Known issues: with **Frame rate: 60 everywhere** championship belts can shake during entrances (use 30 / 60);
+- **Beat the Streak crash fixed**: backing out of the "Past WrestleMania Victims" page no longer closes the game (#46).
+- **No more slowdown after a few matches in a row** (for example in 30 Years of WrestleMania) on graphics cards with
+  less video memory (#69, #70).
+- **AMD Radeon integrated graphics** (for example Radeon 780M): no more "device lost" crashes.
+- **Post-match replays** play again on Windows (#7).
+- **Lower CPU use** is now **off by default** (it could cost smoothness on some PCs); you can still turn it on.
+- **Creation Suite**: imports now work with more save files (#63, #64); **export** created superstars and arenas;
+  new **Logos** tab (your own pictures as
+  custom logos, 256 x 256 or 128 x 128) and **Stories** tab; **Discord** button in the launcher.
+- Linux: no RenderDoc "Capturing Vulkan" overlay any more when RenderDoc is installed (#33).
+- Known issues: on **AMD Radeon integrated graphics** (for example Radeon 780M) the game can stall for a moment or
+  drop to 30 fps, most often the first time a new arena or superstar is shown - **this will be fixed in the next
+  build**. Linux: post-match replays stay off for now. With **Frame rate: 60 everywhere** championship belts can
+  shake during entrances (use 30 / 60);
   if the intro video plays and the game goes back to the title screen, choosing a mode can hang on a black
   screen - press **Start** on the first title screen.
+
+### From v1.3.0
+
+- **Creation Suite** (CAW / arena import), **PC keyboard typing** in name boxes (#53), WrestleMania V skin fix (#18),
+  Hollywood Hogan's nWo t-shirt, PC no longer sleeps while playing with a controller (#49).
 
 ### From v1.2.1
 
@@ -37,10 +43,10 @@ Xbox 360 emulator.
 
 - **Created superstars save fix**: saving a created superstar several times in a row (and the signatures / finishers
   screens) no longer freezes the game.
-- **Lower CPU use** (Native renderer, on by default), **Language** setting, Xbox renderer **Frame rate** and
+- **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.3.0 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.0 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -69,7 +75,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.3.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -150,6 +156,9 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 
 ## Known issues
 
+- **AMD Radeon integrated graphics** (for example Radeon 780M): short stalls and drops to 30 fps, most often the
+  first time a new arena or superstar is shown. This will be fixed in the next build.
+- **Linux**: post-match replays are off for now (they could make the loading screen after Quit Match never finish).
 - **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; Randy Savage, Hulk Hogan
   and Miss Elizabeth can look white in 30 Years of WrestleMania (WrestleMania V); John Cena's title belt can shake
   with **60 everywhere** (use **30 / 60**);
