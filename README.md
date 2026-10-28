@@ -5,11 +5,28 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0 and 1.4.0 are distributed as
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0 and 1.4.1 are distributed as
 > downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
 
-## What's new in v1.4.0
+## What's new in v1.4.1
+
+- **Creation Suite fixes** (launcher only; the game itself is the same as v1.4.0):
+  - Importing some arenas no longer leaves the save "unsupported" (#64). The launcher now checks the save before it
+    writes anything.
+  - Many more community CAWs and arenas import, including most of the "Best of" save collection (before, many were
+    refused as "package list is damaged").
+  - Imported arenas no longer show a black ring or floor: each arena is now copied completely, including its look
+    settings and full name.
+  - Arenas imported with an older launcher can be repaired: open **Creation Suite > Arenas** and press
+    **Fix / find existing** once.
+- Known issues: on **AMD Radeon integrated graphics** (for example Radeon 780M) the game can still stall for a moment
+  or drop to 30 fps, most often the first time a new arena or superstar is shown; we are still working on it. Linux:
+  post-match replays stay off for now. With **Frame rate: 60 everywhere** championship belts can shake during
+  entrances (use 30 / 60); if the intro video plays and the game goes back to the title screen, choosing a mode can
+  hang on a black screen - press **Start** on the first title screen.
+
+### From v1.4.0
 
 - **Beat the Streak crash fixed**: backing out of the "Past WrestleMania Victims" page no longer closes the game (#46).
 - **No more slowdown after a few matches in a row** (for example in 30 Years of WrestleMania) on graphics cards with
@@ -20,12 +37,6 @@ Xbox 360 emulator.
 - **Creation Suite**: imports now work with more save files (#63, #64); **export** created superstars and arenas;
   new **Logos** tab (your own pictures as
   custom logos, 256 x 256 or 128 x 128) and **Stories** tab; **Discord** button in the launcher.
-- Known issues: on **AMD Radeon integrated graphics** (for example Radeon 780M) the game can stall for a moment or
-  drop to 30 fps, most often the first time a new arena or superstar is shown - **this will be fixed in the next
-  build**. Linux: post-match replays stay off for now. With **Frame rate: 60 everywhere** championship belts can
-  shake during entrances (use 30 / 60);
-  if the intro video plays and the game goes back to the title screen, choosing a mode can hang on a black
-  screen - press **Start** on the first title screen.
 
 ### From v1.3.0
 
@@ -45,7 +56,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.0 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.1 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -74,7 +85,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.0-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.1-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:

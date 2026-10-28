@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.4.1 - 2026-10-28
+
+- Creation Suite (launcher only; the game is unchanged from v1.4.0):
+  - Fixed "unsupported save" after importing some arenas (#64); the launcher checks the save before writing anything.
+  - Many more community CAWs and arenas import (for example the "Best of" save collection); fewer "package list is
+    damaged" errors.
+  - Fixed imported arenas showing a black ring or floor: arenas are copied completely (look settings, full name).
+  - Arenas imported with an older launcher are repaired with Creation Suite > Arenas > Fix / find existing.
+- Known issues: as v1.4.0 (AMD Radeon integrated graphics stalls are still being worked on).
+
 ## v1.4.0 - 2026-10-27
 
 - Fixed the crash when backing out of the Beat the Streak "Past WrestleMania Victims" page (#46).
