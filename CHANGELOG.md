@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.3 - 2026-10-29
+
+- New Settings options for slower PCs: Textures (Normal / Low) and Shadows (On / Off).
+- Fewer first-time stutters: more effects are prepared before play.
+- Intel graphics without 64-bit shader support (for example 10th-gen "Ice Lake" laptops) can use the Native renderer
+  instead of getting a black screen (#56).
+- The launcher shows a message instead of closing silently when it cannot open its window (#26).
+- New picture sizes 360p and 540p.
+- Fixed: the chosen game language was ignored while Settings were on Recommended.
+- Saves: backup/restore is blocked while the game runs, and a restore no longer gets undone by the launcher.
+- No false freeze report while shaders are prepared before play.
+
 ## v1.4.2 - 2026-10-28
 
 - New launcher look.

@@ -5,11 +5,24 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1 and 1.4.2 are distributed as
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1, 1.4.2 and 1.4.3 are distributed as
 > downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
 
-## What's new in v1.4.2
+## What's new in v1.4.3
+
+- New Settings options for slower PCs: **Textures** (Normal / Low) and **Shadows** (On / Off).
+- New picture sizes **360p** and **540p**.
+- Intel graphics without 64-bit shader support (for example 10th-gen "Ice Lake" laptops) can now use the Native
+  renderer instead of getting a black screen (#56).
+- Fewer stutters the first time you play: more effects are prepared before play.
+- The launcher shows a message instead of closing silently when it cannot open its window (#26).
+- Fixed: the chosen game language was ignored while Settings were on Recommended.
+- Saves: backup/restore is blocked while the game is running, and a restore is no longer undone by the launcher.
+- Known issues: as v1.4.2. On some laptops **Lower CPU use** makes entrances less smooth - leave it off unless your PC
+  runs hot or loud.
+
+### From v1.4.2
 
 - New launcher look.
 - F11 switches between fullscreen and windowed (#58).
@@ -69,7 +82,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.2 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.3 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -98,7 +111,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.2-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.3-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -119,6 +132,7 @@ WWE2K14-Recomp-x64/
 ├── wwe2k14.toml                # keyboard keys (change them on the launcher's Controls page)
 ├── avcodec-58.dll, avutil-56.dll
 ├── shaders/                    # Native renderer shaders (shared by Windows and Linux)
+├── shaders32/                  # Native renderer shaders for GPUs without 64-bit shader support (Intel Ice Lake)
 ├── shadertools/                # converts rare missing shaders at run time (Linux: Linux-x86_64/shadertools)
 ├── Linux-x86_64/               # Linux launcher + game
 ├── README.md, CHANGELOG.md, DISCLAIMER.md, CONTRIBUTORS.md, SHA256SUMS
