@@ -5,12 +5,25 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1, 1.4.2 and 1.4.3 are distributed as
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1, 1.4.2, 1.4.3 and 1.4.4 are distributed as
 > downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
 
-## What's new in v1.4.3
+## What's new in v1.4.4
 
+- **Smoother matches on a slow graphics chip.** Tested on an Intel UHD 630 at 480p: frames on time went from 42 % to
+  82 %, and speed from 52.7 to 62.3 fps. Crowds are now drawn with far fewer steps, and less memory is copied each frame.
+- **Fixed: matches slowing down on AMD laptop graphics** (Radeon 780M class, Steam Deck, Ryzen laptops). On a Radeon
+  780M laptop, matches now run at 59.4 fps with 1.9 % of frames late (was 45.7 fps, 30.5 % late).
+- **Fewer first-time stutters:** effects prepared before play are now used directly.
+- New launcher home-screen artwork. Windows and Linux are now separate downloads.
+- New Settings option **Intel Lake compatibility shaders** (off by default). Turn it on only if the Native renderer
+  crashes or looks wrong on an Intel graphics chip.
+- New Settings option **Faster loading** (off by default; works with Locked 30).
+- Known issues: as v1.4.3. If the title-screen demo has played, choosing a mode can hang - press Start within about
+  20 seconds. On some laptops **Lower CPU use** makes entrances less smooth - leave it off unless your PC runs hot or loud.
+
+### From v1.4.3
 - New Settings options for slower PCs: **Textures** (Normal / Low) and **Shadows** (On / Off).
 - New picture sizes **360p** and **540p**.
 - Intel graphics without 64-bit shader support (for example 10th-gen "Ice Lake" laptops) can now use the Native
@@ -82,7 +95,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.3 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.4 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -111,7 +124,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.3-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.4-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:

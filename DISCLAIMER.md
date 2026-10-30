@@ -28,3 +28,11 @@ your saves and settings.
 ```
 
 This is an unofficial research/interoperability project. All trademarks and copyrights remain with their respective owners. Contact the project maintainers through the repository if you are a rights holder with a concern.
+
+## Launcher artwork
+
+The launcher's home-screen pictures use promotional artwork from WWE 2K14. WWE, the WWE logo, WWE 2K14, the names and
+likenesses of WWE talent, and all related artwork are trademarks and copyrights of World Wrestling Entertainment, Inc.,
+2K and Take-Two Interactive Software, Inc., and/or their respective owners. They are used here only to identify the game.
+This project is not affiliated with, endorsed by, or sponsored by WWE, 2K or Take-Two, and claims no ownership of or
+license to this artwork. Rights holders who want it removed can contact the project and it will be taken out.

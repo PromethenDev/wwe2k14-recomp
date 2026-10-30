@@ -1,5 +1,14 @@
 # Changelog
 
+## v1.4.4
+
+- Smoother matches on slow graphics chips (Intel UHD 630 at 480p: on time 42 % -> 82 %, 52.7 -> 62.3 fps).
+- Fixed matches slowing down on AMD laptop graphics (Radeon 780M class, Steam Deck, Ryzen laptops): 45.7 -> 59.4 fps on a
+  Radeon 780M (#76).
+- Fewer first-time stutters: effects prepared before play are now used directly.
+- New launcher home-screen artwork. Windows and Linux are separate downloads (Windows 212 -> 160 MB).
+- New Settings options: Intel Lake compatibility shaders (off by default) and Faster loading (off by default).
+
 ## v1.4.3 - 2026-10-29
 
 - New Settings options for slower PCs: Textures (Normal / Low) and Shadows (On / Off).
