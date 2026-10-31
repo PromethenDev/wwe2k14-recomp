@@ -5,9 +5,14 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1, 1.4.2, 1.4.3 and 1.4.4 are distributed as
+> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1, 1.4.2, 1.4.3, 1.4.4 and 1.4.5 are distributed as
 > downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
 > extend to v1.1.0 or later.
+
+## What's new in v1.4.5
+
+- **Fixed: the game would not start on Intel "Ice Lake" laptop graphics** (for example Core i3-1005G1 / i5-1035G1
+  with Intel UHD or Iris Plus) with the Native renderer in v1.4.4 (#77). One compatibility shader was missing.
 
 ## What's new in v1.4.4
 
@@ -95,7 +100,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.4 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.5 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -124,7 +129,7 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.4-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.5-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:

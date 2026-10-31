@@ -1,6 +1,10 @@
 # Changelog
 
-## v1.4.4
+## v1.4.5 - 2026-10-30
+
+- Fixed: the game would not start on Intel "Ice Lake" laptop graphics with the Native renderer (#77).
+
+## v1.4.4 - 2026-10-30
 
 - Smoother matches on slow graphics chips (Intel UHD 630 at 480p: on time 42 % -> 82 %, 52.7 -> 62.3 fps).
 - Fixed matches slowing down on AMD laptop graphics (Radeon 780M class, Steam Deck, Ryzen laptops): 45.7 -> 59.4 fps on a
