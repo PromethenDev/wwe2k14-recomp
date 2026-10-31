@@ -5,9 +5,10 @@ game code is translated ahead of time to C++ and built into a native executable 
 Xbox 360 emulator.
 
 > [!NOTE]
-> **Downloads**: get the latest version from the **Releases** page. Versions 1.1.0, 1.2.0, 1.2.1, 1.3.0, 1.4.0, 1.4.1, 1.4.2, 1.4.3, 1.4.4 and 1.4.5 are distributed as
-> downloads only; the source code in this repository is that of v1.0.1 (under its BSD 3-Clause [LICENSE](LICENSE)), which does not
-> extend to v1.1.0 or later.
+> **License**: every release of WWE 2K14 Recomp - v1.0.0 through v1.4.6 and all later versions - is licensed under the
+> BSD 3-Clause [LICENSE](LICENSE). The license covers this project's own code only; it does not cover WWE 2K14 or any game
+> content, and third-party components keep their own licenses. Get the latest version from the **Releases** page; versions
+> from 1.1.0 on are distributed as downloads, and the source code in this repository is that of v1.0.1.
 
 ## What's new in v1.4.5
 
