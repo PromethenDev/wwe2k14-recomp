@@ -10,6 +10,13 @@ Xbox 360 emulator.
 > content, and third-party components keep their own licenses. Get the latest version from the **Releases** page; versions
 > from 1.1.0 on are distributed as downloads, and the source code in this repository is that of v1.0.1.
 
+## What's new in v1.4.8
+
+- **Fixed: matches with a created superstar (CAW) never finished loading** (#72, #84). Post-match replays are off
+  again for now, because turning them on caused this; they come back once both work together.
+- Fixed: the in-launcher updater on Linux downloaded the Windows files (#82). The main download contains both the
+  Windows and the Linux files again, so Linux players on the broken updater can update normally once.
+
 ## What's new in v1.4.7
 
 - **Fixed endless loading screens with DLC installed**: at the main menu and in Move-Set > Signatures / Finishers
@@ -108,7 +115,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.7 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.8 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -137,7 +144,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.7-x64.zip` and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.8-x64.zip` (Windows and Linux in one package; Linux players can also use the
+   smaller `Linux-WWE2K14-Recomp-v1.4.8-x64.zip`) and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
@@ -222,7 +230,8 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 
 - **AMD Radeon integrated graphics** (for example Radeon 780M): short stalls and drops to 30 fps, most often the
   first time a new arena or superstar is shown. This will be fixed in the next build.
-- **Linux**: post-match replays are off for now (they could make the loading screen after Quit Match never finish).
+- **Post-match replays** are off for now on Windows and Linux (with them on, matches with a created superstar never
+  finished loading).
 - **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; Randy Savage, Hulk Hogan
   and Miss Elizabeth can look white in 30 Years of WrestleMania (WrestleMania V); John Cena's title belt can shake
   with **60 everywhere** (use **30 / 60**);

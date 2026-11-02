@@ -1,5 +1,12 @@
 # Changelog
 
+## v1.4.8 - 2026-11-02
+
+- Fixed: matches with a created superstar (CAW) never finished loading (#72, #84). Post-match replays are off again
+  for now, because turning them on caused this; they come back once both work together.
+- Fixed: the in-launcher updater on Linux downloaded the Windows files (#82). This download contains both Windows and
+  Linux files so Linux players on the broken updater can update normally once.
+
 ## v1.4.7 - 2026-11-01
 
 - Fixed endless loading screens with DLC installed: at the main menu and in Move-Set > Signatures / Finishers
