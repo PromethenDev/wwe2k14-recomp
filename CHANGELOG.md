@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.4.7 - 2026-11-01
+
+- Fixed endless loading screens with DLC installed: at the main menu and in Move-Set > Signatures / Finishers
+  (#29, #78, #83).
+- Fixed a rare random crash.
+- Fixed a possible freeze in cloth physics.
+- Freeze reports now say what a stuck loading screen is waiting for.
+
+## v1.4.6 - 2026-10-31
+
+- Fixed Creation Suite export: other drives, game-edited superstars (incl. WWE-superstar heads), and large arenas /
+  superstars ("file is too large"). The export window opens in Documents; failures say which step went wrong.
+- Clearer message when the launcher is not next to the game program (wwe2k14.exe).
+- Better bug reports: a short, readable timeline of each game session (frame rate, hitches, loading, files that
+  failed to open, a crash line) and a launcher log of what was clicked and which settings changed. Account names are
+  hidden in the launcher log. No measurable cost on a slow Intel UHD 630.
+- Bug reports now include the PC's hardware (processor, memory, Windows version, display, power/battery, SSD or hard
+  disk, graphics driver and video memory). No computer name, account name or serial numbers.
+
 ## v1.4.5 - 2026-10-30
 
 - Fixed: the game would not start on Intel "Ice Lake" laptop graphics with the Native renderer (#77).
