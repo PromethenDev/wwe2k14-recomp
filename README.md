@@ -10,6 +10,17 @@ Xbox 360 emulator.
 > content, and third-party components keep their own licenses. Get the latest version from the **Releases** page; versions
 > from 1.1.0 on are distributed as downloads, and the source code in this repository is that of v1.0.1.
 
+## What's new in v1.4.9
+
+- **Creation Suite:** rename your created superstars and custom arenas.
+- **Logos:** draw new logos or edit existing ones with the built-in paint tool (works with a touchpad, full screen option).
+- **Music:** play your songs in the launcher with a position bar to jump anywhere. Change volume, trim, fades, bass
+  and treble and hear each change while the song plays. Match a song, or several ticked songs, to the game's own
+  music level.
+- **Settings:** clearer pages with bigger buttons. **Recommended settings for my PC** now uses your strongest graphics
+  card (for example the RTX instead of the built-in graphics on a laptop) and offers to switch to it.
+- The game itself is unchanged from v1.4.8.
+
 ## What's new in v1.4.8
 
 - **Fixed: matches with a created superstar (CAW) never finished loading** (#72, #84). Post-match replays are off
@@ -115,7 +126,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.8 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.9 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -144,8 +155,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.8-x64.zip` (Windows and Linux in one package; Linux players can also use the
-   smaller `Linux-WWE2K14-Recomp-v1.4.8-x64.zip`) and extract it to a normal folder such as Documents or Desktop (not
+1. Download `WWE2K14-Recomp-v1.4.9-x64.zip` (Windows and Linux in one package; Linux players can also use the
+   smaller `Linux-WWE2K14-Recomp-v1.4.9-x64.zip`) and extract it to a normal folder such as Documents or Desktop (not
    `C:\Program Files`).
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:

@@ -1,5 +1,16 @@
 # Changelog
 
+## v1.4.9 - 2026-11-02
+
+- **Creation Suite:** rename your created superstars and custom arenas.
+- **Logos:** draw new logos or edit existing ones with the built-in paint tool (works with a touchpad, full screen option).
+- **Music:** play your songs in the launcher with a position bar to jump anywhere. Change volume, trim, fades, bass
+  and treble and hear each change while the song plays. Match a song, or several ticked songs, to the game's own
+  music level.
+- **Settings:** clearer pages with bigger buttons. **Recommended settings for my PC** now uses your strongest graphics
+  card (for example the RTX instead of the built-in graphics on a laptop) and offers to switch to it.
+- The game itself is unchanged from v1.4.8.
+
 ## v1.4.8 - 2026-11-02
 
 - Fixed: matches with a created superstar (CAW) never finished loading (#72, #84). Post-match replays are off again
