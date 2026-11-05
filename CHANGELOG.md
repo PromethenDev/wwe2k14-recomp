@@ -1,5 +1,17 @@
 # Changelog
 
+## v1.4.10 - 2026-11-05
+
+- **Faster on the processor:** the game now uses much less processor time per frame. On our test PC the game's
+  main thread dropped from about 16 ms to about 5 ms per frame, and a laptop on battery now holds a steady 60 fps.
+  Weaker PCs should benefit most; fast PCs will not see a big change.
+- **Picture fixes:** black patches during Undertaker's victory (#91); two shaders that could show random colours;
+  slightly wrong reflections on many shiny materials.
+- **Long sessions:** video memory no longer keeps growing over many matches in a row (#93).
+- **AMD Radeon integrated graphics (for example 780M):** if Elimination Chamber or other big matches crash, please
+  update your AMD graphics driver - an old 2023 driver was the cause on our test laptop.
+- **Move-Set endless load fixed:** Signatures & Finishers could load forever when the game ran out of cache space; it now skips that optional copy and keeps loading.
+
 ## v1.4.9 - 2026-11-02
 
 - **Creation Suite:** rename your created superstars and custom arenas.
@@ -13,10 +25,8 @@
 
 ## v1.4.8 - 2026-11-02
 
-- Fixed: matches with a created superstar (CAW) never finished loading (#72, #84). Post-match replays are off again
-  for now, because turning them on caused this; they come back once both work together.
-- Fixed: the in-launcher updater on Linux downloaded the Windows files (#82). This download contains both Windows and
-  Linux files so Linux players on the broken updater can update normally once.
+- Fixed: matches with a created superstar (CAW) never finished loading (#72, #84). Post-match replays are off again for now, because turning them on caused this; they come back once both work together.
+- Fixed: the in-launcher updater on Linux downloaded the Windows files (#82). This download contains both Windows and Linux files so Linux players on the broken updater can update normally once.
 
 ## v1.4.7 - 2026-11-01
 

@@ -1,14 +1,20 @@
-# WWE 2K14 Recomp
+# WWE 2K14 Recomp v1.4.10
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
 
-> [!NOTE]
-> **License**: every release of WWE 2K14 Recomp - v1.0.0 through v1.4.6 and all later versions - is licensed under the
-> BSD 3-Clause [LICENSE](LICENSE). The license covers this project's own code only; it does not cover WWE 2K14 or any game
-> content, and third-party components keep their own licenses. Get the latest version from the **Releases** page; versions
-> from 1.1.0 on are distributed as downloads, and the source code in this repository is that of v1.0.1.
+## What's new in v1.4.10
+
+- **Faster on the processor:** the game now uses much less processor time per frame. On our test PC the game's
+  main thread dropped from about 16 ms to about 5 ms per frame, and a laptop on battery now holds a steady 60 fps.
+  Weaker PCs should benefit most; fast PCs will not see a big change.
+- **Picture fixes:** black patches during Undertaker's victory (#91); two shaders that could show random colours;
+  slightly wrong reflections on many shiny materials.
+- **Long sessions:** video memory no longer keeps growing over many matches in a row (#93).
+- **AMD Radeon integrated graphics (for example 780M):** if Elimination Chamber or other big matches crash, please
+  update your AMD graphics driver - an old 2023 driver was the cause on our test laptop.
+- **Move-Set endless load fixed:** Signatures & Finishers could load forever when the game ran out of cache space; it now skips that optional copy and keeps loading.
 
 ## What's new in v1.4.9
 
@@ -23,10 +29,10 @@ Xbox 360 emulator.
 
 ## What's new in v1.4.8
 
-- **Fixed: matches with a created superstar (CAW) never finished loading** (#72, #84). Post-match replays are off
+- Fixed: matches with a created superstar (CAW) never finished loading (#72, #84). Post-match replays are off
   again for now, because turning them on caused this; they come back once both work together.
-- Fixed: the in-launcher updater on Linux downloaded the Windows files (#82). The main download contains both the
-  Windows and the Linux files again, so Linux players on the broken updater can update normally once.
+- Fixed: the in-launcher updater on Linux downloaded the Windows files (#82). This download contains both Windows and
+  Linux files so Linux players on the broken updater can update normally once.
 
 ## What's new in v1.4.7
 
@@ -34,6 +40,15 @@ Xbox 360 emulator.
   (#29, #78, #83).
 - Fixed a rare random crash and a possible freeze in cloth physics.
 - Freeze reports now say what a stuck loading screen is waiting for.
+
+## What's new in v1.4.6
+
+- **Creation Suite export fixed:** exporting works when the game is on a different drive from where you save the file
+  (for example the game on D: and your Desktop on C:), for superstars the game has edited (including ones with a WWE
+  superstar's head), and for large arenas and superstars with their own images - there is no size limit any more (the "file is too large" error).
+- The export window opens in Documents, and a failed export now says which step went wrong.
+- **Better bug reports:** a short, readable timeline of each game session and a launcher log of clicks and setting
+  changes, both included in **Save a Bug Report** (account names hidden).
 
 ## What's new in v1.4.5
 
@@ -126,7 +141,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.9 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.4.10 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -155,9 +170,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.9-x64.zip` (Windows and Linux in one package; Linux players can also use the
-   smaller `Linux-WWE2K14-Recomp-v1.4.9-x64.zip`) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`).
+1. Download `WWE2K14-Recomp-v1.4.10.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.4.10.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or
