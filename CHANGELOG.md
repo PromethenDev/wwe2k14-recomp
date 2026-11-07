@@ -1,5 +1,33 @@
 # Changelog
 
+## v1.5.0 - 2026-11-07
+
+- **Import from WWE '13 (new):** a button on the new **Mods** page brings wrestlers from your own WWE '13 into WWE 2K14:
+  their models, attires, entrances, moves, names, theme music, the ring announcer saying their names, and their own
+  titantron videos, converted on your PC. All 106 supported wrestlers, base game and add-ons, or just the ones you tick.
+  - The launcher finds your WWE '13 files and add-ons by itself, or you choose the folder at any time.
+  - Themes start at WWE 2K14's own music volume. Each wrestler's theme volume can be changed under **Edit**, with a
+    button to go back to the game's volume.
+  - It checks free disk space first, shows its progress, and can be cancelled. **Undo WWE '13 import** puts back every
+    original file exactly. You can import more wrestlers later without starting over.
+  - You need your own WWE '13 and your own WWE 2K14 DLC packs. No game files are included in this download.
+- **Mods page (new):** imported wrestlers with search, Men and Divas lists, remove and add back several at once, each
+  tagged with the game it came from, and a **Pop out list** button for a full-size view.
+- **Weapon wheel in Hell in a Cell:** pull any object from under the ring, as in Extreme Rules: chairs, ladders, tables
+  and more. The computer uses it too. Off by default; tick it on the Mods page. Exhibition matches only.
+- **Full shadows in big matches:** matches with 3 or more wrestlers, including Ladder and TLC, get the same soft rope and
+  wrestler shadows on the ring as one-on-one matches. On by default, except on AMD integrated graphics, where it stays
+  your choice for now (Settings).
+- **Faster on weak graphics:** lighter shaders and less work per frame on built-in graphics such as Intel UHD 630 and
+  AMD Radeon 780M. On our Intel UHD 630 test PC: about 55 fps against about 51 for v1.4.10, and steadier (the slowest 5%
+  of frames 27 ms against 30 ms). The test matches vary, so treat that as a small gain.
+- **Smoother over a whole match:** the game uses video memory more carefully and keeps frame pacing steadier.
+- **Two optional add-ons that lower the picture for speed,** both off by default, in Settings: **Performance mode**
+  (anti-aliasing off and softer texture filtering) and **Texture filtering: Standard** (softer than the default Sharp).
+- **Saves page:** backups show **Normal** or **Modded**, so you know which saves were played with imported wrestlers.
+- **Fixed:** black strips on the steel cage and on Hell in a Cell. Launcher settings that did not stay saved. After an
+  update, new shaders are prepared again so the first matches don't stutter.
+
 ## v1.4.10 - 2026-11-05
 
 - **Faster on the processor:** the game now uses much less processor time per frame. On our test PC the game's

@@ -1,8 +1,36 @@
-# WWE 2K14 Recomp v1.4.10
+# WWE 2K14 Recomp v1.5.0
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
+
+## What's new in v1.5.0
+
+- **Import from WWE '13 (new):** a button on the new **Mods** page brings wrestlers from your own WWE '13 into WWE 2K14:
+  their models, attires, entrances, moves, names, theme music, the ring announcer saying their names, and their own
+  titantron videos, converted on your PC. All 106 supported wrestlers, base game and add-ons, or just the ones you tick.
+  - The launcher finds your WWE '13 files and add-ons by itself, or you choose the folder at any time.
+  - Themes start at WWE 2K14's own music volume. Each wrestler's theme volume can be changed under **Edit**, with a
+    button to go back to the game's volume.
+  - It checks free disk space first, shows its progress, and can be cancelled. **Undo WWE '13 import** puts back every
+    original file exactly. You can import more wrestlers later without starting over.
+  - You need your own WWE '13 and your own WWE 2K14 DLC packs. No game files are included in this download.
+- **Mods page (new):** imported wrestlers with search, Men and Divas lists, remove and add back several at once, each
+  tagged with the game it came from, and a **Pop out list** button for a full-size view.
+- **Weapon wheel in Hell in a Cell:** pull any object from under the ring, as in Extreme Rules: chairs, ladders, tables
+  and more. The computer uses it too. Off by default; tick it on the Mods page. Exhibition matches only.
+- **Full shadows in big matches:** matches with 3 or more wrestlers, including Ladder and TLC, get the same soft rope and
+  wrestler shadows on the ring as one-on-one matches. On by default, except on AMD integrated graphics, where it stays
+  your choice for now (Settings).
+- **Faster on weak graphics:** lighter shaders and less work per frame on built-in graphics such as Intel UHD 630 and
+  AMD Radeon 780M. On our Intel UHD 630 test PC: about 55 fps against about 51 for v1.4.10, and steadier (the slowest 5%
+  of frames 27 ms against 30 ms). The test matches vary, so treat that as a small gain.
+- **Smoother over a whole match:** the game uses video memory more carefully and keeps frame pacing steadier.
+- **Two optional add-ons that lower the picture for speed,** both off by default, in Settings: **Performance mode**
+  (anti-aliasing off and softer texture filtering) and **Texture filtering: Standard** (softer than the default Sharp).
+- **Saves page:** backups show **Normal** or **Modded**, so you know which saves were played with imported wrestlers.
+- **Fixed:** black strips on the steel cage and on Hell in a Cell. Launcher settings that did not stay saved. After an
+  update, new shaders are prepared again so the first matches don't stutter.
 
 ## What's new in v1.4.10
 
@@ -141,7 +169,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.4.10 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.5.0 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -158,6 +186,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 - **Title update 1.0.3** (`default.xexp` and its data files). It is required: the recompilation was built from the
   updated game, so the game refuses to start without it and tells you why.
 - **DLC packs** are optional.
+- **Import from WWE '13** is optional too. It needs your own WWE '13 files and your own WWE 2K14 DLC packs; it tells you
+  plainly if something is missing.
 
 ## What you need
 
@@ -170,8 +200,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.4.10.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.4.10.zip`.
+1. Download `WWE2K14-Recomp-v1.5.0.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.0.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or
@@ -188,13 +218,15 @@ The launcher checks every file and shows **Game files ready** when everything is
 WWE2K14-Recomp-x64/
 ├── WWE 2K14 Launcher.exe       # start here (Windows)
 ├── wwe2k14.exe                 # the game (started by the launcher)
+├── pipelines-seed.keys         # first-start graphics list (Linux: Linux-x86_64/pipelines-seed.keys)
 ├── wwe2k14.toml                # keyboard keys (change them on the launcher's Controls page)
 ├── avcodec-58.dll, avutil-56.dll
 ├── shaders/                    # Native renderer shaders (shared by Windows and Linux)
 ├── shaders32/                  # Native renderer shaders for GPUs without 64-bit shader support (Intel Ice Lake)
+├── crowd-cards/                # extra crowd shaders (Linux: Linux-x86_64/crowd-cards)
 ├── shadertools/                # converts rare missing shaders at run time (Linux: Linux-x86_64/shadertools)
 ├── Linux-x86_64/               # Linux launcher + game
-├── README.md, CHANGELOG.md, DISCLAIMER.md, CONTRIBUTORS.md, SHA256SUMS
+├── README.md, CHANGELOG.md, DISCLAIMER.md, CONTRIBUTORS.md, LICENSE, SHA256SUMS
 ├── licenses/, third-party-licenses/, ffmpeg-source-*.zip
 ├── WWE 2K14/                   # your game folder (default.xex + default.xexp + data)
 ├── userdata/                   # saves, DLC and settings (created on first run)
@@ -216,6 +248,10 @@ The launcher shows a recommended setup for your graphics card. You can also choo
 - **Stretch to fill wide screens** - fill a 21:9 or 16:10 screen instead of showing black bars.
 - **Creation Suite** - import created superstars and arenas (Beta), and drop your own songs in for the game's
   custom music.
+- **Mods** - **Gameplay** changes such as the Hell in a Cell weapon wheel (off by default), and **Import from WWE '13**.
+  Importing many wrestlers takes a few minutes and needs free disk space; the launcher checks the space first. Each
+  titantron movie is converted on your PC. If one cannot be converted, that wrestler uses a WWE 2K14 titantron instead
+  and the launcher tells you. **Undo WWE '13 import** restores your original files.
 - **Saves** - **Back Up Now** and **Restore** your saves with one click.
 
 ## Updates
@@ -254,7 +290,9 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 ## Known issues
 
 - **AMD Radeon integrated graphics** (for example Radeon 780M): short stalls and drops to 30 fps, most often the
-  first time a new arena or superstar is shown. This will be fixed in the next build.
+  first time a new arena or superstar is shown. On our one test laptop (Radeon 780M), a heavy match plugged in on its
+  Silent power mode can also fall to about 30 fps when the chip's memory slows down; on battery it held 60. The speed
+  work in this version reduced that in our test but did not remove it.
 - **Post-match replays** are off for now on Windows and Linux (with them on, matches with a created superstar never
   finished loading).
 - **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; Randy Savage, Hulk Hogan
@@ -265,6 +303,8 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 - **The Back button does not toggle the pre-match options; use the D-pad (arrow keys) instead.** In the
   Create-a-Superstar editor, holding Back (**Tab**) shows a controls legend. Save a created superstar from the
   **OTHER** tab's **ACCEPT** row (see "On-screen prompts and saving a created superstar" above).
+- **Import from WWE '13**: do not close the launcher or turn off the PC while it is copying files. If that happens, the
+  import cannot repair itself; your original files stay in a backup beside your game folders.
 - Some shadow and lighting differences remain compared to the console.
 - Frame rates can dip in active play on some systems (the game's timing follows the frame rate).
 - Extract the release to a normal folder, not `C:\Program Files`: the launcher keeps your saves and settings next to
@@ -297,5 +337,12 @@ thread and what it was waiting on at the moment it stopped presenting.
   with [XenosRecomp](https://github.com/hedge-dev/XenosRecomp). Memory is managed with the Vulkan Memory Allocator (MIT).
 - **Video**: [FFmpeg](https://ffmpeg.org/) libraries under the LGPL 2.1 or later; the corresponding source is included
   (`ffmpeg-source-*.zip`).
+- **Import from WWE '13**: no WWE '13 or WWE 2K14 game files are included; the import works only with files you already
+  own. The movie converter (`wwe2k14-bink-convert`) is a separate program under the GNU Affero General Public License
+  version 3, built on NihAV; its source is attached to each release (`wwe2k14-bink-convert-source-*.tar.gz`). The LZX
+  decoder library (`wwe2k14_lzx`) is from libmspack under the LGPL 2.1; its source is attached too
+  (`libmspack-lzx-source-*.tar.gz`). See `licenses/importer-NOTICE.txt`.
 - Other components and their licenses are listed in `licenses/` and `third-party-licenses/`.
+- **License**: this project's own code is under the BSD 3-Clause [LICENSE](LICENSE). It does not cover WWE 2K14 or any game
+  content, and third-party components keep their own licenses.
 - Contributors: see [CONTRIBUTORS.md](CONTRIBUTORS.md).
