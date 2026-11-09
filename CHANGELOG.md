@@ -1,5 +1,24 @@
 # Changelog
 
+## v1.5.2 - 2026-11-09
+
+- **Bug Reports page (new):** click **Bug Reports** at the bottom of the launcher. It lists your last 10 games and how
+  each one ended (crashes are shown in red), with **Save Report** and **Show Report** for each game, your saved reports,
+  and a **Report on GitHub** button. Save the report for the game that went wrong, then drag the file into your GitHub
+  message.
+- **Crash message (new):** if the game crashes, the launcher comes back by itself, tells you the game crashed, saves a bug
+  report for that game (or tells you if it could not), and takes you to the Bug Reports page. The launcher still closes when the game
+  starts; a small helper without a window waits for the game in the background.
+- **Fixed: crash in Ladder and TLC matches with the weapon wheel** (GitHub #110). For now the weapon wheel is off in
+  Ladder and TLC matches, even with **Also in other match types** ticked.
+- **Fixed (Linux): the game would not start again after closing it with Alt+F4** on PCs with little memory, until the
+  PC was restarted (GitHub #107).
+- **WWE '13 import:** when Add-On 2 is not found, the message now lists the add-on folders the launcher did find
+  (GitHub #103). Files another program holds for a moment are tried again, and if that still fails the message says why.
+- **Black wrestlers on older AMD Radeon cards (RX 560 / RX 580):** not fixed yet, but a bug report from these cards now
+  shows exactly what the graphics card refuses, so we can fix it. If this happens to you, please send one from the new
+  Bug Reports page (GitHub #44).
+
 ## v1.5.1 - 2026-11-08
 
 - **In-game settings menu (new):** press **F1** on the keyboard, or **Back + Start** together on a controller, during

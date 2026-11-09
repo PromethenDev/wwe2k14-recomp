@@ -1,8 +1,27 @@
-# WWE 2K14 Recomp v1.5.1
+# WWE 2K14 Recomp v1.5.2
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
+
+## What's new in v1.5.2
+
+- **Bug Reports page (new):** click **Bug Reports** at the bottom of the launcher. It lists your last 10 games and how
+  each one ended (crashes are shown in red), with **Save Report** and **Show Report** for each game, your saved reports,
+  and a **Report on GitHub** button. Save the report for the game that went wrong, then drag the file into your GitHub
+  message.
+- **Crash message (new):** if the game crashes, the launcher comes back by itself, tells you the game crashed, saves a bug
+  report for that game (or tells you if it could not), and takes you to the Bug Reports page. The launcher still closes when the game
+  starts; a small helper without a window waits for the game in the background.
+- **Fixed: crash in Ladder and TLC matches with the weapon wheel** (GitHub #110). For now the weapon wheel is off in
+  Ladder and TLC matches, even with **Also in other match types** ticked.
+- **Fixed (Linux): the game would not start again after closing it with Alt+F4** on PCs with little memory, until the
+  PC was restarted (GitHub #107).
+- **WWE '13 import:** when Add-On 2 is not found, the message now lists the add-on folders the launcher did find
+  (GitHub #103). Files another program holds for a moment are tried again, and if that still fails the message says why.
+- **Black wrestlers on older AMD Radeon cards (RX 560 / RX 580):** not fixed yet, but a bug report from these cards now
+  shows exactly what the graphics card refuses, so we can fix it. If this happens to you, please send one from the new
+  Bug Reports page (GitHub #44).
 
 ## What's new in v1.5.1
 
@@ -185,7 +204,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.5.1 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.5.2 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -216,8 +235,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.5.1.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.1.zip`.
+1. Download `WWE2K14-Recomp-v1.5.2.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.2.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or
@@ -331,12 +350,14 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
 
 ## Reporting bugs
 
-Press **Save a Bug Report (logs + settings)** at the bottom of the launcher. It saves a `wwe2k14-bug-report-<date>.zip`
-next to the launcher with the latest game logs, your launcher settings and basic PC information (graphics card,
-system); no game files or saves. Attach it to a new issue on this repository's **Issues** page and describe what
-happened. If the game crashed, its log ends with a crash report that shows exactly where.
+Click **Bug Reports** at the bottom of the launcher. The page lists your last 10 games and how each one ended
+(crashes in red). Click **Save Report** on the game that went wrong: it saves a `wwe2k14-bug-report-game-<date>.zip`
+next to the launcher with that game's log, the launcher's logs and settings and basic PC information (graphics card,
+system); no game files or saves. **Show Report** finds the file. Click **Report on GitHub**, describe what happened and
+drag the file into your message. If the game crashed, the launcher comes back by itself, saves that game's report (or says if it
+could not) and opens this page for you.
 
-If the game freezes, wait a few seconds and then use **Save a Bug Report** and send it: the game writes a
+If the game freezes, wait a few seconds, close it, and save the report for that game the same way: the game writes a
 `wwe2k14-freeze-<date>.txt` into its `logs` folder (and the report zip always includes it) that records every guest
 thread and what it was waiting on at the moment it stopped presenting.
 
