@@ -1,8 +1,24 @@
-# WWE 2K14 Recomp v1.5.0
+# WWE 2K14 Recomp v1.5.1
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
+
+## What's new in v1.5.1
+
+- **In-game settings menu (new):** press **F1** on the keyboard, or **Back + Start** together on a controller, during
+  the game. Change crowd, shadows, Lower CPU use, sync and stretch without going back to the launcher. Your choices are
+  saved for next time.
+- **Controller vibration switch (new):** a **Controller vibration** tick box on the **Controls** page. Untick it to turn
+  rumble off completely. (GitHub #102)
+- **Weapon wheel in more matches:** under the Hell in a Cell weapon wheel box on the **Mods** page, tick **Also in other
+  match types** to pull objects from under the ring in more exhibition matches. Off by default.
+- **Fixed: WWE '13 import could not find WWE 2K14 Add-On 2** when its folder had a different name. The launcher now
+  recognises it by its contents. (GitHub #103)
+- **Fixed: WWE '13 import stopped with "An LSD registry table has an invalid row count"** on some copies of WWE '13
+  add-on files. Those files are accepted now, and if a file really is damaged the message names it.
+- **Fixed:** the Creation Suite said a save was "unsupported" when a created superstar used certain WWE Superstars'
+  heads (for example Daniel Bryan's).
 
 ## What's new in v1.5.0
 
@@ -169,7 +185,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.5.0 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.5.1 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -200,8 +216,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.5.0.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.0.zip`.
+1. Download `WWE2K14-Recomp-v1.5.1.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.1.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or

@@ -1,5 +1,21 @@
 # Changelog
 
+## v1.5.1 - 2026-11-08
+
+- **In-game settings menu (new):** press **F1** on the keyboard, or **Back + Start** together on a controller, during
+  the game. Change crowd, shadows, Lower CPU use, sync and stretch without going back to the launcher. Your choices are
+  saved for next time.
+- **Controller vibration switch (new):** a **Controller vibration** tick box on the **Controls** page. Untick it to turn
+  rumble off completely. (GitHub #102)
+- **Weapon wheel in more matches:** under the Hell in a Cell weapon wheel box on the **Mods** page, tick **Also in other
+  match types** to pull objects from under the ring in more exhibition matches. Off by default.
+- **Fixed: WWE '13 import could not find WWE 2K14 Add-On 2** when its folder had a different name. The launcher now
+  recognises it by its contents. (GitHub #103)
+- **Fixed: WWE '13 import stopped with "An LSD registry table has an invalid row count"** on some copies of WWE '13
+  add-on files. Those files are accepted now, and if a file really is damaged the message names it.
+- **Fixed:** the Creation Suite said a save was "unsupported" when a created superstar used certain WWE Superstars'
+  heads (for example Daniel Bryan's).
+
 ## v1.5.0 - 2026-11-07
 
 - **Import from WWE '13 (new):** a button on the new **Mods** page brings wrestlers from your own WWE '13 into WWE 2K14:
