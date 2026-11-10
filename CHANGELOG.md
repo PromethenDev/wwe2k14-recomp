@@ -1,5 +1,11 @@
 # Changelog
 
+## v1.5.3 - 2026-11-10
+
+- **Fixed: WWE '13 import said "Importing needs WWE 2K14 Add-On 2" even with all DLC added** (GitHub #103, #111, #118,
+  #120). There are two versions of that add-on; the import now works with either one. If your add-ons have no room
+  for every wrestler you chose, the message now says how many do not fit.
+
 ## v1.5.2 - 2026-11-09
 
 - **Bug Reports page (new):** click **Bug Reports** at the bottom of the launcher. It lists your last 10 games and how
