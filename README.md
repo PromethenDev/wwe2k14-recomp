@@ -1,8 +1,18 @@
-# WWE 2K14 Recomp v1.5.3
+# WWE 2K14 Recomp v1.5.4
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
+
+## What's new in v1.5.4
+
+- **Fixed: crash in Hell in a Cell with the weapon wheel** (GitHub #122). With the weapon wheel switched on, the match
+  now gets more memory for the items it loads (taken from memory the game never uses), so it no longer runs out.
+- **Fixed: crash when picking wrestlers in Create-an-Entrance, stables, Create-a-Story and Universe** after importing
+  WWE '13 wrestlers (GitHub #128, #129, #130, #132).
+- **Fixed: crash with some WWE '13 titantrons.**
+- **Safety check for the 30 Years of WrestleMania crash in WrestleMania 23 Cena vs Michaels** (GitHub #125): when the
+  game finds damaged data while unpacking a file, it now skips it instead of crashing.
 
 ## What's new in v1.5.3
 
@@ -210,7 +220,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.5.3 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.5.4 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -241,8 +251,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.5.3.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.3.zip`.
+1. Download `WWE2K14-Recomp-v1.5.4.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.4.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or

@@ -1,5 +1,15 @@
 # Changelog
 
+## v1.5.4 - 2026-11-11
+
+- **Fixed: crash in Hell in a Cell with the weapon wheel** (GitHub #122). With the weapon wheel switched on, the match
+  now gets more memory for the items it loads (taken from memory the game never uses), so it no longer runs out.
+- **Fixed: crash when picking wrestlers in Create-an-Entrance, stables, Create-a-Story and Universe** after importing
+  WWE '13 wrestlers (GitHub #128, #129, #130, #132).
+- **Fixed: crash with some WWE '13 titantrons.**
+- **Safety check for the 30 Years of WrestleMania crash in WrestleMania 23 Cena vs Michaels** (GitHub #125): when the
+  game finds damaged data while unpacking a file, it now skips it instead of crashing.
+
 ## v1.5.3 - 2026-11-10
 
 - **Fixed: WWE '13 import said "Importing needs WWE 2K14 Add-On 2" even with all DLC added** (GitHub #103, #111, #118,
