@@ -12,6 +12,8 @@ Xbox 360 emulator.
   wrestlers already in WWE 2K14 their 2K15 look** to update 47 wrestlers the game already has (The Rock, Seth Rollins,
   Big Show and more) to their WWE 2K15 attires. **Undo WWE 2K15 import** on the Mods page puts the original files back.
   Play WWE 2K14 once and save before importing.
+- **WWE '13 import reads your disc image (new):** **Import from WWE '13** and **Import WWE '13 arenas** now also
+  find your WWE '13 (Xbox 360) disc image (.iso) and read it directly: no need to extract the disc.
 - **WWE '13 arenas (new):** in **Mods > Import from WWE '13**, click **Import WWE '13 arenas**. It brings over the
   WWE '13 arenas WWE 2K14 does not have (up to 25, including Capitol Punishment, Vengeance, WrestleMania XXVIII and the
   Attitude Era arenas), with lit crowds and entrances. In Select Arena they are at the end of the **WrestleMania** page
