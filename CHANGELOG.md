@@ -1,5 +1,28 @@
 # Changelog
 
+## v1.6.0 - 2026-11-13
+
+- **WWE 2K15 import (new):** in **Mods**, click **Import from WWE 2K15** and choose the folder with your own extracted
+  WWE 2K15 (Xbox 360) disc. Pick the wrestlers you want: they are added with their models, attires, entrances,
+  victories, move sets and menu pictures. For now they use a stand-in's entrance music and titantron. Tick **Also give
+  wrestlers already in WWE 2K14 their 2K15 look** to update 47 wrestlers the game already has (The Rock, Seth Rollins,
+  Big Show and more) to their WWE 2K15 attires. **Undo WWE 2K15 import** on the Mods page puts the original files back.
+  Play WWE 2K14 once and save before importing.
+- **WWE '13 arenas (new):** in **Mods > Import from WWE '13**, click **Import WWE '13 arenas**. It brings over the
+  WWE '13 arenas WWE 2K14 does not have (up to 25, including Capitol Punishment, Vengeance, WrestleMania XXVIII and the
+  Attitude Era arenas), with lit crowds and entrances. In Select Arena they are at the end of the **WrestleMania** page
+  (scroll down past WrestleMania 29). **Undo WWE '13 arenas** on the Mods page puts the original files back. Import the
+  wrestlers first: while the arenas are imported, wrestlers cannot be imported or undone.
+- **Borderless display (new, Windows):** **Settings > Display > Borderless** fills the screen like Fullscreen but never
+  changes your monitor's refresh rate, so switching windows on 144 Hz / 165 Hz monitors no longer flickers or goes
+  black (GitHub #116).
+- **Fixed: wrestlers froze when a weapon was set in a corner with the weapon wheel on** (Hell in a Cell, I Quit and
+  other matches; GitHub #110).
+- **Fixed: crash in the 30 Years of WrestleMania WrestleMania 23 Cena vs Michaels match** (GitHub #125): the game now
+  unpacks its files in a safer way.
+- **Fixed: crash when scrolling the wrestler lists in Create-an-Entrance, stables, Create-a-Story and Universe** after a
+  WWE '13 import, on wrestlers that have no Universe entry yet (GitHub #132).
+
 ## v1.5.4 - 2026-11-11
 
 - **Fixed: crash in Hell in a Cell with the weapon wheel** (GitHub #122). With the weapon wheel switched on, the match

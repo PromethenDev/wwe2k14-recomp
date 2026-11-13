@@ -1,8 +1,31 @@
-# WWE 2K14 Recomp v1.5.4
+# WWE 2K14 Recomp v1.6.0
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
+
+## What's new in v1.6.0
+
+- **WWE 2K15 import (new):** in **Mods**, click **Import from WWE 2K15** and choose the folder with your own extracted
+  WWE 2K15 (Xbox 360) disc. Pick the wrestlers you want: they are added with their models, attires, entrances,
+  victories, move sets and menu pictures. For now they use a stand-in's entrance music and titantron. Tick **Also give
+  wrestlers already in WWE 2K14 their 2K15 look** to update 47 wrestlers the game already has (The Rock, Seth Rollins,
+  Big Show and more) to their WWE 2K15 attires. **Undo WWE 2K15 import** on the Mods page puts the original files back.
+  Play WWE 2K14 once and save before importing.
+- **WWE '13 arenas (new):** in **Mods > Import from WWE '13**, click **Import WWE '13 arenas**. It brings over the
+  WWE '13 arenas WWE 2K14 does not have (up to 25, including Capitol Punishment, Vengeance, WrestleMania XXVIII and the
+  Attitude Era arenas), with lit crowds and entrances. In Select Arena they are at the end of the **WrestleMania** page
+  (scroll down past WrestleMania 29). **Undo WWE '13 arenas** on the Mods page puts the original files back. Import the
+  wrestlers first: while the arenas are imported, wrestlers cannot be imported or undone.
+- **Borderless display (new, Windows):** **Settings > Display > Borderless** fills the screen like Fullscreen but never
+  changes your monitor's refresh rate, so switching windows on 144 Hz / 165 Hz monitors no longer flickers or goes
+  black (GitHub #116).
+- **Fixed: wrestlers froze when a weapon was set in a corner with the weapon wheel on** (Hell in a Cell, I Quit and
+  other matches; GitHub #110).
+- **Fixed: crash in the 30 Years of WrestleMania WrestleMania 23 Cena vs Michaels match** (GitHub #125): the game now
+  unpacks its files in a safer way.
+- **Fixed: crash when scrolling the wrestler lists in Create-an-Entrance, stables, Create-a-Story and Universe** after a
+  WWE '13 import, on wrestlers that have no Universe entry yet (GitHub #132).
 
 ## What's new in v1.5.4
 
@@ -220,7 +243,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.5.4 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.6.0 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -251,8 +274,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.5.4.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.5.4.zip`.
+1. Download `WWE2K14-Recomp-v1.6.0.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.6.0.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or
