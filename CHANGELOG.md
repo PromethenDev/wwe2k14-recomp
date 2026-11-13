@@ -2,8 +2,8 @@
 
 ## v1.6.0 - 2026-11-13
 
-- **WWE 2K15 import (new):** in **Mods**, click **Import from WWE 2K15** and choose the folder with your own extracted
-  WWE 2K15 (Xbox 360) disc. Pick the wrestlers you want: they are added with their models, attires, entrances,
+- **WWE 2K15 import (new):** in **Mods**, click **Import from WWE 2K15**: the launcher searches this PC for your own extracted
+  WWE 2K15 (Xbox 360) disc (or choose its folder yourself). Pick the wrestlers you want: they are added with their models, attires, entrances,
   victories, move sets and menu pictures. For now they use a stand-in's entrance music and titantron. Tick **Also give
   wrestlers already in WWE 2K14 their 2K15 look** to update 47 wrestlers the game already has (The Rock, Seth Rollins,
   Big Show and more) to their WWE 2K15 attires. **Undo WWE 2K15 import** on the Mods page puts the original files back.
