@@ -3,25 +3,29 @@
 ## v1.6.0 - 2026-11-13
 
 - **WWE 2K15 import (new):** in **Mods**, click **Import from WWE 2K15**: the launcher searches this PC for your own WWE 2K15 (Xbox 360) disc image
-  (.iso) or extracted disc (or choose its folder yourself); no need to extract the disc. Pick the wrestlers you want: they are added with their models, attires, entrances,
+  (.iso) or extracted disc (or press **Choose a disc image** / **Choose a folder** yourself); no need to extract the disc. Pick the wrestlers you want: they are added with their models, attires, entrances,
   victories, move sets and menu pictures. For now they use a stand-in's entrance music and titantron. Tick **Also give
   wrestlers already in WWE 2K14 their 2K15 look** to update 47 wrestlers the game already has (The Rock, Seth Rollins,
   Big Show and more) to their WWE 2K15 attires. **Undo WWE 2K15 import** on the Mods page puts the original files back.
-  Play WWE 2K14 once and save before importing.
+  Play WWE 2K14 once and save before importing. If one wrestler cannot be built (for example because a mod changed the
+  WWE 2K14 entrance file his entrance starts from), he is left out, the others are imported, and the launcher says why.
 - **WWE '13 import reads your disc image (new):** **Import from WWE '13** and **Import WWE '13 arenas** now also
-  find your WWE '13 (Xbox 360) disc image (.iso) and read it directly: no need to extract the disc.
-- **WWE '13 arenas (new):** in **Mods > Import from WWE '13**, click **Import WWE '13 arenas**. It brings over the
+  find your WWE '13 (Xbox 360) disc image (.iso) and read it directly: no need to extract the disc. You can also pick
+  the .iso yourself with **Choose a disc image**.
+- **WWE '13 arenas (new, experimental):** in **Mods > Import from WWE '13**, click **Import WWE '13 arenas**. It brings over the
   WWE '13 arenas WWE 2K14 does not have (up to 25, including Capitol Punishment, Vengeance, WrestleMania XXVIII and the
   Attitude Era arenas), with lit crowds and entrances. In Select Arena they are at the end of the **WrestleMania** page
   (scroll down past WrestleMania 29). **Undo WWE '13 arenas** on the Mods page puts the original files back. Import the
-  wrestlers first: while the arenas are imported, wrestlers cannot be imported or undone.
+  wrestlers first: while the arenas are imported, wrestlers cannot be imported or undone. You choose which arenas to
+  bring over. **Known issues (experimental):** the arena's big screen stays blank during entrances (no titantron), and
+  wrestlers can walk through the entrance ramp instead of on top of it. Both are being worked on.
 - **Borderless display (new, Windows):** **Settings > Display > Borderless** fills the screen like Fullscreen but never
   changes your monitor's refresh rate, so switching windows on 144 Hz / 165 Hz monitors no longer flickers or goes
   black (GitHub #116).
 - **Fixed: wrestlers froze when a weapon was set in a corner with the weapon wheel on** (Hell in a Cell, I Quit and
   other matches; GitHub #110).
-- **Fixed: crash in the 30 Years of WrestleMania WrestleMania 23 Cena vs Michaels match** (GitHub #125): the game now
-  unpacks its files in a safer way.
+- **Safer file unpacking** (GitHub #125): the game unpacks its files in a safer way. A later out-of-memory crash in the
+  30 Years of WrestleMania WrestleMania 23 Cena vs Michaels match is still being looked into.
 - **Fixed: crash when scrolling the wrestler lists in Create-an-Entrance, stables, Create-a-Story and Universe** after a
   WWE '13 import, on wrestlers that have no Universe entry yet (GitHub #132).
 
