@@ -1,5 +1,6 @@
 #pragma once
 
+#include <array>
 #include <cstdint>
 #include <filesystem>
 #include <fstream>
@@ -60,6 +61,18 @@ class StfsReader {
   std::vector<StfsEntry> entries_;
 };
 
+// Writes a minimal single-file Xbox 360 saved-game package (STFS type "CON ", content type 1) holding one root
+// file. Layout matches what StfsReader opens: header 0xB000 bytes, read/write-format hash tables (2 blocks each) at
+// every level the size needs (up to three), file-table block 0, file data from block 1 chained to the end marker.
+// Block hashes and the top hash are real SHA-1 values; the console signature is NOT valid (the package is unsigned),
+// so a real Xbox 360 would not accept it. No size limit beyond the 32-bit file size field (4 GB).
+bool WriteStfsSaveGamePackage(const std::filesystem::path& package_path, const std::string& display_name_ascii,
+                              uint32_t title_id, const std::string& file_name,
+                              const std::vector<uint8_t>& file_bytes, std::string* error);
+// SHA-1 (used for STFS block hashes); exposed for tests.
+std::array<uint8_t, 20> Sha1(const uint8_t* data, size_t size);
+
 bool DecodeWwe2k14TitleId(const std::filesystem::path& executable, uint32_t* title_id);
+bool DecodeXexTitleId(const std::filesystem::path& executable, uint32_t* title_id);
 
 }  // namespace wwe2k14::launcher::internal

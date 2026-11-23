@@ -1,7 +1,7 @@
 From 59737a709ffb31691c07bed0b33f4a81e9b26cbb Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 16:24:48 -0700
-Subject: [PATCH 37/97] graphics(vulkan): seek storage streams to EOF before
+Subject: [PATCH 037/149] graphics(vulkan): seek storage streams to EOF before
  appending
 
 C requires a positioning call between input and output on an update
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 7 insertions(+)
 
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index e894a08..92eb966 100644
+index e894a089..92eb9663 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
 @@ -706,6 +706,13 @@ void VulkanPipelineCache::InitializeShaderStorage(const std::filesystem::path& c

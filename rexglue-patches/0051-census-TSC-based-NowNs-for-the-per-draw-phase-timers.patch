@@ -1,8 +1,8 @@
 From 198c76acefa44ef1749d11e494b993f222973e05 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:47:01 -0700
-Subject: [PATCH 51/97] census: TSC-based NowNs for the per-draw phase timers;
- display pacing samples mid-period
+Subject: [PATCH 051/149] census: TSC-based NowNs for the per-draw phase
+ timers; display pacing samples mid-period
 
 - NowNs (two calls per draw with the census on, as in every laptop launcher) read steady_clock =
   QueryPerformanceCounter on Windows. Now the time stamp counter scaled by a ratio calibrated once (20 ms at
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 49 insertions(+), 1 deletion(-)
 
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index c20e43a..09e1334 100644
+index c20e43a4..09e13346 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -8,6 +8,11 @@
@@ -96,7 +96,7 @@ index c20e43a..09e1334 100644
  void CpPhaseEnter(CpPhase phase, uint64_t now_ns) { g_rate_census.CpPhaseEnter(phase, now_ns); }
  
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 20c9dd3..7dfa05d 100644
+index 20c9dd30..7dfa05dc 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -423,6 +423,10 @@ void GraphicsSystem::DisplayPacingThread() {

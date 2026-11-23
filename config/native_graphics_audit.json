@@ -1,0 +1,187 @@
+{
+  "schema_version": 1,
+  "title": "WWE 2K14 native graphics hook static audit",
+  "scope": "STATIC ONLY; no runtime use, correctness, or acceptance claim",
+  "reference_files": {
+    "generated/wwe2k14_recomp.85.cpp": "85dd6b9468a166675f7af2f57121332691858c1e3835d6a027ee190cd7239439",
+    "config/functions.toml": "e5c79f29911fcb4964cec2f18b1f9d46235288ef5245d9cb9d37b8afd1ea47fc",
+    "game/default.xex": "544ef8b505aebcece3459865a4e27e1a7cfad568406514f27e1115b378d3a8fb",
+    "game/default.xexp": "3ab6cd4cb5f353077847da6165848d01f7684f48e6bc5767e6aad73ec622c361"
+  },
+  "analysis_image": {
+    "sha256": "090be64661622010a301081cc2fb1100d5fa9a2880237c86c63e8b1899c54c10",
+    "flat_image_base_va": "0x82000000",
+    "text_start_va": "0x82250000",
+    "text_size": "0x134B764",
+    "site_checks_are_partial": true
+  },
+  "strong_override_addresses": [
+    "0x82CB6318",
+    "0x82CB9048",
+    "0x82CB5840",
+    "0x82CB9310",
+    "0x82CFD800"
+  ],
+  "hooks": [
+    {
+      "label": "VS float constant update candidate",
+      "entry": "0x82CB3F48",
+      "portmap_from": "0x82B98178",
+      "portmap_method": "ngram-entry-window",
+      "portmap_confidence": "medium",
+      "static_status": "body and dataflow verified; API label is a candidate",
+      "runtime_status": "unverified",
+      "body_sha256": "a6ea02b4c82b5a8154ebe6c55b4b0f30dd3fa54af76fdf904bc6564a4ce5e5e4",
+      "instruction_comments": [
+        "addi r10,r4,120",
+        "ld r11,0(r3)",
+        "std r11,0(r3)"
+      ],
+      "raw_image_checks": [
+        {"va": "0x82CB3F48", "bytes_be": "39440078", "instruction": "addi r10,r4,120"}
+      ],
+      "dataflow": "Copies r6 16-byte vectors from r5 to device+16*(r4+120), then ORs r7 into device+0.",
+      "unknowns": ["runtime call count/order", "actual constant contents at a draw"]
+    },
+    {
+      "label": "PS float constant update candidate",
+      "entry": "0x82CB4020",
+      "portmap_from": "0x82B98250",
+      "portmap_method": "ngram-entry-window",
+      "portmap_confidence": "medium",
+      "static_status": "body and dataflow verified; API label is a candidate",
+      "runtime_status": "unverified",
+      "body_sha256": "cde0c7135034487767a073022eeead6c32ba4d78eb39d1b9e4823a40528eb89a",
+      "instruction_comments": [
+        "addi r10,r4,376",
+        "ld r11,8(r3)",
+        "std r11,8(r3)"
+      ],
+      "raw_image_checks": [
+        {"va": "0x82CB4020", "bytes_be": "39440178", "instruction": "addi r10,r4,376"}
+      ],
+      "dataflow": "Copies r6 16-byte vectors from r5 to device+16*(r4+376), then ORs r7 into device+8.",
+      "unknowns": ["runtime call count/order", "actual constant contents at a draw"]
+    },
+    {
+      "label": "PS shader bind candidate",
+      "entry": "0x82CB42A0",
+      "portmap_from": "0x82B984D0",
+      "portmap_method": "whole-shape-unique",
+      "portmap_confidence": "high",
+      "static_status": "bind dataflow verified; record semantics remain candidates",
+      "runtime_status": "unverified",
+      "body_sha256": "5e37228eaeb7fd98270f5f724749662618880d28956d0f4043c264cc2b14e981",
+      "instruction_comments": [
+        "lwz r31,13068(r3)",
+        "stw r29,13068(r30)",
+        "oris r11,r11,16"
+      ],
+      "raw_image_checks": [],
+      "dataflow": "Stores incoming r4 at device+13068 and updates other dirty/state fields; conditional record reads and helper calls occur.",
+      "unknowns": ["record field meanings", "runtime shader identities and variants", "call ordering"]
+    },
+    {
+      "label": "VS shader bind candidate",
+      "entry": "0x82CB44A8",
+      "portmap_from": "0x82B986D8",
+      "portmap_method": "whole-shape-unique",
+      "portmap_confidence": "high",
+      "static_status": "bind dataflow verified; record semantics remain candidates",
+      "runtime_status": "unverified",
+      "body_sha256": "163f895fca501a49c886bf4907378725caee9b94104c5715621ad6f1d47fb485",
+      "instruction_comments": [
+        "stw r29,13072(r30)",
+        "addic. r11,r29,872",
+        "std r10,0(r30)"
+      ],
+      "raw_image_checks": [],
+      "dataflow": "Stores incoming r4 at device+13072 and updates dirty/state fields; conditionally reads the supplied record and calls helpers.",
+      "unknowns": ["record field meanings", "runtime shader identities and variants", "call ordering"]
+    },
+    {
+      "label": "stream/buffer pointer setter candidate",
+      "entry": "0x82CB46C0",
+      "portmap_from": "0x82B988F0",
+      "portmap_method": "ngram-entry-window",
+      "portmap_confidence": "medium",
+      "static_status": "complete small body verified; SetStreamSource label remains a candidate",
+      "runtime_status": "unverified",
+      "body_sha256": "e20e68c98c09b0676efd98bb7c92c406f1b49e86e73362c8dbcaa602f1ccf90c",
+      "instruction_comments": [
+        "stw r4,12240(r3)",
+        "ld r11,16(r3)",
+        "oris r11,r11,8",
+        "std r11,16(r3)",
+        "blr"
+      ],
+      "raw_image_checks": [
+        {"va": "0x82CB46C0", "bytes_be": "90832fd0", "instruction": "stw r4,12240(r3)"},
+        {"va": "0x82CB46C4", "bytes_be": "e9630010", "instruction": "ld r11,16(r3)"},
+        {"va": "0x82CB46C8", "bytes_be": "656b0008", "instruction": "oris r11,r11,8"},
+        {"va": "0x82CB46CC", "bytes_be": "f9630010", "instruction": "std r11,16(r3)"},
+        {"va": "0x82CB46D0", "bytes_be": "4e800020", "instruction": "blr"}
+      ],
+      "dataflow": "Stores r4 at device+12240 and ORs a bit into device+16; has no stride argument.",
+      "unknowns": ["stream slot/offset", "bound declaration", "stride owner", "runtime use"]
+    },
+    {
+      "label": "index/buffer setup candidate",
+      "entry": "0x82CB4DB0",
+      "portmap_from": "0x82B98FE0",
+      "portmap_method": "whole-shape-unique",
+      "portmap_confidence": "high",
+      "static_status": "buffer setup verified; SetIndices label remains a candidate",
+      "runtime_status": "unverified",
+      "body_sha256": "e31fd5d2969d0189828a6b0b145363834c8dc72ecd7ce361e170f6d9db185fb4",
+      "instruction_comments": [
+        "stw r4,12808(r3)",
+        "addi r4,r3,12568",
+        "bl 0x82cb36b0",
+        "stw r4,12240(r31)"
+      ],
+      "raw_image_checks": [],
+      "dataflow": "Stores input at device+12808; helper 0x82CB36B0 receives the input and device+12568, then returned r4 is stored at device+12240.",
+      "unknowns": ["helper result layout", "whether +12240 is index or vertex state", "runtime use/order"]
+    },
+    {
+      "label": "non-indexed draw packet emitter candidate",
+      "entry": "0x82CB4E10",
+      "portmap_from": "0x82B99040",
+      "portmap_method": "whole-shape-unique",
+      "portmap_confidence": "high",
+      "static_status": "packet-ring construction verified; API label remains a candidate",
+      "runtime_status": "unverified",
+      "body_sha256": "8f1921b11bbe4760483d4e944c5c4a93b65728c0c8619b07d2d54a6d2ed67335",
+      "instruction_comments": [
+        "mr r23,r4",
+        "mr r24,r5",
+        "stw r30,48(r31)"
+      ],
+      "raw_image_checks": [],
+      "dataflow": "Consumes incoming r4-r6, writes command words to a device-owned ring, and updates device+48.",
+      "unknowns": ["full argument semantics", "runtime use/order", "whether indirect work bypasses this entry"]
+    },
+    {
+      "label": "indexed draw packet emitter candidate",
+      "entry": "0x82CB52D0",
+      "portmap_from": "0x82B99500",
+      "portmap_method": "whole-shape-unique",
+      "portmap_confidence": "high",
+      "static_status": "packet-ring construction verified; API label remains a candidate",
+      "runtime_status": "unverified",
+      "body_sha256": "e2e3c3b26484cabc1d69ddca983408a99cca670f4abd280babd054d452f0f86c",
+      "instruction_comments": [
+        "mr r18,r4",
+        "mr r17,r5",
+        "mr r21,r6",
+        "mr r19,r7",
+        "lwz r24,12812(r31)",
+        "stw r11,48(r31)"
+      ],
+      "raw_image_checks": [],
+      "dataflow": "Saves incoming r4-r7, reads device+12812, writes command words to a device-owned ring, and updates device+48.",
+      "unknowns": ["full argument and +12812 meanings", "runtime use/order", "whether indirect work bypasses this entry"]
+    }
+  ]
+}

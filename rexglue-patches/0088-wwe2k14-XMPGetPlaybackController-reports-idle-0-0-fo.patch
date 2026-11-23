@@ -1,7 +1,7 @@
 From 8a370e6b410c38fe79930ca67642f3238a58e7bd Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 3 Oct 2026 00:53:46 -0700
-Subject: [PATCH 88/97] wwe2k14: XMPGetPlaybackController reports idle (0,0)
+Subject: [PATCH 088/149] wwe2k14: XMPGetPlaybackController reports idle (0,0)
  for title 545408B2 until the title's first explicit setter (2K14 mutes its
  music otherwise); WWE 13 path unchanged
 
@@ -12,7 +12,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 35 insertions(+), 14 deletions(-)
 
 diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
-index 921ae8d..f9577d4 100644
+index 921ae8d8..f9577d40 100644
 --- a/include/rex/kernel/xam/apps/xmp_app.h
 +++ b/include/rex/kernel/xam/apps/xmp_app.h
 @@ -127,6 +127,7 @@ class XmpApp : public system::xam::App {
@@ -24,7 +24,7 @@ index 921ae8d..f9577d4 100644
    RepeatMode repeat_mode_;
    uint32_t unknown_flags_;
 diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
-index a276d42..3f08142 100644
+index a276d42f..3f081425 100644
 --- a/src/kernel/xam/apps/xmp_app.cpp
 +++ b/src/kernel/xam/apps/xmp_app.cpp
 @@ -42,6 +42,8 @@ using namespace rex::system;

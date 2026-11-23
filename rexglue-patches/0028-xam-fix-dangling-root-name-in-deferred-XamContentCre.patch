@@ -1,7 +1,7 @@
 From 7414087ae227e9a99bdf9004acfb669eaf2b54ef Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 02:00:29 -0700
-Subject: [PATCH 28/97] xam: fix dangling root name in deferred
+Subject: [PATCH 028/149] xam: fix dangling root name in deferred
  XamContentCreate; log content API calls
 
 The deferred XamContentCreate lambda captured root_name.value() - a string_view
@@ -14,7 +14,7 @@ calls and stub exports are logged at info level (no behaviour change).
 
 WWE '13 title update + DLC Packs 2/3: both packs mount as dlc0:/dlc1: with the
 installed license, catalogs and DLC_02/03.pck open; 900 s run 0 captures, in-ring
-criterion met.
+criterion met. Builder gpt-6-luna (TU-3b/TU-6); Reviewer gpt-6-luna ACCEPT.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 126 insertions(+), 64 deletions(-)
 
 diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
-index c68952d..4289c96 100644
+index c68952d5..4289c962 100644
 --- a/src/kernel/xam/xam_content.cpp
 +++ b/src/kernel/xam/xam_content.cpp
 @@ -21,6 +21,8 @@
@@ -280,7 +280,7 @@ index c68952d..4289c96 100644
 +
 +#undef XAM_CONTENT_EXPORT_STUB
 diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
-index a4b8fe3..17a384b 100644
+index a4b8fe31..17a384b6 100644
 --- a/src/kernel/xam/xam_ui.cpp
 +++ b/src/kernel/xam/xam_ui.cpp
 @@ -30,6 +30,9 @@ REXCVAR_DEFINE_BOOL(headless, false, "Kernel",

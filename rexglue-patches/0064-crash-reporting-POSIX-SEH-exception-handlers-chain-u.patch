@@ -1,7 +1,7 @@
 From db4553c88fea937e9315e526cd4ffe17474a8758 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 18:56:04 -0700
-Subject: [PATCH 64/97] crash reporting: POSIX SEH/exception handlers chain
+Subject: [PATCH 064/149] crash reporting: POSIX SEH/exception handlers chain
  unhandled faults to the previously installed handler (game crash note was
  buried); Windows flushes logging on exit; selected-GPU log line carries
  driver version
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 117 insertions(+), 13 deletions(-)
 
 diff --git a/src/core/exception_handler_posix.cpp b/src/core/exception_handler_posix.cpp
-index 8aced51..d254dd4 100644
+index 8aced51f..d254dd4e 100644
 --- a/src/core/exception_handler_posix.cpp
 +++ b/src/core/exception_handler_posix.cpp
 @@ -14,6 +14,7 @@
@@ -73,7 +73,7 @@ index 8aced51..d254dd4 100644
  
  void ExceptionHandler::Install(Handler fn, void* data) {
 diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
-index ea3ddcc..6971ec7 100644
+index ea3ddcc7..6971ec76 100644
 --- a/src/core/seh_posix.cpp
 +++ b/src/core/seh_posix.cpp
 @@ -12,7 +12,10 @@
@@ -192,7 +192,7 @@ index ea3ddcc..6971ec7 100644
  
  bool& seh_active() {
 diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
-index 423e100..27df325 100644
+index 423e100f..27df325a 100644
 --- a/src/ui/vulkan/vulkan_provider.cpp
 +++ b/src/ui/vulkan/vulkan_provider.cpp
 @@ -256,10 +256,12 @@ std::unique_ptr<VulkanProvider> VulkanProvider::Create(const bool with_gpu_emula
@@ -211,7 +211,7 @@ index 423e100..27df325 100644
    if (with_presentation) {
      provider->ui_samplers_ = UISamplers::Create(provider->vulkan_device_.get());
 diff --git a/src/ui/windowed_app_main_win.cpp b/src/ui/windowed_app_main_win.cpp
-index 3f223c4..1005821 100644
+index 3f223c46..1005821b 100644
 --- a/src/ui/windowed_app_main_win.cpp
 +++ b/src/ui/windowed_app_main_win.cpp
 @@ -114,8 +114,12 @@ int WINAPI wWinMain(HINSTANCE hinstance, HINSTANCE hinstance_prev, LPWSTR comman

@@ -1,7 +1,7 @@
 From dd5647f09642d126b4fa7135917c40763cf9a6b8 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 15:32:40 -0700
-Subject: [PATCH 55/97] xam ui: draw system dialogs (keyboard input, message
+Subject: [PATCH 055/149] xam ui: draw system dialogs (keyboard input, message
  box) in a neutral game-like style
 
 Owner 2026-09-27: the default ImGui look of the XShowKeyboardUI prompt (clip naming in Highlight Reel) looked like
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 70 insertions(+), 11 deletions(-)
 
 diff --git a/src/kernel/xam/xam_ui.cpp b/src/kernel/xam/xam_ui.cpp
-index 17a384b..264e9e0 100644
+index 17a384b6..264e9e09 100644
 --- a/src/kernel/xam/xam_ui.cpp
 +++ b/src/kernel/xam/xam_ui.cpp
 @@ -67,6 +67,50 @@ class XamDialog : public rex::ui::ImGuiDialog {

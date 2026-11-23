@@ -1,0 +1,66 @@
+From c369deba32fa509577349e01ff52449da9fec21f Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 7 Nov 2026 06:30:13 -0800
+Subject: [PATCH 140/149] Revert "Freeze logger: report folder as a path, so a
+ folder name outside the code page no longer stops the game at start (owner OK
+ 2026-11-07)"
+
+This reverts commit 1b30112924dfb1ba6a93d5265672a69f159ca324.
+---
+ src/core/freeze_logger.cpp | 23 +++++++++--------------
+ 1 file changed, 9 insertions(+), 14 deletions(-)
+
+diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
+index e38b546d..42e7a464 100644
+--- a/src/core/freeze_logger.cpp
++++ b/src/core/freeze_logger.cpp
+@@ -564,14 +564,14 @@ int ActiveThreadCount() {
+   return std::popcount(g_used_mask.load(std::memory_order_relaxed));
+ }
+ 
+-// A path, not a string: path::string() throws on Windows for a folder name outside the code page, which stopped the game at start.
+-std::filesystem::path ReportDir() {
++std::string ReportDir() {
+   const std::string log_file = REXCVAR_GET(log_file);
+   if (!log_file.empty()) {
+-    std::filesystem::path parent = std::filesystem::u8path(log_file).parent_path();
+-    if (!parent.empty()) return parent;
++    std::filesystem::path parent = std::filesystem::path(log_file).parent_path();
++    if (!parent.empty()) return parent.string();
+   }
+-  return rex::filesystem::GetExecutableFolder();
++  std::error_code error;
++  return rex::filesystem::GetExecutableFolder().string();
+ }
+ 
+ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+@@ -609,14 +609,9 @@ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+ #endif
+   std::strftime(stamp, sizeof(stamp), "%Y%m%d-%H%M%S", &local);
+ 
+-  const std::filesystem::path dir = ReportDir();
+-  const std::filesystem::path report = dir / (std::string("wwe2k14-freeze-") + stamp + ".txt");
+-  const std::string path = rex::path_to_utf8(report);
+-#ifdef _WIN32
+-  FILE* file = _wfopen(report.c_str(), L"wb");
+-#else
+-  FILE* file = std::fopen(report.c_str(), "wb");
+-#endif
++  const std::string dir = ReportDir();
++  const std::string path = dir + "/wwe2k14-freeze-" + stamp + ".txt";
++  FILE* file = std::fopen(path.c_str(), "wb");
+   if (!file) {
+     REXLOG_WARN("[freeze-logger] freeze detected but cannot write {}", path);
+     return;
+@@ -1112,7 +1107,7 @@ void Start() {
+   g_watchdog = std::thread(Watchdog);
+   std::atexit([] { Stop(); });
+   REXLOG_INFO("[freeze-logger] enabled: present-gap={} s report_dir={}", kFreezeGapSeconds,
+-              rex::path_to_utf8(ReportDir()));
++              ReportDir());
+   if (const char* bench = std::getenv("REX_FREEZE_LOG_BENCH"); bench && std::strcmp(bench, "1") == 0) {
+     constexpr int kIterations = 1000000;
+     const uint64_t begin = NowNs();
+-- 
+2.43.0
+

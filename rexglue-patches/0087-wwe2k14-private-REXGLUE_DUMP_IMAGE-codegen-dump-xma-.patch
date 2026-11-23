@@ -1,7 +1,7 @@
 From 520720f3d141a9237ccb4d312cd3d6161e28ca7c Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 19:52:39 -0700
-Subject: [PATCH 87/97] wwe2k14 private: REXGLUE_DUMP_IMAGE codegen dump +
+Subject: [PATCH 087/149] wwe2k14 private: REXGLUE_DUMP_IMAGE codegen dump +
  [xma-stats] diagnostic
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -11,7 +11,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 62 insertions(+)
 
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index eafb410..7214d26 100644
+index eafb4105..7214d26d 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -9,6 +9,8 @@
@@ -87,7 +87,7 @@ index eafb410..7214d26 100644
      if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
        break;
 diff --git a/src/codegen/codegen_context.cpp b/src/codegen/codegen_context.cpp
-index f588434..5495ab8 100644
+index f588434a..5495ab81 100644
 --- a/src/codegen/codegen_context.cpp
 +++ b/src/codegen/codegen_context.cpp
 @@ -21,6 +21,12 @@

@@ -1,8 +1,8 @@
 From 3d9bf9ca961ba700f77fdbdbbbb0f496de3cd46a Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 07:04:39 -0700
-Subject: [PATCH 16/97] diagnostics: env-gated per-second rate census (vblank,
- irq, VdSwap, present, guest clock)
+Subject: [PATCH 016/149] diagnostics: env-gated per-second rate census
+ (vblank, irq, VdSwap, present, guest clock)
 
 WWE13_RATE_CENSUS=1 logs one [rate-census] line per wall second. Off by
 default; when on, only atomic increments at the counted sites.
@@ -22,7 +22,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
 new file mode 100644
-index 0000000..f8c9ec9
+index 00000000..f8c9ec97
 --- /dev/null
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -0,0 +1,25 @@
@@ -52,7 +52,7 @@ index 0000000..f8c9ec9
 +
 +}  // namespace rex::diagnostics::rate_census
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index 0d6ed35..c30c5e7 100644
+index 0d6ed35b..c30c5e7c 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
 @@ -14,6 +14,7 @@ add_library(rexcore STATIC
@@ -65,7 +65,7 @@ index 0d6ed35..c30c5e7 100644
      string.cpp
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
 new file mode 100644
-index 0000000..4122a13
+index 00000000..4122a132
 --- /dev/null
 +++ b/src/core/rate_census.cpp
 @@ -0,0 +1,201 @@
@@ -271,7 +271,7 @@ index 0000000..4122a13
 +
 +}  // namespace rex::diagnostics::rate_census
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index efed1b7..5636275 100644
+index efed1b78..56362754 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -18,6 +18,7 @@
@@ -291,7 +291,7 @@ index efed1b7..5636275 100644
    vertex_buffers_in_sync_[1] = 0;
  
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 3706e38..c842957 100644
+index 3706e38e..c8429576 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -22,6 +22,7 @@
@@ -342,7 +342,7 @@ index 3706e38..c842957 100644
    // SCOPE_profile_cpu_f("gpu");
  
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 65488ef..eb188b7 100644
+index 65488ef8..eb188b7b 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -27,6 +27,7 @@
@@ -362,7 +362,7 @@ index 65488ef..eb188b7 100644
    vertex_buffers_in_sync_[1] = 0;
  
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
-index 39f9b82..53f2b8e 100644
+index 39f9b82b..53f2b8e6 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 @@ -16,6 +16,7 @@

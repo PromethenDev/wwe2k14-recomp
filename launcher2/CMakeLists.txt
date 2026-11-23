@@ -31,7 +31,7 @@ set(SDL_UNINSTALL OFF CACHE BOOL "Do not add SDL uninstall target" FORCE)
 set(SDL_TESTS OFF CACHE BOOL "Do not build SDL tests" FORCE)
 set(SDL_TEST_LIBRARY OFF CACHE BOOL "Do not build SDL test helpers" FORCE)
 set(SDL_EXAMPLES OFF CACHE BOOL "Do not build SDL examples" FORCE)
-set(SDL_AUDIO OFF CACHE BOOL "Launcher does not use SDL audio" FORCE)
+set(SDL_AUDIO ON CACHE BOOL "Launcher plays music previews (Creation Suite > Music)" FORCE)
 set(SDL_VIDEO ON CACHE BOOL "Launcher needs SDL video" FORCE)
 set(SDL_RENDER ON CACHE BOOL "Launcher uses SDL_Renderer" FORCE)
 set(SDL_DIALOG ON CACHE BOOL "Launcher uses native file dialogs" FORCE)
@@ -101,12 +101,41 @@ add_custom_command(OUTPUT "${WWE2K14_EMBEDDED_FONTS}"
   DEPENDS wwe2k14_font_compressor "${CMAKE_CURRENT_LIST_DIR}/ui/generate_fonts.py" ${WWE2K14_FONT_FILES}
   VERBATIM)
 
+# Home-screen tile icons (design B), embedded like the fonts so no image files ship next to the launcher.
+set(WWE2K14_EMBEDDED_IMAGES "${CMAKE_CURRENT_BINARY_DIR}/launcher_embedded_images.h")
+file(GLOB WWE2K14_TILE_IMAGES CONFIGURE_DEPENDS "${CMAKE_CURRENT_LIST_DIR}/ui/images/tile_*.png")
+add_custom_command(OUTPUT "${WWE2K14_EMBEDDED_IMAGES}"
+  COMMAND "${Python3_EXECUTABLE}" "${CMAKE_CURRENT_LIST_DIR}/ui/generate_images.py"
+    "${CMAKE_CURRENT_LIST_DIR}/ui/images" "${WWE2K14_EMBEDDED_IMAGES}"
+  DEPENDS "${CMAKE_CURRENT_LIST_DIR}/ui/generate_images.py" ${WWE2K14_TILE_IMAGES}
+  VERBATIM)
+
 # The launcher shows this version and the auto-updater compares it with the newest GitHub release.
 include("${CMAKE_CURRENT_LIST_DIR}/../cmake/wwe2k14_version.cmake")
 configure_file("${CMAKE_CURRENT_LIST_DIR}/launcher_version.h.in"
   "${CMAKE_CURRENT_BINARY_DIR}/version/launcher_version.h" @ONLY)
 include_directories("${CMAKE_CURRENT_BINARY_DIR}/version")
 
+# The import recipes are numeric and textual choices only; keep them beside the launcher as
+# replaceable data instead of embedding the list in the executable.
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/data")
+configure_file("${CMAKE_CURRENT_LIST_DIR}/data/wwe13-ports.tsv"
+  "${CMAKE_CURRENT_BINARY_DIR}/data/wwe13-ports.tsv" COPYONLY)
+foreach(_wwe15_data wwe2k15-ports.tsv wwe2k15-moves.tsv)
+  configure_file("${CMAKE_CURRENT_LIST_DIR}/data/${_wwe15_data}"
+    "${CMAKE_CURRENT_BINARY_DIR}/data/${_wwe15_data}" COPYONLY)
+endforeach()
+file(MAKE_DIRECTORY "${CMAKE_CURRENT_BINARY_DIR}/licenses")
+configure_file("${CMAKE_CURRENT_LIST_DIR}/licenses/libmspack-COPYING.LIB"
+  "${CMAKE_CURRENT_BINARY_DIR}/licenses/libmspack-COPYING.LIB" COPYONLY)
+configure_file("${CMAKE_CURRENT_LIST_DIR}/licenses/libmspack-source.txt"
+  "${CMAKE_CURRENT_BINARY_DIR}/licenses/libmspack-source.txt" COPYONLY)
+
+# Owner 2026-10-26: public release builds contain no test tools (glitch capture key / RenderDoc setting).
+option(WWE2K14_LAUNCHER_TEST_TOOLS "Build the test-build-only tools (glitch capture setting)" ON)
+if(NOT WWE2K14_LAUNCHER_TEST_TOOLS)
+  add_compile_definitions(WWE2K14_LAUNCHER_NO_TEST_TOOLS=1)
+endif()
 if(EXISTS "${CMAKE_CURRENT_LIST_DIR}/core/CMakeLists.txt")
   add_subdirectory(core)
 endif()
@@ -127,12 +156,16 @@ if(NOT WWE2K14_LAUNCHER_STUB_CORE AND NOT TARGET wwe2k14_launcher_core)
   message(FATAL_ERROR "The real launcher core is unavailable; configure with -DWWE2K14_LAUNCHER_STUB_CORE=ON for UI testing")
 endif()
 
-add_executable(wwe2k14-launcher WIN32 ui/main.cpp ui/native_keys.cpp "${WWE2K14_EMBEDDED_FONTS}")
+add_executable(wwe2k14-launcher WIN32 ui/main.cpp ui/native_keys.cpp "${WWE2K14_EMBEDDED_FONTS}"
+               "${WWE2K14_EMBEDDED_IMAGES}")
 add_dependencies(wwe2k14-launcher wwe2k14_font_compressor)
 target_include_directories(wwe2k14-launcher PRIVATE
   "${CMAKE_CURRENT_LIST_DIR}/core" "${CMAKE_CURRENT_LIST_DIR}/ui"
   "${CMAKE_CURRENT_BINARY_DIR}")
 target_link_libraries(wwe2k14-launcher PRIVATE wwe2k14_launcher_imgui)
+if(UNIX AND NOT APPLE)
+  set_target_properties(wwe2k14-launcher PROPERTIES BUILD_RPATH "$ORIGIN" INSTALL_RPATH "$ORIGIN")
+endif()
 if(WWE2K14_LAUNCHER_STUB_CORE)
   target_sources(wwe2k14-launcher PRIVATE ui/dev_stub_core.cpp)
   target_compile_definitions(wwe2k14-launcher PRIVATE WWE2K14_LAUNCHER_STUB_CORE=1)
@@ -141,6 +174,13 @@ else()
 endif()
 if(WIN32)
   target_link_libraries(wwe2k14-launcher PRIVATE shell32 ole32 user32)
+  # Exe icon (owner 2026-10-24, GitHub #37): same game-art .ico as the game exe, added only when present.
+  set(WWE2K14_ICON "${CMAKE_CURRENT_LIST_DIR}/../../icon/wwe2k14.ico" CACHE FILEPATH "Windows exe icon (.ico)")
+  if(EXISTS "${WWE2K14_ICON}")
+    enable_language(RC)
+    file(WRITE "${CMAKE_CURRENT_BINARY_DIR}/launcher_icon.rc" "1 ICON \"${WWE2K14_ICON}\"\n")
+    target_sources(wwe2k14-launcher PRIVATE "${CMAKE_CURRENT_BINARY_DIR}/launcher_icon.rc")
+  endif()
 elseif(UNIX AND NOT APPLE)
   find_package(X11 REQUIRED)
   target_link_libraries(wwe2k14-launcher PRIVATE X11::X11)

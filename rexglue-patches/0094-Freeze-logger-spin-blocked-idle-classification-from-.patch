@@ -1,11 +1,11 @@
 From 56cb7fae92ef101a00a735459058e7bd2810e340 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 07:40:27 -0700
-Subject: [PATCH 94/97] Freeze logger: spin/blocked/idle classification from
+Subject: [PATCH 094/149] Freeze logger: spin/blocked/idle classification from
  per-thread CPU, 20 host-PC samples of spinning threads symbolized from the
  binary's .symtab, memory-recovery counters (kind, last guest addr/protect,
  age), guest-state hook; fix gap underflow (now read before last_present);
- spin test hook
+ spin test hook (DeepSeek Flash worker, Claude reviewed)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 533 insertions(+), 6 deletions(-)
 
 diff --git a/include/rex/diagnostics/freeze_logger.h b/include/rex/diagnostics/freeze_logger.h
-index 7e9da6d..4f7eeb1 100644
+index 7e9da6d5..4f7eeb15 100644
 --- a/include/rex/diagnostics/freeze_logger.h
 +++ b/include/rex/diagnostics/freeze_logger.h
 @@ -8,6 +8,7 @@
@@ -54,7 +54,7 @@ index 7e9da6d..4f7eeb1 100644
 +
  }  // namespace rex::diagnostics::freeze_logger
 diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
-index 507c754..0411719 100644
+index 507c7543..0411719b 100644
 --- a/src/core/freeze_logger.cpp
 +++ b/src/core/freeze_logger.cpp
 @@ -29,6 +29,7 @@
@@ -706,7 +706,7 @@ index 507c754..0411719 100644
      if (!g_reported.compare_exchange_strong(expected, true, std::memory_order_acq_rel)) continue;
      GenerateReport(now, last_present);
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 83f138d..6002cb0 100644
+index 83f138d9..6002cb01 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -23,6 +23,7 @@

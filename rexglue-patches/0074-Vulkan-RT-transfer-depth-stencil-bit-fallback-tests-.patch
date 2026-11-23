@@ -1,7 +1,7 @@
 From 96aa05b9d1856617230e235b3f9445a42ce5209d Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 19:22:17 -0700
-Subject: [PATCH 74/97] Vulkan RT transfer: depth->stencil-bit fallback tests
+Subject: [PATCH 074/149] Vulkan RT transfer: depth->stencil-bit fallback tests
  the real stencil sample (C2 mat 'black squares')
 
 Without VK_EXT_shader_stencil_export (e.g. NVIDIA) the 4x->2x depth/stencil ownership transfer writes stencil
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 9 insertions(+), 2 deletions(-)
 
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index ca70c46..6414d1c 100644
+index ca70c464..6414d1c4 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -4483,7 +4483,13 @@ VkShaderModule VulkanRenderTargetCache::GetTransferShader(TransferShaderKey key)

@@ -1,0 +1,47 @@
+From 4eef380bbc5cb1b5eda36ef90946d4efa2c9aa49 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 20:01:37 -0700
+Subject: [PATCH 111/149] nr: DrawObserver::OnGuestMemoryWritten from trace
+ playback (replay only; no-op without observer)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 9e61b29ded07ae89db8bf9a4e997f20c9819b2fa)
+---
+ include/rex/graphics/draw_observer.h | 6 ++++++
+ src/graphics/trace_player.cpp        | 3 +++
+ 2 files changed, 9 insertions(+)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 4f25a61a..e07710de 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -48,6 +48,12 @@ class DrawObserver {
+   virtual void OnCompareFrame(bool begin, uint32_t frame) { (void)begin; (void)frame; }
+   // Every frame boundary (XE_SWAP packet end), before compare-window handling.
+   virtual void OnSwap(uint32_t frame) { (void)frame; }
++  // Trace playback wrote [physical_base, +length) of guest memory directly (no write watches fire for
++  // it; the SDK learns of it through TracePlaybackWroteMemory). Replay only; never called in a live run.
++  virtual void OnGuestMemoryWritten(uint32_t physical_base, uint32_t length) {
++    (void)physical_base;
++    (void)length;
++  }
+ };
+ 
+ // Request a compare window for the next frame (thread-safe; a no-op unless
+diff --git a/src/graphics/trace_player.cpp b/src/graphics/trace_player.cpp
+index c9db214d..3a0d6ed5 100644
+--- a/src/graphics/trace_player.cpp
++++ b/src/graphics/trace_player.cpp
+@@ -176,6 +176,9 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
+                          memory->TranslatePhysical(cmd->base_ptr), cmd->decoded_length);
+         trace_ptr += cmd->encoded_length;
+         command_processor->TracePlaybackWroteMemory(cmd->base_ptr, cmd->decoded_length);
++        if (DrawObserver* observer = GetDrawObserver()) {
++          observer->OnGuestMemoryWritten(cmd->base_ptr, cmd->decoded_length);
++        }
+         break;
+       }
+       case TraceCommandType::kMemoryWrite: {
+-- 
+2.43.0
+

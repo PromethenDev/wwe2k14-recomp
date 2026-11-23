@@ -1,0 +1,42 @@
+From c767d4ca6b87e8044cb0537c1a563ef414b97ffa Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 10:34:40 -0700
+Subject: [PATCH 116/149] nr: nr_shared_device also enables the core dynamic
+ descriptor-array indexing features (review)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 40cbd496b841c9ea458b091c6ec66d7cf605dc78)
+---
+ src/ui/vulkan/vulkan_device.cpp | 9 ++++++++-
+ 1 file changed, 8 insertions(+), 1 deletion(-)
+
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 30a00678..75e6cde7 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -750,6 +750,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     nr.requested = true;
+     enabled_features.shaderInt64 = supported_features.shaderInt64;
+     nr.shader_int64 = supported_features.shaderInt64 != VK_FALSE;
++    // Dynamically uniform indexing of descriptor arrays (core features; the bindless tables need them).
++    enabled_features.shaderSampledImageArrayDynamicIndexing = supported_features.shaderSampledImageArrayDynamicIndexing;
++    enabled_features.shaderStorageBufferArrayDynamicIndexing = supported_features.shaderStorageBufferArrayDynamicIndexing;
++    enabled_features.shaderUniformBufferArrayDynamicIndexing = supported_features.shaderUniformBufferArrayDynamicIndexing;
++    enabled_features.shaderStorageImageArrayDynamicIndexing = supported_features.shaderStorageImageArrayDynamicIndexing;
+     const VkPhysicalDeviceVulkan12Features& s = features_1_2.supported;
+     VkPhysicalDeviceVulkan12Features& e = features_1_2.enabled;
+     e.bufferDeviceAddress = s.bufferDeviceAddress;
+@@ -772,7 +777,9 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     e.descriptorBindingPartiallyBound = s.descriptorBindingPartiallyBound;
+     e.descriptorBindingVariableDescriptorCount = s.descriptorBindingVariableDescriptorCount;
+     e.runtimeDescriptorArray = s.runtimeDescriptorArray;
+-    nr.descriptor_indexing = s.runtimeDescriptorArray && s.descriptorBindingPartiallyBound &&
++    nr.descriptor_indexing = supported_features.shaderSampledImageArrayDynamicIndexing &&
++                             supported_features.shaderStorageBufferArrayDynamicIndexing &&
++                             s.runtimeDescriptorArray && s.descriptorBindingPartiallyBound &&
+                              s.descriptorBindingVariableDescriptorCount &&
+                              s.descriptorBindingSampledImageUpdateAfterBind &&
+                              s.descriptorBindingStorageBufferUpdateAfterBind;
+-- 
+2.43.0
+

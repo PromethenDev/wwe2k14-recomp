@@ -1,7 +1,8 @@
 From a1ffe32dcca9dd7512434027d740ced35cc58bb8 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 07:18:22 -0700
-Subject: [PATCH 86/97] Window: cursor auto-hide on Linux (GTK) and a 4 s delay
+Subject: [PATCH 086/149] Window: cursor auto-hide on Linux (GTK) and a 4 s
+ delay
 
 GTKWindow now implements CursorVisibility (kVisible / kHidden / kAutoHidden): in auto-hide the pointer over the game
 area is hidden after kDefaultCursorAutoHideMilliseconds without real mouse movement, clicks or scrolling, and shown
@@ -14,7 +15,7 @@ window closes. kDefaultCursorAutoHideMilliseconds 3333 -> 4000 (Windows uses the
  3 files changed, 91 insertions(+), 1 deletion(-)
 
 diff --git a/include/rex/ui/window.h b/include/rex/ui/window.h
-index 4bf2d7c..aceeade 100644
+index 4bf2d7cd..aceeade2 100644
 --- a/include/rex/ui/window.h
 +++ b/include/rex/ui/window.h
 @@ -415,7 +415,7 @@ class Window {
@@ -27,7 +28,7 @@ index 4bf2d7c..aceeade 100644
    Window(WindowedAppContext& app_context, const std::string_view title,
           uint32_t desired_logical_width, uint32_t desired_logical_height);
 diff --git a/include/rex/ui/window_gtk.h b/include/rex/ui/window_gtk.h
-index 433fda3..f78fd27 100644
+index 433fda30..f78fd279 100644
 --- a/include/rex/ui/window_gtk.h
 +++ b/include/rex/ui/window_gtk.h
 @@ -44,6 +44,7 @@ class GTKWindow : public Window {
@@ -57,7 +58,7 @@ index 433fda3..f78fd27 100644
    GtkWidget* window_ = nullptr;
    GtkWidget* box_ = nullptr;
 diff --git a/src/ui/window_gtk.cpp b/src/ui/window_gtk.cpp
-index 29a4108..c7fabb5 100644
+index 29a4108b..c7fabb55 100644
 --- a/src/ui/window_gtk.cpp
 +++ b/src/ui/window_gtk.cpp
 @@ -346,6 +346,7 @@ GTKWindow::GTKWindow(WindowedAppContext& app_context, const std::string_view tit

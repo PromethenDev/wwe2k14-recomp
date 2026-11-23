@@ -1,0 +1,98 @@
+--- a/plume_vulkan.cpp	2026-11-19 22:56:10.006934454 -0800
++++ b/plume_vulkan.cpp	2026-11-19 22:56:10.019934661 -0800
+@@ -69,7 +69,14 @@
+ #   endif
+     };
+ 
++    // Windows: application-controlled full-screen exclusive swapchains (VulkanFullScreenExclusive below). Some drivers
++    // (Intel UHD 630) otherwise present a borderless full-screen window through a DWM copy, not a flip.
++    bool VulkanFullScreenExclusive = false;
++
+     static const std::unordered_set<std::string> OptionalInstanceExtensions = {
++#   if defined(_WIN64)
++        VK_KHR_GET_SURFACE_CAPABILITIES_2_EXTENSION_NAME,
++#   endif
+ #   if defined(__APPLE__)
+         // Tells the system Vulkan loader to enumerate portability drivers, if supported.
+         VK_KHR_PORTABILITY_ENUMERATION_EXTENSION_NAME,
+@@ -95,6 +102,9 @@
+         VK_KHR_PRESENT_ID_EXTENSION_NAME,
+         VK_KHR_PRESENT_WAIT_EXTENSION_NAME,
+         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
++#   if defined(_WIN64)
++        VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME,
++#   endif
+         // Vulkan spec requires this to be enabled if supported by the driver.
+         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+     };
+@@ -2378,6 +2388,21 @@
+         createInfo.clipped = VK_TRUE;
+         createInfo.oldSwapchain = vk;
+ 
++#   if defined(_WIN64)
++        VkSurfaceFullScreenExclusiveWin32InfoEXT exclusiveWin32Info = {};
++        VkSurfaceFullScreenExclusiveInfoEXT exclusiveInfo = {};
++        createInfo.pNext = nullptr;
++        fullScreenExclusiveAcquired = false;
++        if (commandQueue->device->fullScreenExclusiveSupported) {
++            exclusiveWin32Info.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_WIN32_INFO_EXT;
++            exclusiveWin32Info.hmonitor = MonitorFromWindow(desc.renderWindow, MONITOR_DEFAULTTOPRIMARY);
++            exclusiveInfo.sType = VK_STRUCTURE_TYPE_SURFACE_FULL_SCREEN_EXCLUSIVE_INFO_EXT;
++            exclusiveInfo.pNext = &exclusiveWin32Info;
++            exclusiveInfo.fullScreenExclusive = VK_FULL_SCREEN_EXCLUSIVE_APPLICATION_CONTROLLED_EXT;
++            createInfo.pNext = &exclusiveInfo;
++        }
++#   endif
++
+         VkResult res = vkCreateSwapchainKHR(commandQueue->device->vk, &createInfo, nullptr, &vk);
+         if (res != VK_SUCCESS) {
+             fprintf(stderr, "vkCreateSwapchainKHR failed with error code 0x%X.\n", res);
+@@ -2387,6 +2412,15 @@
+         // Store the chosen present mode to identify later whether the swapchain needs to be recreated.
+         createdPresentMode = requiredPresentMode;
+ 
++#   if defined(_WIN64)
++        if (commandQueue->device->fullScreenExclusiveSupported) {
++            const VkResult exclusiveRes = vkAcquireFullScreenExclusiveModeEXT(commandQueue->device->vk, vk);
++            fullScreenExclusiveAcquired = (exclusiveRes == VK_SUCCESS);
++            fprintf(stderr, "[plume] full-screen exclusive %ux%u: %s (0x%X)\n", width, height,
++                    fullScreenExclusiveAcquired ? "acquired" : "not acquired", uint32_t(exclusiveRes));
++        }
++#   endif
++
+         // Reset present counter.
+         presentCount = 1;
+ 
+@@ -4086,6 +4120,14 @@
+             }
+         }
+ 
++#   if defined(_WIN64)
++        // Needs the instance's VK_KHR_get_surface_capabilities2; only enabled when the app asks for it.
++        if (!VulkanFullScreenExclusive || vkGetPhysicalDeviceSurfaceCapabilities2KHR == nullptr) {
++            supportedOptionalExtensions.erase(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
++        }
++        fullScreenExclusiveSupported = supportedOptionalExtensions.count(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME) != 0;
++#   endif
++
+         std::vector<const char *> enabledExtensions;
+         for (const std::string &extension : RequiredDeviceExtensions) {
+             enabledExtensions.push_back(extension.c_str());
+--- a/plume_vulkan.h	2026-11-19 22:56:10.006934454 -0800
++++ b/plume_vulkan.h	2026-11-19 22:56:10.018934645 -0800
+@@ -243,6 +243,7 @@
+         uint64_t currentPresentId = 0;
+         bool immediatePresentModeSupported = false;
+         bool mailboxPresentModeSupported = false;
++        bool fullScreenExclusiveAcquired = false;
+ 
+         VulkanSwapChain(VulkanCommandQueue *commandQueue, const RenderSwapChainDesc &desc);
+         ~VulkanSwapChain() override;
+@@ -418,6 +419,7 @@
+         VkPhysicalDeviceSampleLocationsPropertiesEXT sampleLocationProperties = {};
+         std::unique_ptr<RenderBuffer> nullBuffer;
+         bool loadStoreOpNoneSupported = false;
++        bool fullScreenExclusiveSupported = false;  // VK_EXT_full_screen_exclusive enabled (Windows)
+         bool nullDescriptorSupported = false;
+ 
+         // Driver pipeline cache, saved beside the exe between runs (see setVulkanPipelineCacheDirectory).

@@ -1,0 +1,54 @@
+From 79732da0be654128ced448993abb2878d683b3c6 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:56:08 -0800
+Subject: [PATCH 143/149] xam: list a content package once when it is in both
+ the profile and the common folder (GitHub #144 boot loading loop: dlc3 ==
+ dlc4 same package); NEEDS OWNER OK before shipping
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xam/xam_content.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 83538908..8bedca10 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -9,6 +9,8 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <set>
++#include <string>
+ #include <rex/cvar.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+@@ -95,7 +97,12 @@ ppc_u32_result_t XamContentCreateEnumerator_entry(ppc_u32_t user_index, ppc_u32_
+     // Enumerate user-specific content
+     auto content_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+         static_cast<uint32_t>(DummyDeviceId::HDD), xuid, XContentType(uint32_t(content_type)));
++    // GitHub #144: the same package can sit in both the profile folder and the common (xuid 0) folder; listing
++    // it twice makes the title mount it twice (dlc3 == dlc4) and 2K14 then waits forever on the loading icon.
++    // List each package file name once (the profile copy wins, as it is listed first).
++    std::set<std::string> listed;
+     for (const auto& content_data : content_datas) {
++      listed.insert(content_data.file_name());
+       auto item = e->AppendItem();
+       *item = content_data;
+     }
+@@ -105,6 +112,12 @@ ppc_u32_result_t XamContentCreateEnumerator_entry(ppc_u32_t user_index, ppc_u32_
+       auto common_datas = REX_KERNEL_STATE()->content_manager()->ListContent(
+           static_cast<uint32_t>(DummyDeviceId::HDD), 0, XContentType(uint32_t(content_type)));
+       for (const auto& content_data : common_datas) {
++        if (!listed.insert(content_data.file_name()).second) {
++          REXKRNL_WARN("XamContentCreateEnumerator: package {} is in both the profile and the common content "
++                       "folder; listing it once",
++                       content_data.file_name());
++          continue;
++        }
+         auto item = e->AppendItem();
+         *item = content_data;
+       }
+-- 
+2.43.0
+

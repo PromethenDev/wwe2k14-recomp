@@ -1,0 +1,544 @@
+From 784dd7c991e6af46e1910fd7446f54b5242908f4 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 11:35:55 -0800
+Subject: [PATCH 137/149] Merge lane all-1104 SDK changes into main (owner OK
+ 2026-11-04): H1 guest handle reuse fix (object table), observers, TEST-only
+ CPU limit (REX_TEST_CPU_LIMIT / TEST-CPU-LIMIT.txt; must be compiled out
+ before a public release)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/observers.h     |   3 +
+ include/rex/system/util/object_table.h  |   2 +
+ include/rex/thread.h                    |   5 ++
+ src/core/observers.cpp                  |   5 ++
+ src/core/threading.cpp                  |   4 +
+ src/core/threading_posix.cpp            |   4 +
+ src/core/threading_win.cpp              | 107 ++++++++++++++++++++++++
+ src/system/util/object_table.cpp        |  98 +++++++++++++++++-----
+ src/system/xfile.cpp                    |   2 +
+ tests/unit/kernel/object_table_test.cpp |  48 +++++++++++
+ 10 files changed, 258 insertions(+), 20 deletions(-)
+
+diff --git a/include/rex/diagnostics/observers.h b/include/rex/diagnostics/observers.h
+index 3e31d8f1..05bd31f6 100644
+--- a/include/rex/diagnostics/observers.h
++++ b/include/rex/diagnostics/observers.h
+@@ -4,6 +4,7 @@
+ 
+ namespace rex::diagnostics::observers {
+ using FileOpenFn = void (*)(const char* guest_path, uint32_t status, bool is_directory);
++using FileReadFn = void (*)();
+ using InputFn = void (*)(uint32_t user_index, uint16_t buttons, uint8_t left_trigger,
+                          uint8_t right_trigger);
+ using CrashFn = void (*)(const char* summary);
+@@ -14,9 +15,11 @@ using CrashFn = void (*)(const char* summary);
+ // the game installs its own SetUnhandledExceptionFilter (vectored handlers also see
+ // exceptions that are handled later, so they cannot tell a crash).
+ void SetFileOpenObserver(FileOpenFn fn) noexcept;
++void SetFileReadObserver(FileReadFn fn) noexcept;
+ void SetInputObserver(InputFn fn) noexcept;
+ void SetCrashObserver(CrashFn fn) noexcept;
+ void NotifyFileOpen(const char* guest_path, uint32_t status, bool is_directory) noexcept;
++void NotifyFileRead() noexcept;
+ void NotifyInput(uint32_t user_index, uint16_t buttons, uint8_t left_trigger,
+                  uint8_t right_trigger) noexcept;
+ void NotifyCrash(const char* summary) noexcept;
+diff --git a/include/rex/system/util/object_table.h b/include/rex/system/util/object_table.h
+index 9149bc0c..3765da2e 100644
+--- a/include/rex/system/util/object_table.h
++++ b/include/rex/system/util/object_table.h
+@@ -110,6 +110,8 @@ class ObjectTable {
+   struct ClosedSlot {
+     uint32_t type = 0;  // XObject::Type + 1 (0 = never closed)
+     uint32_t closer_lrs[kClosedFrames] = {};
++    bool recently_closed = false;
++    std::string name;
+   };
+   std::vector<ClosedSlot> closed_;
+   std::unordered_map<string::string_key_case, X_HANDLE> name_table_;
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 4835bbe3..3d9c4449 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -92,6 +92,11 @@ uint32_t logical_processor_count();
+ // Must be called at startup before attempting to set thread affinity.
+ void EnableAffinityConfiguration();
+ 
++// TEST-only CPU limit (Windows): REX_TEST_CPU_LIMIT env or TEST-CPU-LIMIT.txt next to the exe, "N" = N cores with one
++// logical CPU each, "NxT" = N cores with T logical CPUs each (e.g. 4x2 = 4 cores / 8 threads). Returns the limited
++// logical CPU count (0 = no limit). EnableAffinityConfiguration applies the matching process mask.
++uint32_t TestCpuLimitCount();
++
+ // Gets a stable thread-specific ID, but may not be. Use for informative
+ // purposes only.
+ uint32_t current_thread_system_id();
+diff --git a/src/core/observers.cpp b/src/core/observers.cpp
+index 4527cda3..a6e7e407 100644
+--- a/src/core/observers.cpp
++++ b/src/core/observers.cpp
+@@ -4,16 +4,21 @@
+ namespace rex::diagnostics::observers {
+ namespace {
+ std::atomic<FileOpenFn> file_open{nullptr};
++std::atomic<FileReadFn> file_read{nullptr};
+ std::atomic<InputFn> input{nullptr};
+ std::atomic<CrashFn> crash{nullptr};
+ std::atomic_flag crash_called = ATOMIC_FLAG_INIT;
+ }
+ void SetFileOpenObserver(FileOpenFn fn) noexcept { file_open.store(fn, std::memory_order_relaxed); }
++void SetFileReadObserver(FileReadFn fn) noexcept { file_read.store(fn, std::memory_order_relaxed); }
+ void SetInputObserver(InputFn fn) noexcept { input.store(fn, std::memory_order_relaxed); }
+ void SetCrashObserver(CrashFn fn) noexcept { crash.store(fn, std::memory_order_relaxed); }
+ void NotifyFileOpen(const char* p, uint32_t s, bool d) noexcept {
+   if (auto fn = file_open.load(std::memory_order_relaxed)) fn(p, s, d);
+ }
++void NotifyFileRead() noexcept {
++  if (auto fn = file_read.load(std::memory_order_relaxed)) fn();
++}
+ void NotifyInput(uint32_t u, uint16_t b, uint8_t l, uint8_t r) noexcept {
+   if (auto fn = input.load(std::memory_order_relaxed)) fn(u, b, l, r);
+ }
+diff --git a/src/core/threading.cpp b/src/core/threading.cpp
+index 91ab28d0..3418b210 100644
+--- a/src/core/threading.cpp
++++ b/src/core/threading.cpp
+@@ -27,6 +27,10 @@ namespace rex::thread {
+ uint32_t logical_processor_count() {
+   static uint32_t value = 0;
+   if (!value) {
++    if (const uint32_t limited = TestCpuLimitCount()) {
++      value = limited;
++      return value;
++    }
+     value = std::thread::hardware_concurrency();
+ #if REX_PLATFORM_LINUX
+     // hardware_concurrency() may report online system CPUs even when this
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index 496ba965..4feb60d8 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -146,6 +146,10 @@ void install_signal_handler(SignalType type) {
+ // TODO(dougvj)
+ void EnableAffinityConfiguration() {}
+ 
++uint32_t TestCpuLimitCount() {
++  return 0;  // Linux: use taskset; the affinity count is read in logical_processor_count().
++}
++
+ // uint64_t ticks() { return mach_absolute_time(); }
+ 
+ uint32_t current_thread_system_id() {
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 01cb0ee3..39dc39cc 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -20,7 +20,12 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");
+ #include <rex/chrono/chrono_steady_cast.h>
+ 
+ #include <cstdint>
++#include <cstdlib>
++#include <iterator>
+ #include <limits>
++#include <string>
++#include <thread>
++#include <vector>
+ 
+ #define LOG_LASTERROR() \
+   { spdlog::error("Win32 Error 0x{:08X} in {}(...)", GetLastError(), __FUNCTION__); }
+@@ -129,12 +134,114 @@ DWORD SleepExRoundedUp(std::chrono::microseconds duration) {
+ 
+ namespace rex::thread {
+ 
++namespace {
++struct TestCpuLimit {
++  DWORD_PTR mask = 0;
++  uint32_t count = 0;
++  uint32_t cores = 0;
++  uint32_t threads_per_core = 0;
++  std::string source;
++};
++
++// Parses "N" or "NxT" (N 1..64 cores, T 1..2 logical CPUs per core). Returns false when absent or invalid.
++bool ParseTestCpuLimit(const std::string& text, uint32_t* cores, uint32_t* tpc) {
++  size_t i = 0;
++  while (i < text.size() && (text[i] == ' ' || text[i] == '\t' || text[i] == '\r' || text[i] == '\n')) ++i;
++  uint32_t n = 0, t = 1;
++  size_t digits = 0;
++  while (i < text.size() && text[i] >= '0' && text[i] <= '9' && digits < 3) n = n * 10 + uint32_t(text[i++] - '0'), ++digits;
++  if (!digits || n == 0 || n > 64) return false;
++  if (i < text.size() && (text[i] == 'x' || text[i] == 'X')) {
++    ++i;
++    if (i >= text.size() || text[i] < '1' || text[i] > '2') return false;
++    t = uint32_t(text[i++] - '0');
++  }
++  *cores = n;
++  *tpc = t;
++  return true;
++}
++
++const TestCpuLimit& GetTestCpuLimit() {
++  static const TestCpuLimit limit = [] {
++    TestCpuLimit out;
++    std::string text;
++    if (const char* env = std::getenv("REX_TEST_CPU_LIMIT"); env && *env) {
++      text = env;
++      out.source = "REX_TEST_CPU_LIMIT";
++    } else {
++      wchar_t path[MAX_PATH * 2];
++      DWORD n = GetModuleFileNameW(nullptr, path, DWORD(std::size(path)));
++      if (n && n < std::size(path)) {
++        std::wstring file(path, n);
++        const size_t slash = file.find_last_of(L"\\/");
++        file = (slash == std::wstring::npos ? std::wstring() : file.substr(0, slash + 1)) + L"TEST-CPU-LIMIT.txt";
++        HANDLE h = CreateFileW(file.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, 0, nullptr);
++        if (h != INVALID_HANDLE_VALUE) {
++          char buf[64] = {};
++          DWORD got = 0;
++          if (ReadFile(h, buf, sizeof(buf) - 1, &got, nullptr)) text.assign(buf, got);
++          CloseHandle(h);
++          out.source = "TEST-CPU-LIMIT.txt";
++        }
++      }
++    }
++    if (out.source.empty()) return out;
++    uint32_t cores = 0, tpc = 0;
++    if (!ParseTestCpuLimit(text, &cores, &tpc)) {
++      spdlog::warn("[cpu-limit] {} has an invalid value (expected N or NxT, e.g. 4 or 4x2); no limit", out.source);
++      return out;
++    }
++    // One entry per physical core, in Windows' logical-processor order (processor group 0 only).
++    DWORD bytes = 0;
++    GetLogicalProcessorInformation(nullptr, &bytes);
++    std::vector<SYSTEM_LOGICAL_PROCESSOR_INFORMATION> info(bytes / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION) + 1);
++    if (!bytes || !GetLogicalProcessorInformation(info.data(), &bytes)) {
++      spdlog::warn("[cpu-limit] GetLogicalProcessorInformation failed; no limit");
++      return out;
++    }
++    info.resize(bytes / sizeof(SYSTEM_LOGICAL_PROCESSOR_INFORMATION));
++    uint32_t used_cores = 0;
++    for (const auto& e : info) {
++      if (e.Relationship != RelationProcessorCore || used_cores >= cores) continue;
++      uint32_t taken = 0;
++      for (uint32_t bit = 0; bit < sizeof(ULONG_PTR) * 8 && taken < tpc; ++bit) {
++        const ULONG_PTR b = ULONG_PTR(1) << bit;
++        if (e.ProcessorMask & b) {
++          out.mask |= b;
++          ++taken;
++        }
++      }
++      if (taken) ++used_cores;
++    }
++    for (DWORD_PTR m = out.mask; m; m &= m - 1) ++out.count;
++    out.cores = used_cores;
++    out.threads_per_core = tpc;
++    return out;
++  }();
++  return limit;
++}
++}  // namespace
++
++uint32_t TestCpuLimitCount() {
++  return GetTestCpuLimit().count;
++}
++
+ void EnableAffinityConfiguration() {
+   HANDLE process_handle = GetCurrentProcess();
+   DWORD_PTR process_affinity_mask;
+   DWORD_PTR system_affinity_mask;
+   GetProcessAffinityMask(process_handle, &process_affinity_mask, &system_affinity_mask);
++  const TestCpuLimit& limit = GetTestCpuLimit();
++  if (limit.mask && (limit.mask & system_affinity_mask) == limit.mask) {
++    const BOOL ok = SetProcessAffinityMask(process_handle, limit.mask);
++    spdlog::warn("[cpu-limit] TEST CPU limit from {}: {} cores x {} = {} logical CPUs, mask 0x{:X} (system 0x{:X}) {}",
++                 limit.source, limit.cores, limit.threads_per_core, limit.count, uint64_t(limit.mask),
++                 uint64_t(system_affinity_mask), ok ? "applied" : "FAILED");
++    if (ok) return;
++  }
+   SetProcessAffinityMask(process_handle, system_affinity_mask);
++  spdlog::info("[cpu-limit] no CPU limit: logical CPUs {} (mask 0x{:X})", std::thread::hardware_concurrency(),
++               uint64_t(system_affinity_mask));
+ }
+ 
+ uint32_t current_thread_system_id() {
+diff --git a/src/system/util/object_table.cpp b/src/system/util/object_table.cpp
+index 31939ae0..046f7b6c 100644
+--- a/src/system/util/object_table.cpp
++++ b/src/system/util/object_table.cpp
+@@ -20,20 +20,32 @@
+ #include <rex/system/util/object_table.h>
+ #include <rex/system/util/obj_fix.h>
+ #include <rex/system/xobject.h>
++#include <rex/system/xfile.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/thread_state.h>
+ #include <rex/system/xthread.h>
+ 
+-// Card S5-2 (endless loading on Windows, GitHub #29/#72/#83/#84): the free-slot scan restarted at slot 0, so a closed
+-// handle number was handed to the very next new object. A game that still waits on a handle it closed then waited on
+-// an unrelated object - in the s52w-3 freeze report the audio lock's mutex handle 0xF8000770 had become the file
+-// sound\DLC_01.pck, which never signals. Round-robin allocation reuses a number only after the whole table has
+-// cycled, so a stale handle stays invalid (the wait fails at once) instead of aliasing a new object.
+-REXCVAR_DEFINE_BOOL(WWE2K14_HANDLE_ROUND_ROBIN, false, "Kernel",
+-                    "Allocate guest handles round-robin so closed handle numbers are not reused at once");
++// H1 candidate: delay reuse of a freed guest handle number and reject operations on empty slots.
++// Default is enabled only in the private H1 SDK lane.
++REXCVAR_DEFINE_BOOL(WWE2K14_HANDLE_REUSE_FIX, true, "Kernel",
++                    "Rotate guest handle allocation and reject retain/close of an empty slot");
++REXCVAR_DEFINE_BOOL(WWE2K14_DIAG_HANDLES, false, "Kernel",
++                    "Log guest handle create/close/reuse and request reports for low-draw read stalls");
+ 
+ namespace rex::system::util {
+ 
++namespace {
++
++std::string ObjectNameForLog(XObject* object) {
++  if (!object->name().empty()) return object->name();
++  if (object->type() == XObject::Type::File) {
++    return static_cast<XFile*>(object)->path();
++  }
++  return "<unnamed>";
++}
++
++}  // namespace
++
+ ObjectTable::ObjectTable() {}
+ 
+ ObjectTable::~ObjectTable() {
+@@ -55,16 +67,13 @@ void ObjectTable::Reset() {
+   last_free_entry_ = 0;
+   free(table_);
+   table_ = nullptr;
++  closed_.clear();
+ }
+ 
+ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
+-  static const bool obj_fix = [] {
+-    const char* v = std::getenv("WWE2K14_OBJ_FIX");
+-    return v == nullptr || std::strcmp(v, "0") != 0;
+-  }();
+-  if (obj_fix) {
+-    // Round-robin: a freed handle number is not handed out again until the table cycles,
+-    // so stale guest KEVENT headers cannot alias a newly opened object.
++  const bool reuse_fix = REXCVAR_GET(WWE2K14_HANDLE_REUSE_FIX);
++  if (reuse_fix) {
++    // Rotate through nonzero slots so a recently freed number is not the next one handed out.
+     if (util::objfix::FindFreeSlotRoundRobin([this](uint32_t s) { return table_[s].object == nullptr; },
+                                              table_capacity_, &last_free_entry_, out_slot)) {
+       return X_STATUS_SUCCESS;
+@@ -95,10 +104,12 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
+     return X_STATUS_NO_MEMORY;
+   }
+ 
+-  // Never allow 0 handles.
+-  uint32_t slot = ++last_free_entry_;
++  // Never allow slot 0. In reuse-fix mode Resize leaves the cursor at the old capacity,
++  // which is the first newly added slot; in baseline mode preserve the prior increment.
++  uint32_t slot = reuse_fix ? last_free_entry_ : ++last_free_entry_;
++  if (reuse_fix && (slot == 0 || slot >= table_capacity_)) slot = 1;
+   *out_slot = slot;
+-  if (obj_fix) {
++  if (reuse_fix) {
+     last_free_entry_ = (slot + 1 >= table_capacity_) ? 1 : slot + 1;
+   }
+ 
+@@ -138,13 +149,29 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
+ 
+     // Stash.
+     if (XSUCCEEDED(result)) {
+-      if (REXCVAR_GET(WWE2K14_HANDLE_ROUND_ROBIN)) {
+-        last_free_entry_ = slot + 1 < table_capacity_ ? slot + 1 : 1;
+-      }
+       ObjectTableEntry& entry = table_[slot];
+       entry.object = object;
+       entry.handle_ref_count = 1;
+       handle = XObject::kHandleBase + (slot << 2);
++      const bool diag = REXCVAR_GET(WWE2K14_DIAG_HANDLES);
++      // AddHandle runs inside the XObject base constructor: subclass members (XFile::file_) are not built yet,
++      // so only the base name is safe here (Claude fix 11-03: path() crashed at boot).
++      const std::string object_name = diag ? (object->name().empty() ? std::string("<unnamed>") : object->name()) : std::string();
++      if (slot < closed_.size()) {
++        ClosedSlot& closed = closed_[slot];
++        if (diag && closed.recently_closed) {
++          REXSYS_WARN("[handle] reuse handle={:08X} old_type={} old_name='{}' new_type={} new_name='{}'",
++                      handle, closed.type ? closed.type - 1 : 0,
++                      closed.name.empty() ? "<not-captured>" : closed.name,
++                      uint32_t(object->type()), object_name);
++        }
++        closed.recently_closed = false;
++        closed.name.clear();
++      }
++      if (diag) {
++        REXSYS_INFO("[handle] create handle={:08X} type={} name='{}'", handle,
++                    uint32_t(object->type()), object_name);
++      }
+       object->handles().push_back(handle);
+ 
+       // Retain so long as the object is in the table.
+@@ -186,6 +213,13 @@ X_STATUS ObjectTable::RetainHandle(X_HANDLE handle) {
+     return X_STATUS_INVALID_HANDLE;
+   }
+ 
++  if (!entry->object || entry->handle_ref_count <= 0) {
++    if (REXCVAR_GET(WWE2K14_DIAG_HANDLES)) {
++      REXSYS_WARN("[handle] retain-empty handle={:08X} refs={}", handle, entry->handle_ref_count);
++    }
++    if (REXCVAR_GET(WWE2K14_HANDLE_REUSE_FIX)) return X_STATUS_INVALID_HANDLE;
++  }
++
+   entry->handle_ref_count++;
+   return X_STATUS_SUCCESS;
+ }
+@@ -195,9 +229,19 @@ X_STATUS ObjectTable::ReleaseHandle(X_HANDLE handle) {
+ 
+   ObjectTableEntry* entry = LookupTable(handle);
+   if (!entry) {
++    if (REXCVAR_GET(WWE2K14_DIAG_HANDLES)) {
++      REXSYS_WARN("[handle] close-invalid handle={:08X} reason=outside-table", handle);
++    }
+     return X_STATUS_INVALID_HANDLE;
+   }
+ 
++  if (!entry->object || entry->handle_ref_count <= 0) {
++    if (REXCVAR_GET(WWE2K14_DIAG_HANDLES)) {
++      REXSYS_WARN("[handle] close-empty handle={:08X} refs={}", handle, entry->handle_ref_count);
++    }
++    if (REXCVAR_GET(WWE2K14_HANDLE_REUSE_FIX)) return X_STATUS_INVALID_HANDLE;
++  }
++
+   if (--entry->handle_ref_count == 0) {
+     // No more references. Remove it from the table.
+     return RemoveHandle(handle);
+@@ -222,8 +266,16 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
+   }
+ 
+   auto global_lock = global_critical_region_.Acquire();
++  if (!entry->object && REXCVAR_GET(WWE2K14_HANDLE_REUSE_FIX)) {
++    if (REXCVAR_GET(WWE2K14_DIAG_HANDLES)) {
++      REXSYS_WARN("[handle] remove-empty handle={:08X}", handle);
++    }
++    return X_STATUS_INVALID_HANDLE;
++  }
+   if (entry->object) {
+     auto object = entry->object;
++    const bool diag = REXCVAR_GET(WWE2K14_DIAG_HANDLES);
++    const std::string object_name = diag ? ObjectNameForLog(object) : std::string();
+     entry->object = nullptr;
+     const uint32_t slot = GetHandleSlot(handle);
+     if (closed_.size() < table_capacity_) closed_.resize(table_capacity_);
+@@ -231,6 +283,8 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
+       ClosedSlot& closed = closed_[slot];
+       closed = {};
+       closed.type = uint32_t(object->type()) + 1;
++      closed.recently_closed = true;
++      if (diag) closed.name = object_name;
+       CloserStack(closed.closer_lrs);
+     }
+     assert_zero(entry->handle_ref_count);
+@@ -242,6 +296,10 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
+       object->handles().erase(handle_entry);
+     }
+ 
++    if (diag) {
++      REXSYS_INFO("[handle] close handle={:08X} type={} name='{}'", handle,
++                  uint32_t(object->type()), object_name);
++    }
+     REXSYS_DEBUG("Removed handle:{:08X} for {}", handle, typeid(*object).name());
+ 
+     // Remove object name from mapping to prevent naming collision.
+diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
+index 36f508bf..7193dbd2 100644
+--- a/src/system/xfile.cpp
++++ b/src/system/xfile.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <rex/filesystem/vfs.h>
++#include <rex/diagnostics/observers.h>
+ #include <rex/logging.h>
+ #include <rex/math.h>
+ #include <rex/memory.h>
+@@ -156,6 +157,7 @@ X_STATUS XFile::ReadInternal(uint32_t buffer_guest_address, uint32_t buffer_leng
+                                         memory::PageAccess::kReadWrite) {
+           result = X_STATUS_ACCESS_VIOLATION;
+         } else {
++          rex::diagnostics::observers::NotifyFileRead();
+           result = file_->ReadSync(
+               std::span<uint8_t>(
+                   buffer_physical_heap
+diff --git a/tests/unit/kernel/object_table_test.cpp b/tests/unit/kernel/object_table_test.cpp
+index 9c511535..5824c08a 100644
+--- a/tests/unit/kernel/object_table_test.cpp
++++ b/tests/unit/kernel/object_table_test.cpp
+@@ -6,6 +6,7 @@
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
++#include <rex/cvar.h>
+ #include <rex/logging.h>
+ #include <rex/system/util/object_table.h>
+ #include <rex/system/xobject.h>
+@@ -14,6 +15,8 @@ using namespace rex;
+ using namespace rex::system;
+ using namespace rex::system::util;
+ 
++REXCVAR_DECLARE(bool, WWE2K14_HANDLE_REUSE_FIX);
++
+ // =============================================================================
+ // Test Fixtures and Helpers
+ // =============================================================================
+@@ -280,6 +283,51 @@ TEST_CASE("ObjectTable multiple objects get unique handles", "[kernel][object_ta
+   table.Reset();
+ }
+ 
++TEST_CASE("ObjectTable reuse fix delays a freed number and rejects a second close", "[kernel][object_table]") {
++  InitTestLogging();
++  DestructorCountReset reset;
++
++  const bool old_fix = REXCVAR_GET(WWE2K14_HANDLE_REUSE_FIX);
++  REXCVAR_SET(WWE2K14_HANDLE_REUSE_FIX, true);
++  ObjectTable table;
++  auto* first = new TestObject();
++  X_HANDLE first_handle = 0;
++  CHECK(table.AddHandle(first, &first_handle) == X_STATUS_SUCCESS);
++  first->Release();
++  CHECK(table.ReleaseHandle(first_handle) == X_STATUS_SUCCESS);
++  CHECK(table.ReleaseHandle(first_handle) == X_STATUS_INVALID_HANDLE);
++
++  auto* second = new TestObject();
++  X_HANDLE second_handle = 0;
++  CHECK(table.AddHandle(second, &second_handle) == X_STATUS_SUCCESS);
++  second->Release();
++  CHECK(second_handle != first_handle);
++  table.Reset();
++  REXCVAR_SET(WWE2K14_HANDLE_REUSE_FIX, old_fix);
++}
++
++TEST_CASE("ObjectTable reuse fix off preserves immediate slot reuse", "[kernel][object_table]") {
++  InitTestLogging();
++  DestructorCountReset reset;
++
++  const bool old_fix = REXCVAR_GET(WWE2K14_HANDLE_REUSE_FIX);
++  REXCVAR_SET(WWE2K14_HANDLE_REUSE_FIX, false);
++  ObjectTable table;
++  auto* first = new TestObject();
++  X_HANDLE first_handle = 0;
++  CHECK(table.AddHandle(first, &first_handle) == X_STATUS_SUCCESS);
++  first->Release();
++  CHECK(table.ReleaseHandle(first_handle) == X_STATUS_SUCCESS);
++
++  auto* second = new TestObject();
++  X_HANDLE second_handle = 0;
++  CHECK(table.AddHandle(second, &second_handle) == X_STATUS_SUCCESS);
++  second->Release();
++  CHECK(second_handle == first_handle);
++  table.Reset();
++  REXCVAR_SET(WWE2K14_HANDLE_REUSE_FIX, old_fix);
++}
++
+ // =============================================================================
+ // ObjectTable Handle Lookup Tests
+ // =============================================================================
+-- 
+2.43.0
+

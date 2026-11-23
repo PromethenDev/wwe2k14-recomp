@@ -1,7 +1,7 @@
 From dafa3a1ca283fb83243915c2673d47a0cd7451b4 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 11:13:16 -0700
-Subject: [PATCH 18/97] diagnostics: census CPU/GPU attribution fields
+Subject: [PATCH 018/149] diagnostics: census CPU/GPU attribution fields
  (per-thread CPU, swap wait, GPU busy)
 
 Adds [rate-census-cpu] per-second lines (top-5 thread CPU%, VdSwap thread
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 382 insertions(+), 11 deletions(-)
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
-index f8c9ec9..2c95aea 100644
+index f8c9ec97..2c95aea9 100644
 --- a/include/rex/diagnostics/rate_census.h
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -6,9 +6,29 @@
@@ -70,7 +70,7 @@ index f8c9ec9..2c95aea 100644
  
  }  // namespace rex::diagnostics::rate_census
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index 4122a13..e690576 100644
+index 4122a132..e690576b 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -5,17 +5,31 @@
@@ -544,7 +544,7 @@ index 4122a13..e690576 100644
 +
  }  // namespace rex::diagnostics::rate_census
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 55666da..997f3f7 100644
+index 55666da2..997f3f7c 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -10,6 +10,7 @@
@@ -580,7 +580,7 @@ index 55666da..997f3f7 100644
      // FIXME: We're supposed to process the WAIT_UNTIL register at this point,
      // but no games seem to actually use it.
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index eb188b7..3834809 100644
+index eb188b7b..3834809b 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -5359,9 +5359,11 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
@@ -596,7 +596,7 @@ index eb188b7..3834809 100644
        fences_awaited += await_submission - submission_completed_;
      } else {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
-index 53f2b8e..c1c6c76 100644
+index 53f2b8e6..c1c6c76b 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 @@ -455,6 +455,9 @@ void VdSwap_entry(ppc_pvoid_t buffer_ptr,      // ptr into primary ringbuffer

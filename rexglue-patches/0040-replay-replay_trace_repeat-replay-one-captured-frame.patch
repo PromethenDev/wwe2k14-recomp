@@ -1,8 +1,8 @@
 From da17fb6db3987ac73b4a47492cc6befea34feb8f Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 19:09:28 -0700
-Subject: [PATCH 40/97] replay: replay_trace_repeat - replay one captured frame
- N times and time it
+Subject: [PATCH 040/149] replay: replay_trace_repeat - replay one captured
+ frame N times and time it
 
 TracePlayer::ReplayCurrentFrame replays the whole current frame without
 clearing caches. With --replay_trace_repeat=N the replay mode logs
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 27 insertions(+)
 
 diff --git a/include/rex/graphics/trace_player.h b/include/rex/graphics/trace_player.h
-index 7fe8c35..6508853 100644
+index 7fe8c35f..65088533 100644
 --- a/include/rex/graphics/trace_player.h
 +++ b/include/rex/graphics/trace_player.h
 @@ -42,6 +42,8 @@ class TracePlayer : public TraceReader {
@@ -33,7 +33,7 @@ index 7fe8c35..6508853 100644
    void WaitOnPlayback();
  
 diff --git a/src/graphics/trace_player.cpp b/src/graphics/trace_player.cpp
-index b487aff..2517601 100644
+index b487affe..25176018 100644
 --- a/src/graphics/trace_player.cpp
 +++ b/src/graphics/trace_player.cpp
 @@ -78,6 +78,13 @@ void TracePlayer::SeekCommand(int target_command) {
@@ -51,7 +51,7 @@ index b487aff..2517601 100644
    rex::thread::Wait(playback_event_.get(), true);
  }
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 68c99ca..f99e258 100644
+index 68c99cae..f99e258a 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -11,6 +11,8 @@

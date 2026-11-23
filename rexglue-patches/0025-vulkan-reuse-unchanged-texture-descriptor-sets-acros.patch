@@ -1,8 +1,8 @@
 From d3f13bf6a50dd953bbd0e6728ee179090af854ee Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 19:15:42 -0700
-Subject: [PATCH 25/97] vulkan: reuse unchanged texture descriptor sets across
- draws
+Subject: [PATCH 025/149] vulkan: reuse unchanged texture descriptor sets
+ across draws
 
 UpdateBindings invalidated both texture descriptor sets on every draw (upstream
 TODO), allocating and writing new sets each time. It now builds the effective
@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 201 insertions(+), 25 deletions(-)
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
-index 250f2eb..5146000 100644
+index 250f2eb1..5146000b 100644
 --- a/include/rex/diagnostics/rate_census.h
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -65,6 +65,9 @@ void RecordGpuBusyStart();
@@ -40,7 +40,7 @@ index 250f2eb..5146000 100644
  bool IsEnabled();
  uint64_t NowNs();
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 9073c58..d5e9099 100644
+index 9073c582..d5e90991 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -379,6 +379,16 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -78,7 +78,7 @@ index 9073c58..d5e9099 100644
    std::unique_ptr<VulkanSharedMemory> shared_memory_;
  
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index 9563ff0..763308c 100644
+index 9563ff04..763308c0 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -87,6 +87,8 @@ struct Counters {
@@ -174,7 +174,7 @@ index 9563ff0..763308c 100644
  
  uint64_t NowNs() { return QueryHostNanoseconds(); }
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 0bd03a9..23dafe6 100644
+index 0bd03a9c..23dafe6b 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -13,6 +13,7 @@

@@ -1,9 +1,9 @@
 From 798a1321699b6a073e739c19a14cfa74d56c57f7 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 00:09:13 -0700
-Subject: [PATCH 65/97] XMP custom music phase 1: XamCreateEnumeratorHandle for
- app 0xFA lists <exe>/music (xmp_music_dir) as 820-byte song records; 0x70025
- ok; 0x7003B logged play request; rate-limited XMP message log
+Subject: [PATCH 065/149] XMP custom music phase 1: XamCreateEnumeratorHandle
+ for app 0xFA lists <exe>/music (xmp_music_dir) as 820-byte song records;
+ 0x70025 ok; 0x7003B logged play request; rate-limited XMP message log
 
 Verified in WWE '13 entrance editor: USER PLAYLIST shows the folder songs, pick survives save/reload.
 
@@ -17,7 +17,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 218 insertions(+), 5 deletions(-)
 
 diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
-index d939d62..7fc63a6 100644
+index d939d62a..7fc63a6a 100644
 --- a/include/rex/kernel/xam/apps/xmp_app.h
 +++ b/include/rex/kernel/xam/apps/xmp_app.h
 @@ -10,7 +10,10 @@
@@ -78,7 +78,7 @@ index d939d62..7fc63a6 100644
  
  }  // namespace apps
 diff --git a/include/rex/system/xam/app_manager.h b/include/rex/system/xam/app_manager.h
-index 84be3e4..9a2ecc0 100644
+index 84be3e4f..9a2ecc0f 100644
 --- a/include/rex/system/xam/app_manager.h
 +++ b/include/rex/system/xam/app_manager.h
 @@ -51,6 +51,8 @@ class AppManager {
@@ -91,7 +91,7 @@ index 84be3e4..9a2ecc0 100644
                                  uint32_t buffer_length);
    X_HRESULT DispatchMessageAsync(uint32_t app_id, uint32_t message, uint32_t buffer_ptr,
 diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
-index 1aab507..0d3338a 100644
+index 1aab507d..0d3338a7 100644
 --- a/src/kernel/xam/apps/xmp_app.cpp
 +++ b/src/kernel/xam/apps/xmp_app.cpp
 @@ -10,10 +10,23 @@
@@ -276,7 +276,7 @@ index 1aab507..0d3338a 100644
        assert_true(!buffer_length || buffer_length == 12);
        uint32_t xmp_client = memory::load_and_swap<uint32_t>(buffer + 0);
 diff --git a/src/kernel/xam/xam_enum.cpp b/src/kernel/xam/xam_enum.cpp
-index 700bd9e..e1836fb 100644
+index 700bd9e8..e1836fb1 100644
 --- a/src/kernel/xam/xam_enum.cpp
 +++ b/src/kernel/xam/xam_enum.cpp
 @@ -11,6 +11,7 @@
@@ -345,7 +345,7 @@ index 700bd9e..e1836fb 100644
  
  ppc_u32_result_t XamGetPrivateEnumStructureFromHandle_entry(ppc_u32_t handle,
 diff --git a/src/system/xam/app_manager.cpp b/src/system/xam/app_manager.cpp
-index f96257f..abd982b 100644
+index f96257f5..abd982be 100644
 --- a/src/system/xam/app_manager.cpp
 +++ b/src/system/xam/app_manager.cpp
 @@ -25,6 +25,11 @@ void AppManager::RegisterApp(std::unique_ptr<App> app) {

@@ -1,0 +1,158 @@
+From f5e68a56d1948ca552dd062b56f2a47a59ddd1eb Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 2 Oct 2026 17:47:21 -0700
+Subject: [PATCH 104/149] native B2f: opt-in --replay_trace_capture_full_rt
+ (whole RT readback for per-draw references)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ae9d3fa6f6a89485ed46f0fe39ba6237a6762403)
+---
+ include/rex/graphics/command_processor.h      |  5 +-
+ .../rex/graphics/vulkan/command_processor.h   |  3 +-
+ src/graphics/vulkan/command_processor.cpp     | 47 ++++++++++++-------
+ src/ui/rex_app.cpp                            |  5 +-
+ 4 files changed, 39 insertions(+), 21 deletions(-)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index a40bcc12..134a19bc 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -136,7 +136,10 @@ class CommandProcessor {
+   // Captures the most recently drawn color render target for opt-in trace
+   // replay diagnostics. Backends that cannot expose a host render target may
+   // keep the default unsupported implementation.
+-  virtual bool CaptureLastRenderTarget(ui::RawImage& image_out) { return false; }
++  virtual bool CaptureLastRenderTarget(ui::RawImage&,
++                                      bool = false) {
++    return false;
++  }
+ 
+   void RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
+                         uint32_t register_count, bool execute_callbacks);
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index f507c739..bf5ed954 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -145,7 +145,8 @@ class VulkanCommandProcessor : public CommandProcessor {
+ 
+   void TracePlaybackWroteMemory(uint32_t base_ptr, uint32_t length) override;
+ 
+-  bool CaptureLastRenderTarget(ui::RawImage& image_out) override;
++  bool CaptureLastRenderTarget(ui::RawImage& image_out,
++                               bool full_render_target = false) override;
+ 
+   void RestoreEdramSnapshot(const void* snapshot) override;
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 81519a74..8d0b5cc7 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -1222,7 +1222,8 @@ void VulkanCommandProcessor::TracePlaybackWroteMemory(uint32_t base_ptr, uint32_
+   primitive_processor_->MemoryInvalidationCallback(base_ptr, length, true);
+ }
+ 
+-bool VulkanCommandProcessor::CaptureLastRenderTarget(ui::RawImage& image_out) {
++bool VulkanCommandProcessor::CaptureLastRenderTarget(ui::RawImage& image_out,
++                                                     bool full_render_target) {
+   VkImage image = VK_NULL_HANDLE;
+   VkFormat format = VK_FORMAT_UNDEFINED;
+   VkExtent2D image_extent{};
+@@ -1242,20 +1243,30 @@ bool VulkanCommandProcessor::CaptureLastRenderTarget(ui::RawImage& image_out) {
+     return false;
+   }
+ 
+-  draw_util::Scissor scissor{};
+-  draw_util::GetScissor(*register_file_, scissor);
+-  const uint64_t right = uint64_t(scissor.offset[0]) + scissor.extent[0];
+-  const uint64_t bottom = uint64_t(scissor.offset[1]) + scissor.extent[1];
+-  if (!scissor.extent[0] || !scissor.extent[1] || right > image_extent.width ||
+-      bottom > image_extent.height) {
+-    REXGPU_WARN("Trace RT capture: scissor {}x{}+{},{} is outside the {}x{} target",
+-                scissor.extent[0], scissor.extent[1], scissor.offset[0], scissor.offset[1],
+-                image_extent.width, image_extent.height);
+-    return false;
++  uint32_t capture_x = 0;
++  uint32_t capture_y = 0;
++  uint32_t capture_width = image_extent.width;
++  uint32_t capture_height = image_extent.height;
++  if (!full_render_target) {
++    draw_util::Scissor scissor{};
++    draw_util::GetScissor(*register_file_, scissor);
++    const uint64_t right = uint64_t(scissor.offset[0]) + scissor.extent[0];
++    const uint64_t bottom = uint64_t(scissor.offset[1]) + scissor.extent[1];
++    if (!scissor.extent[0] || !scissor.extent[1] || right > image_extent.width ||
++        bottom > image_extent.height) {
++      REXGPU_WARN("Trace RT capture: scissor {}x{}+{},{} is outside the {}x{} target",
++                  scissor.extent[0], scissor.extent[1], scissor.offset[0], scissor.offset[1],
++                  image_extent.width, image_extent.height);
++      return false;
++    }
++    capture_x = scissor.offset[0];
++    capture_y = scissor.offset[1];
++    capture_width = scissor.extent[0];
++    capture_height = scissor.extent[1];
+   }
+ 
+   const VkDeviceSize readback_size =
+-      VkDeviceSize(scissor.extent[0]) * scissor.extent[1] * sizeof(uint32_t);
++      VkDeviceSize(capture_width) * capture_height * sizeof(uint32_t);
+   const ui::vulkan::VulkanDevice* const vulkan_device = GetVulkanDevice();
+   const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
+   const VkDevice device = vulkan_device->device();
+@@ -1291,8 +1302,8 @@ bool VulkanCommandProcessor::CaptureLastRenderTarget(ui::RawImage& image_out) {
+   VkBufferImageCopy copy_region{};
+   copy_region.imageSubresource.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
+   copy_region.imageSubresource.layerCount = 1;
+-  copy_region.imageOffset = {int32_t(scissor.offset[0]), int32_t(scissor.offset[1]), 0};
+-  copy_region.imageExtent = {scissor.extent[0], scissor.extent[1], 1};
++  copy_region.imageOffset = {int32_t(capture_x), int32_t(capture_y), 0};
++  copy_region.imageExtent = {capture_width, capture_height, 1};
+   deferred_command_buffer_.CmdVkCopyImageToBuffer(image, VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL,
+                                                    readback_buffer, 1, &copy_region);
+   PushImageMemoryBarrier(image, image_range, VK_PIPELINE_STAGE_TRANSFER_BIT, source_stage,
+@@ -1334,15 +1345,15 @@ bool VulkanCommandProcessor::CaptureLastRenderTarget(ui::RawImage& image_out) {
+       return false;
+     }
+   }
+-  image_out.width = scissor.extent[0];
+-  image_out.height = scissor.extent[1];
++  image_out.width = capture_width;
++  image_out.height = capture_height;
+   image_out.stride = size_t(image_out.width) * sizeof(uint32_t);
+   image_out.data.resize(size_t(readback_size));
+   std::memcpy(image_out.data.data(), mapping, image_out.data.size());
+   dfn.vkUnmapMemory(device, readback_memory);
+   destroy_readback();
+-  REXGPU_INFO("Trace RT capture: {}x{} format={} msaa=1", image_out.width, image_out.height,
+-              uint32_t(format));
++  REXGPU_INFO("Trace RT capture: {}x{} format={} msaa=1 full_rt={}", image_out.width,
++              image_out.height, uint32_t(format), full_render_target);
+   return true;
+ }
+ 
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 16c094d9..1bf8ce8b 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -72,6 +72,8 @@ REXCVAR_DEFINE_STRING(replay_trace_out, "", "GPU",
+ REXCVAR_DEFINE_INT32(replay_trace_stop_after_draw, -1, "GPU",
+                      "replay_trace: stop after this zero-based draw command and dump its Vulkan RT "
+                      "(-1 replays the full frame)");
++REXCVAR_DEFINE_BOOL(replay_trace_capture_full_rt, false, "GPU",
++                     "replay_trace: capture the whole bound RT instead of the draw scissor");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+ REXCVAR_DEFINE_INT32(close_exit_timeout_seconds, 3, "Runtime",
+                      "After the window is closed, force the process to exit if shutdown has not "
+@@ -383,7 +385,8 @@ bool ReXApp::OnInitialize() {
+               std::future<bool> capture_future = capture_result.get_future();
+               command_processor->CallInThread([command_processor, &image,
+                                                &capture_result]() {
+-                capture_result.set_value(command_processor->CaptureLastRenderTarget(image));
++                capture_result.set_value(command_processor->CaptureLastRenderTarget(
++                    image, REXCVAR_GET(replay_trace_capture_full_rt)));
+               });
+               image_captured = capture_future.get();
+             }
+-- 
+2.43.0
+

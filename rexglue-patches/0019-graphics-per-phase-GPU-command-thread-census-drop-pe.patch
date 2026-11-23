@@ -1,7 +1,7 @@
 From 6c599edcf6591a533d87cd0b20ce1f0cbc6a4537 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 12:43:28 -0700
-Subject: [PATCH 19/97] graphics: per-phase GPU command thread census; drop
+Subject: [PATCH 019/149] graphics: per-phase GPU command thread census; drop
  per-write/per-draw lookup overhead
 
 Diagnostics (env-gated by WWE13_RATE_CENSUS, no-op otherwise): exclusive
@@ -30,7 +30,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  8 files changed, 269 insertions(+), 7 deletions(-)
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
-index 2c95aea..ee1e984 100644
+index 2c95aea9..ee1e984d 100644
 --- a/include/rex/diagnostics/rate_census.h
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -27,6 +27,20 @@ struct Sample {
@@ -89,7 +89,7 @@ index 2c95aea..ee1e984 100644
 +
  }  // namespace rex::diagnostics::rate_census
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index d3402fb..cb74a27 100644
+index d3402fb5..cb74a279 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -256,8 +256,11 @@ class CommandProcessor {
@@ -115,7 +115,7 @@ index d3402fb..cb74a27 100644
    reg::DC_LUT_30_COLOR gamma_ramp_256_entry_table_[256] = {};
    reg::DC_LUT_PWL_DATA gamma_ramp_pwl_rgb_[128][3] = {};
 diff --git a/include/rex/graphics/register_file.h b/include/rex/graphics/register_file.h
-index 36e07dd..9a99902 100644
+index 36e07dd1..9a999025 100644
 --- a/include/rex/graphics/register_file.h
 +++ b/include/rex/graphics/register_file.h
 @@ -35,6 +35,7 @@ class RegisterFile {
@@ -127,7 +127,7 @@ index 36e07dd..9a99902 100644
  
    static constexpr size_t kRegisterCount = 0x5003;
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index e690576..d97f221 100644
+index e690576b..d97f221f 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -33,6 +33,16 @@
@@ -346,7 +346,7 @@ index e690576..d97f221 100644
 +
  }  // namespace rex::diagnostics::rate_census
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 997f3f7..0b3d722 100644
+index 997f3f7c..0b3d722d 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -265,6 +265,12 @@ bool CommandProcessor::IsReadbackMemexportEnabled(bool legacy_backend_flag) cons
@@ -421,7 +421,7 @@ index 997f3f7..0b3d722 100644
    return true;
  }
 diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
-index 5636275..12ff744 100644
+index 56362754..12ff744d 100644
 --- a/src/graphics/d3d12/command_processor.cpp
 +++ b/src/graphics/d3d12/command_processor.cpp
 @@ -2737,7 +2737,7 @@ bool D3D12CommandProcessor::IssueDraw(xenos::PrimitiveType primitive_type, uint3
@@ -463,7 +463,7 @@ index 5636275..12ff744 100644
    // Check if the device is still available.
    ID3D12Device* device = GetD3D12Provider().GetDevice();
 diff --git a/src/graphics/register_file.cpp b/src/graphics/register_file.cpp
-index 03ce18c..0eff799 100644
+index 03ce18ca..0eff7996 100644
 --- a/src/graphics/register_file.cpp
 +++ b/src/graphics/register_file.cpp
 @@ -9,6 +9,7 @@
@@ -502,7 +502,7 @@ index 03ce18c..0eff799 100644
    switch (index) {
  #define XE_GPU_REGISTER(index, type, name) \
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 3834809..0bd03a9 100644
+index 3834809b..0bd03a9c 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -2342,6 +2342,8 @@ std::string FormatResolveSummary(const content_probe::ProbeCounters::ResolveSumm

@@ -163,7 +163,9 @@ bool WriteBinaryFile(const std::filesystem::path& path, const void* data, size_t
   if (!output) return false;
   if (size) output.write(static_cast<const char*>(data), static_cast<std::streamsize>(size));
   output.flush();
-  return output.good();
+  const bool flushed = output.good();
+  output.close();
+  return flushed && !output.fail();
 }
 
 bool WriteBinaryFile(const std::filesystem::path& path, const std::vector<uint8_t>& bytes) {

@@ -1,7 +1,7 @@
 From 6ffc07ce72a69de3a2a59110b0a06f5c2c751776 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 07:44:35 -0700
-Subject: [PATCH 70/97] Opt-in GPU timestamp census (WWE13_GPU_TIMING=1):
+Subject: [PATCH 070/149] Opt-in GPU timestamp census (WWE13_GPU_TIMING=1):
  per-category GPU ms/frame (scene draws, resolve, RT transfer, EDRAM dump,
  texture load, shared-memory copy, present) read after fence completion; off =
  no queries
@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/graphics/vulkan/gpu_timing.h
 
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 0002e2d..0c2a3e3 100644
+index 0002e2d6..0c2a3e35 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -50,6 +50,9 @@
@@ -70,7 +70,7 @@ index 0002e2d..0c2a3e3 100644
    static constexpr size_t kSubmissionWorkerDeferredCommandBufferCount = 3;
    bool async_submission_enabled_ = true;
 diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
-index 3d0fa3f..cf3df6b 100644
+index 3d0fa3fd..cf3df6b9 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
 +++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
 @@ -22,6 +22,7 @@
@@ -116,7 +116,7 @@ index 3d0fa3f..cf3df6b 100644
  
    const VulkanCommandProcessor& command_processor_;
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
-index d5ebabd..8083219 100644
+index d5ebabd7..8083219a 100644
 --- a/src/graphics/CMakeLists.txt
 +++ b/src/graphics/CMakeLists.txt
 @@ -52,6 +52,7 @@ set(REXGRAPHICS_SPIRV_SOURCES
@@ -133,7 +133,7 @@ index d5ebabd..8083219 100644
  endif()
 -
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 8b3ec98..1ef1bb6 100644
+index 8b3ec989..1ef1bb61 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -39,6 +39,7 @@
@@ -374,7 +374,7 @@ index 8b3ec98..1ef1bb6 100644
  
      if (cache_clear_requested_ && AwaitAllQueueOperationsCompletion()) {
 diff --git a/src/graphics/vulkan/deferred_command_buffer.cpp b/src/graphics/vulkan/deferred_command_buffer.cpp
-index b49e033..127984f 100644
+index b49e033b..127984fe 100644
 --- a/src/graphics/vulkan/deferred_command_buffer.cpp
 +++ b/src/graphics/vulkan/deferred_command_buffer.cpp
 @@ -32,11 +32,14 @@ void DeferredCommandBuffer::Reset() {
@@ -415,7 +415,7 @@ index b49e033..127984f 100644
  void DeferredCommandBuffer::CmdVkPipelineBarrier(
 diff --git a/src/graphics/vulkan/gpu_timing.cpp b/src/graphics/vulkan/gpu_timing.cpp
 new file mode 100644
-index 0000000..00db360
+index 00000000..00db360f
 --- /dev/null
 +++ b/src/graphics/vulkan/gpu_timing.cpp
 @@ -0,0 +1,451 @@
@@ -872,7 +872,7 @@ index 0000000..00db360
 +}  // namespace rex::graphics::vulkan
 diff --git a/src/graphics/vulkan/gpu_timing.h b/src/graphics/vulkan/gpu_timing.h
 new file mode 100644
-index 0000000..aebf543
+index 00000000..aebf543d
 --- /dev/null
 +++ b/src/graphics/vulkan/gpu_timing.h
 @@ -0,0 +1,163 @@
@@ -1040,7 +1040,7 @@ index 0000000..aebf543
 +
 +}  // namespace rex::graphics::vulkan
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index ec53003..ca70c46 100644
+index ec53003e..ca70c464 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -37,6 +37,8 @@
@@ -1095,7 +1095,7 @@ index ec53003..ca70c46 100644
  
    GetResolveCopyRectanglesToDump(dump_base, dump_row_length_used, dump_rows, dump_pitch,
 diff --git a/src/graphics/vulkan/shared_memory.cpp b/src/graphics/vulkan/shared_memory.cpp
-index 7264215..69ec35d 100644
+index 72642154..69ec35d8 100644
 --- a/src/graphics/vulkan/shared_memory.cpp
 +++ b/src/graphics/vulkan/shared_memory.cpp
 @@ -23,6 +23,8 @@
@@ -1116,7 +1116,7 @@ index 7264215..69ec35d 100644
    // ordering barrier.
    Use(Usage::kTransferDestination,
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index dec19d5..0302f88 100644
+index dec19d54..0302f881 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -33,6 +33,8 @@

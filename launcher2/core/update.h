@@ -76,6 +76,10 @@ namespace update_internal {
 bool HttpGetForTest(std::string_view url, double timeout_seconds, std::string* body);
 // True when the download URL is one the updater is willing to fetch.
 bool IsAllowedDownloadUrl(std::string_view url);
+// Parses a release using an explicit platform, so both asset choices can be tested on either host.
+std::optional<UpdateInfo> ParseLatestReleaseJsonForPlatform(std::string_view json,
+                                                            std::string_view current_version,
+                                                            bool windows_platform);
 }  // namespace update_internal
 
 }  // namespace wwe2k14::launcher

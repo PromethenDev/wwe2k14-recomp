@@ -1,0 +1,35 @@
+From 792d958709092e076151dcc929037873e349ca44 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:08:42 -0700
+Subject: [PATCH 123/149] xthread: log 'Too few processor cores' once instead
+ of on every affinity change
+
+On CPUs with fewer than 6 logical processors this warning was written ~300 times
+per second (~60 % of all log lines in GitHub #13/#39 logs). Owner approved 2026-10-24.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xthread.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index 3ba0863f..b2d85dca 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -974,7 +974,12 @@ void XThread::SetActiveCpu(uint8_t cpu_index) {
+       thread_->set_affinity_mask(uint64_t(1) << cpu_index);
+     }
+   } else {
+-    REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    // Logged once: this path runs on every guest affinity change (hundreds of times per second on 4-thread CPUs,
++    // ~60 % of all log lines in GitHub #13/#39 logs).
++    static std::atomic<bool> warned{false};
++    if (!warned.exchange(true)) {
++      REXSYS_WARN("Too few processor cores - scheduling will be wonky");
++    }
+   }
+ }
+ 
+-- 
+2.43.0
+

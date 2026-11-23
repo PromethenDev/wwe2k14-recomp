@@ -1,0 +1,194 @@
+From 61233bbb764c5c0ada62f8126ff1f08ad03277c2 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 06:52:52 -0800
+Subject: [PATCH 147/149] ui: detached overlay mode (backport of upstream
+ 4b8069a4) for the w13r renderer (owner OK 2026-11-22)
+
+ReXApp::OnCreateImmediateDrawer + presenter-less AppUIDrawContext: when the graphics system has no presenter (null
+GPU), the app supplies an ImmediateDrawer and the ImGui overlay stack draws through the app's renderer.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/rex_app.h       |  7 +++++++
+ include/rex/ui/presenter.h  | 26 +++++++++++++++++++++++---
+ src/ui/imgui_drawer.cpp     | 27 +++++++++++++++++++--------
+ src/ui/immediate_drawer.cpp |  4 +++-
+ src/ui/rex_app.cpp          | 14 ++++++++++++++
+ 5 files changed, 66 insertions(+), 12 deletions(-)
+
+diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
+index 6865a507..8e8a2a89 100644
+--- a/include/rex/rex_app.h
++++ b/include/rex/rex_app.h
+@@ -121,6 +121,13 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
+   /// Use for cleanup that depends on runtime resources.
+   virtual void OnGuestThreadExit(system::XThread* thread) { (void)thread; }
+ 
++  /// Detached overlay mode (backported 2026-11-22 from upstream 4b8069a4 "support detached overlay mode for apps with a
++  /// custom renderer"): when the graphics system has no presenter (no SDK graphics, or a null GPU) the app may return
++  /// an ImmediateDrawer that draws through its own renderer; the ImGui overlay stack (dialogs, menus) then uses it
++  /// presenter-less. CreateTexture must return nullptr while the app's GPU device is not up yet (the font atlas uploads
++  /// lazily on the first Draw). Default: no overlay in that mode.
++  virtual std::unique_ptr<ui::ImmediateDrawer> OnCreateImmediateDrawer() { return nullptr; }
++
+   // --- Accessors for subclass use ---
+   Runtime* runtime() const { return runtime_.get(); }
+   ui::Window* window() const { return window_.get(); }
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index c40f6cad..191f4fa7 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -66,7 +66,9 @@ class UIDrawContext {
+   UIDrawContext& operator=(const UIDrawContext& context) = delete;
+   virtual ~UIDrawContext() = default;
+ 
+-  Presenter& presenter() const { return presenter_; }
++  // The owning presenter, or null for app-driven (detached) contexts. Backend
++  // (presenter-driven) contexts always have one.
++  Presenter* presenter_or_null() const { return presenter_; }
+ 
+   // It's assumed that the render target size will be either equal to the size
+   // of the surface, or the render target will be stretched to cover the entire
+@@ -75,18 +77,36 @@ class UIDrawContext {
+   uint32_t render_target_height() const { return render_target_height_; }
+ 
+  protected:
++  // Presenter-driven ctor for backend (D3D12/Vulkan) contexts.
+   explicit UIDrawContext(Presenter& presenter, uint32_t render_target_width,
+                          uint32_t render_target_height)
+-      : presenter_(presenter),
++      : presenter_(&presenter),
++        render_target_width_(render_target_width),
++        render_target_height_(render_target_height) {}
++  // Presenter-less ctor for app-driven (detached) overlay contexts.
++  explicit UIDrawContext(uint32_t render_target_width, uint32_t render_target_height)
++      : presenter_(nullptr),
+         render_target_width_(render_target_width),
+         render_target_height_(render_target_height) {}
+ 
+  private:
+-  Presenter& presenter_;
++  Presenter* presenter_;  // null for app-driven (detached) contexts
+   uint32_t render_target_width_;
+   uint32_t render_target_height_;
+ };
+ 
++// Renderer-agnostic base for app-driven overlay rendering when the SDK runs
++// detached (config.graphics == nullptr). The app derives from this, adds its
++// own per-frame payload (e.g. the live command target and frame/submission
++// indices), constructs it each frame, hands it to ImGuiDrawer::Draw, and its
++// ImmediateDrawer pulls the payload out in Begin via static_cast<MyCtx&>(ctx).
++// Carries no presenter.
++class AppUIDrawContext : public UIDrawContext {
++ public:
++  AppUIDrawContext(uint32_t render_target_width, uint32_t render_target_height)
++      : UIDrawContext(render_target_width, render_target_height) {}
++};
++
+ struct RawImage {
+   uint32_t width = 0;
+   uint32_t height = 0;
+diff --git a/src/ui/imgui_drawer.cpp b/src/ui/imgui_drawer.cpp
+index 1036734b..f1500e6a 100644
+--- a/src/ui/imgui_drawer.cpp
++++ b/src/ui/imgui_drawer.cpp
+@@ -325,7 +325,6 @@ void ImGuiDrawer::SetPresenter(Presenter* new_presenter) {
+     if (!dialogs_.empty()) {
+       presenter_->RemoveUIDrawerFromUIThread(this);
+     }
+-    ImGuiIO& io = GetIO();
+   }
+   presenter_ = new_presenter;
+   if (presenter_) {
+@@ -344,20 +343,29 @@ void ImGuiDrawer::SetImmediateDrawer(ImmediateDrawer* new_immediate_drawer) {
+     font_texture_.reset();
+   }
+   immediate_drawer_ = new_immediate_drawer;
+-  if (immediate_drawer_) {
++  // Eagerly upload the font atlas only when a presenter is attached (SDK mode).
++  // In detached mode (presenter_ == nullptr) the app's renderer device may not
++  // exist yet at SetupPresentation, so defer to the idempotent Draw-time
++  // SetupFontTexture().
++  if (immediate_drawer_ && presenter_) {
+     SetupFontTexture();
+   }
+ }
+ 
+ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+-  // Drawing of anything is initiated by the presenter.
+-  assert_not_null(presenter_);
++  // Drawing is initiated by the presenter (SDK mode), or by the app in detached
++  // mode (config.graphics == nullptr), where there is no presenter.
+   if (!immediate_drawer_) {
+-    // A presenter has been attached, but an immediate drawer hasn't been
+-    // attached yet.
++    // A drawer target has been attached, but an immediate drawer hasn't yet.
+     return;
+   }
+ 
++  // In detached mode the app's immediate drawer (and the renderer device
++  // backing it) may only become usable on the first frame, after the guest
++  // creates its D3D device. Upload the font atlas lazily and idempotently;
++  // SetupFontTexture early-returns once font_texture_ is set.
++  SetupFontTexture();
++
+   if (dialogs_.empty()) {
+     return;
+   }
+@@ -405,8 +413,11 @@ void ImGuiDrawer::Draw(UIDrawContext& ui_draw_context) {
+   DetachIfLastDialogRemoved();
+ 
+   if (!dialogs_.empty()) {
+-    // Repaint (and handle input) continuously if still active.
+-    presenter_->RequestUIPaintFromUIThread();
++    // Repaint (and handle input) continuously if still active. In detached mode
++    // there is no presenter; the app drives repaint via its own present loop.
++    if (presenter_) {
++      presenter_->RequestUIPaintFromUIThread();
++    }
+   }
+ }
+ 
+diff --git a/src/ui/immediate_drawer.cpp b/src/ui/immediate_drawer.cpp
+index 9d7581ed..68b78d96 100644
+--- a/src/ui/immediate_drawer.cpp
++++ b/src/ui/immediate_drawer.cpp
+@@ -37,7 +37,9 @@ void ImmediateDrawer::SetPresenter(Presenter* new_presenter) {
+ 
+ void ImmediateDrawer::Begin(UIDrawContext& ui_draw_context, float coordinate_space_width,
+                             float coordinate_space_height) {
+-  assert_true(&ui_draw_context.presenter() == presenter_);
++  // App-driven contexts carry no presenter; presenter-driven backend contexts
++  // must match the drawer's presenter. presenter_or_null() is safe for both.
++  assert_true(ui_draw_context.presenter_or_null() == presenter_);
+   ui_draw_context_ = &ui_draw_context;
+   // In case of non-positive values (or NaNs) - use render target coordinates
+   // according to the contract of the function, and also for safety because
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 372841d9..99d6dc80 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -316,6 +316,20 @@ bool ReXApp::OnInitialize() {
+                               graphics_system->RequestFrameTrace();
+                             });
+     }
++  } else {
++    // Detached overlay mode (upstream 4b8069a4, backported 2026-11-22): no presenter, the app renders the guest itself
++    // and may supply a drawer; the overlay stack runs presenter-less and the app draws it into its own frames.
++    immediate_drawer_ = OnCreateImmediateDrawer();
++    if (immediate_drawer_) {
++      imgui_drawer_ = std::make_unique<rex::ui::ImGuiDrawer>(window_.get(), 64);
++      imgui_drawer_->SetPresenterAndImmediateDrawer(nullptr, immediate_drawer_.get());
++      OnCreateDialogs(imgui_drawer_.get());
++      runtime_->set_imgui_drawer(imgui_drawer_.get());
++      auto* input_sys = static_cast<rex::input::InputSystem*>(runtime_->input_system());
++      if (input_sys) {
++        input_sys->SetActiveCallback([]() { return !ImGui::GetIO().WantCaptureMouse; });
++      }
++    }
+   }
+ 
+   if (!REXCVAR_GET(replay_trace).empty()) {
+-- 
+2.43.0
+

@@ -1,7 +1,7 @@
 From 3345445b4c1793b330574eb6ce6565bdc97b18d0 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 13:21:46 -0700
-Subject: [PATCH 21/97] mmio: try the write-watch callback before reading
+Subject: [PATCH 021/149] mmio: try the write-watch callback before reading
  /proc/self/maps
 
 Every write-watch fault took the global critical region and then parsed the
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 14 insertions(+), 1 deletion(-)
 
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
-index cf03f1f..e698b0b 100644
+index cf03f1f3..e698b0be 100644
 --- a/src/system/mmio_handler.cpp
 +++ b/src/system/mmio_handler.cpp
 @@ -526,10 +526,23 @@ bool MMIOHandler::ExceptionCallback(arch::Exception* ex) {

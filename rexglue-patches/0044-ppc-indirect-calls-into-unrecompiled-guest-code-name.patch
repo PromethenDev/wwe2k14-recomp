@@ -1,7 +1,7 @@
 From ec8e27008c77439897c3078f48d5a5501cb8d63d Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 07:15:16 -0700
-Subject: [PATCH 44/97] ppc: indirect calls into unrecompiled guest code name
+Subject: [PATCH 044/149] ppc: indirect calls into unrecompiled guest code name
  themselves
 
 PPC_CALL_INDIRECT_FUNC: an empty function-table entry now goes to a cold
@@ -10,7 +10,7 @@ target and aborts (was: call through a null host pointer, crash with no guest
 context); WWE13_MISSING_FN_CONTINUE=1 returns instead (exploration only).
 Hit path: lookup + expected-taken null check. Unit test 2/2; ppc_tests
 1459/1459; Linux full-match gate PASS (out/linux-gate/mf-gate). Motivated by
-the 0x8328C3D0 lead (docs/gap-8328C3D0-20260925.md).
+the 0x8328C3D0 lead (docs/gap-8328C3D0-20260925.md). Implemented by Luna.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -22,7 +22,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 tests/unit/system/missing_function_test.cpp
 
 diff --git a/include/rex/ppc/context.h b/include/rex/ppc/context.h
-index 9a8e00e..0f324ad 100644
+index 9a8e00eb..0f324adb 100644
 --- a/include/rex/ppc/context.h
 +++ b/include/rex/ppc/context.h
 @@ -45,6 +45,12 @@ struct PPCContext;
@@ -58,7 +58,7 @@ index 9a8e00e..0f324ad 100644
  #endif  // PPC_CONFIG_H_INCLUDED
  
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index 75f8a94..83f138d 100644
+index 75f8a944..83f138d9 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -13,6 +13,9 @@
@@ -123,7 +123,7 @@ index 75f8a94..83f138d 100644
      .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
  
 diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
-index 7301944..9396408 100644
+index 7301944e..9396408e 100644
 --- a/tests/unit/CMakeLists.txt
 +++ b/tests/unit/CMakeLists.txt
 @@ -4,6 +4,7 @@ add_executable(unit_tests
@@ -136,7 +136,7 @@ index 7301944..9396408 100644
      core/fiber_test.cpp
 diff --git a/tests/unit/system/missing_function_test.cpp b/tests/unit/system/missing_function_test.cpp
 new file mode 100644
-index 0000000..720afb5
+index 00000000..720afb5c
 --- /dev/null
 +++ b/tests/unit/system/missing_function_test.cpp
 @@ -0,0 +1,61 @@

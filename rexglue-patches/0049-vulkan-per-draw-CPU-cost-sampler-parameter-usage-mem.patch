@@ -1,7 +1,7 @@
 From 88ddcb0278bf18a85e9fada0842e906f3faecbd7 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 18:55:25 -0700
-Subject: [PATCH 49/97] vulkan: per-draw CPU cost - sampler parameter/usage
+Subject: [PATCH 049/149] vulkan: per-draw CPU cost - sampler parameter/usage
  memos and a 16-entry texture descriptor set cache
 
 Live draw-stage timing (Linux, keep-60 entrances, rdtsc per IssueDraw stage): ~1050 ns/draw; bindings 258,
@@ -28,7 +28,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 110 insertions(+), 10 deletions(-)
 
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 703d7e0..0002e2d 100644
+index 703d7e0b..0002e2d6 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -398,9 +398,13 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -57,7 +57,7 @@ index 703d7e0..0002e2d 100644
  
    std::unique_ptr<VulkanSharedMemory> shared_memory_;
 diff --git a/include/rex/graphics/vulkan/texture_cache.h b/include/rex/graphics/vulkan/texture_cache.h
-index 04856ee..d05f21c 100644
+index 04856ee7..d05f21c4 100644
 --- a/include/rex/graphics/vulkan/texture_cache.h
 +++ b/include/rex/graphics/vulkan/texture_cache.h
 @@ -89,6 +89,8 @@ class VulkanTextureCache final : public TextureCache {
@@ -95,7 +95,7 @@ index 04856ee..d05f21c 100644
    std::pair<const SamplerParameters, Sampler>* sampler_used_last_ = nullptr;
    uint32_t custom_border_color_sampler_count_ = 0;
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index a129b6b..335f82c 100644
+index a129b6bd..335f82c9 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -110,6 +110,21 @@ bool DescriptorImageInfoEqual(const VkDescriptorImageInfo& left,
@@ -203,7 +203,7 @@ index a129b6b..335f82c 100644
        reuse.set =
            current_graphics_descriptor_sets_[SpirvShaderTranslator::kDescriptorSetTexturesPixel];
 diff --git a/src/graphics/vulkan/texture_cache.cpp b/src/graphics/vulkan/texture_cache.cpp
-index fc46bf8..dec19d5 100644
+index fc46bf81..dec19d54 100644
 --- a/src/graphics/vulkan/texture_cache.cpp
 +++ b/src/graphics/vulkan/texture_cache.cpp
 @@ -669,6 +669,26 @@ VkImageView VulkanTextureCache::GetActiveBindingOrNullImageView(uint32_t fetch_c

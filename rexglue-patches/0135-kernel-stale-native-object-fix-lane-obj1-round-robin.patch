@@ -1,0 +1,372 @@
+From f2a50da460464d34eb01dfa7e66a39bf5f62aab3 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 15:19:22 -0800
+Subject: [PATCH 135/149] kernel: stale native object fix (lane obj1):
+ round-robin free handle slots + GetNativeObject identity/type check with
+ re-init on stale (WWE2K14_OBJ_FIX=0 = old behaviour; owner OK for TEST builds
+ 2026-10-31)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/system/util/obj_fix.h | 53 +++++++++++++++++
+ include/rex/system/xobject.h      |  4 ++
+ src/system/util/object_table.cpp  | 44 ++++++++++-----
+ src/system/xobject.cpp            | 94 +++++++++++++++++++++++++++++--
+ tests/obj-fix-test.cpp            | 50 ++++++++++++++++
+ 5 files changed, 227 insertions(+), 18 deletions(-)
+ create mode 100644 include/rex/system/util/obj_fix.h
+ create mode 100644 tests/obj-fix-test.cpp
+
+diff --git a/include/rex/system/util/obj_fix.h b/include/rex/system/util/obj_fix.h
+new file mode 100644
+index 00000000..7890bbb5
+--- /dev/null
++++ b/include/rex/system/util/obj_fix.h
+@@ -0,0 +1,53 @@
++// WWE2K14 obj-fix: pure helpers (no SDK dependencies) so they can be host-tested.
++#pragma once
++#include <cstdint>
++
++namespace rex::system::util::objfix {
++
++// Round-robin slot search. `is_free(slot)` reports whether a slot is unused.
++// Scans from *last_free (never slot 0), wraps, and on success advances *last_free
++// to the slot AFTER the one handed out, so a just-freed number is not reused
++// until the table has cycled. Returns false when the table is full.
++template <typename IsFree>
++bool FindFreeSlotRoundRobin(IsFree&& is_free, uint32_t capacity, uint32_t* last_free,
++                            uint32_t* out_slot) {
++  if (capacity < 2) {
++    return false;
++  }
++  uint32_t slot = *last_free;
++  if (slot == 0 || slot >= capacity) {
++    slot = 1;
++  }
++  for (uint32_t scanned = 1; scanned < capacity; ++scanned) {  // slots 1..capacity-1
++    if (is_free(slot)) {
++      *out_slot = slot;
++      uint32_t next = slot + 1;
++      *last_free = (next >= capacity) ? 1 : next;
++      return true;
++    }
++    slot = slot + 1;
++    if (slot >= capacity) {
++      slot = 1;
++    }
++  }
++  return false;
++}
++
++// Decision for an "already initialised" guest dispatch header.
++//   object_exists   : handle resolved to an object
++//   type_ok         : object type equals the type expected for the header (or no expectation)
++//   expected_host   : host address of the guest struct the object was bound to (0 = unknown)
++//   native_host     : host address of the guest struct being looked up
++// Returns true when the object may be used, false when the header is stale.
++inline bool NativeObjectIdentityOk(bool object_exists, bool type_ok, uintptr_t expected_host,
++                                   uintptr_t native_host) {
++  if (!object_exists || !type_ok) {
++    return false;
++  }
++  if (expected_host != 0 && expected_host != native_host) {
++    return false;
++  }
++  return true;
++}
++
++}  // namespace rex::system::util::objfix
+diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
+index 4f2c4377..c1543aa5 100644
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -160,6 +160,9 @@ class XObject {
+ 
+   const std::string& name() const { return name_; }
+   uint32_t guest_object() const { return guest_object_ptr_; }
++  // obj-fix: host address of the guest dispatch header this object was lazily bound to
++  // (GetNativeObject first use). 0 when unknown.
++  uintptr_t bound_native_host() const { return bound_native_host_; }
+ 
+   // Has this object been created for use by the host?
+   // Host objects are persisted through reloads/etc.
+@@ -246,6 +249,7 @@ class XObject {
+   // if we allocated it!
+   uint32_t guest_object_ptr_ = 0;
+   bool allocated_guest_object_ = false;
++  uintptr_t bound_native_host_ = 0;
+ };
+ 
+ template <typename T>
+diff --git a/src/system/util/object_table.cpp b/src/system/util/object_table.cpp
+index b66cea94..31939ae0 100644
+--- a/src/system/util/object_table.cpp
++++ b/src/system/util/object_table.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #include <rex/cvar.h>
+@@ -17,6 +18,7 @@
+ #include <rex/memory.h>
+ #include <rex/stream.h>
+ #include <rex/system/util/object_table.h>
++#include <rex/system/util/obj_fix.h>
+ #include <rex/system/xobject.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/thread_state.h>
+@@ -56,21 +58,34 @@ void ObjectTable::Reset() {
+ }
+ 
+ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
+-  // Find a free slot.
+-  uint32_t slot = last_free_entry_;
+-  uint32_t scan_count = 0;
+-  while (scan_count < table_capacity_) {
+-    ObjectTableEntry& entry = table_[slot];
+-    if (!entry.object) {
+-      *out_slot = slot;
++  static const bool obj_fix = [] {
++    const char* v = std::getenv("WWE2K14_OBJ_FIX");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  if (obj_fix) {
++    // Round-robin: a freed handle number is not handed out again until the table cycles,
++    // so stale guest KEVENT headers cannot alias a newly opened object.
++    if (util::objfix::FindFreeSlotRoundRobin([this](uint32_t s) { return table_[s].object == nullptr; },
++                                             table_capacity_, &last_free_entry_, out_slot)) {
+       return X_STATUS_SUCCESS;
+     }
+-    scan_count++;
+-    slot = (slot + 1) % table_capacity_;
+-    if (slot == 0) {
+-      // Never allow 0 handles.
++  } else {
++    // Find a free slot.
++    uint32_t slot = last_free_entry_;
++    uint32_t scan_count = 0;
++    while (scan_count < table_capacity_) {
++      ObjectTableEntry& entry = table_[slot];
++      if (!entry.object) {
++        *out_slot = slot;
++        return X_STATUS_SUCCESS;
++      }
+       scan_count++;
+-      slot++;
++      slot = (slot + 1) % table_capacity_;
++      if (slot == 0) {
++        // Never allow 0 handles.
++        scan_count++;
++        slot++;
++      }
+     }
+   }
+ 
+@@ -81,8 +96,11 @@ X_STATUS ObjectTable::FindFreeSlot(uint32_t* out_slot) {
+   }
+ 
+   // Never allow 0 handles.
+-  slot = ++last_free_entry_;
++  uint32_t slot = ++last_free_entry_;
+   *out_slot = slot;
++  if (obj_fix) {
++    last_free_entry_ = (slot + 1 >= table_capacity_) ? 1 : slot + 1;
++  }
+ 
+   return X_STATUS_SUCCESS;
+ }
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index cf7ec7b9..c9e7e4c3 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -9,11 +9,19 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
+ #include <limits>
++#include <mutex>
++#include <set>
++#include <utility>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
++#include <rex/logging.h>
+ #include <rex/stream.h>
++#include <rex/system/util/obj_fix.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/util/string_utils.h>  // For TranslateAnsiStringAddress
+ #include <rex/system/xobject.h>
+@@ -30,6 +38,57 @@
+ 
+ namespace rex::system {
+ 
++namespace {
++bool ObjFixEnabled() {
++  static const bool enabled = [] {
++    const char* v = std::getenv("WWE2K14_OBJ_FIX");
++    return v == nullptr || std::strcmp(v, "0") != 0;
++  }();
++  return enabled;
++}
++
++// Expected XObject::Type for a dispatch header type; false when there is no expectation.
++bool ExpectedTypeForHeader(int32_t t, XObject::Type* out) {
++  switch (t) {
++    case 0:
++    case 1:
++      *out = XObject::Type::Event;
++      return true;
++    case 2:
++      *out = XObject::Type::Mutant;
++      return true;
++    case 5:
++      *out = XObject::Type::Semaphore;
++      return true;
++    case 6:
++      *out = XObject::Type::Thread;
++      return true;
++    case 8:
++    case 9:
++      *out = XObject::Type::Timer;
++      return true;
++    default:
++      return false;
++  }
++}
++
++void LogStale(void* native_ptr, uint32_t handle, int32_t as_type, bool exists, uint32_t actual_type,
++                uintptr_t bound) {
++  static std::mutex mutex;
++  static std::set<std::pair<uintptr_t, uint32_t>> reported;
++  static uint64_t count = 0;
++  std::lock_guard<std::mutex> lock(mutex);
++  ++count;
++  if (!reported.emplace(reinterpret_cast<uintptr_t>(native_ptr), handle).second) {
++    return;
++  }
++  REXLOG_WARN("[obj-fix] stale native object host_ptr={:#x} handle={:#x} header_type={} object={} "
++              "actual_type={} bound_host={:#x} -> re-initialising (total_stale={})",
++              reinterpret_cast<uintptr_t>(native_ptr), handle, as_type, exists ? "other" : "gone",
++              actual_type, bound, count);
++}
++}  // namespace
++
+ XObject::XObject(Type type) : kernel_state_(nullptr), pointer_ref_count_(1), type_(type) {
+   handles_.reserve(10);
+ }
+@@ -398,13 +457,37 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
+ 
+   if (header->wait_list_flink == kXObjSignature) {
+     // Already initialized.
+-    // TODO: assert if the type of the object != as_type
+     uint32_t handle = header->wait_list_blink;
+     auto object = kernel_state->object_table()->LookupObject<XObject>(handle);
+-
+-    // TODO(benvanik): assert nothing has been changed in the struct.
+-    return object;
+-  } else {
++    if (!ObjFixEnabled()) {
++      return object;
++    }
++    XObject::Type expected_type = XObject::Type::Undefined;
++    bool has_expectation = ExpectedTypeForHeader(as_type, &expected_type);
++    bool type_ok = !has_expectation || (object && object->type() == expected_type);
++    // Identity: the object must be bound to THIS guest struct. Objects created through
++    // CreateNative/SetNativePointer carry guest_object(); lazily bound ones carry
++    // bound_native_host_. Unknown (0) is accepted (e.g. restored from a save).
++    uintptr_t expected_host = 0;
++    if (object) {
++      if (object->guest_object()) {
++        expected_host = reinterpret_cast<uintptr_t>(
++            kernel_state->memory()->TranslateVirtual(object->guest_object()));
++      } else {
++        expected_host = object->bound_native_host();
++      }
++    }
++    if (rex::system::util::objfix::NativeObjectIdentityOk(
++            object != nullptr, type_ok, expected_host, reinterpret_cast<uintptr_t>(native_ptr))) {
++      // TODO(benvanik): assert nothing has been changed in the struct.
++      return object;
++    }
++    LogStale(native_ptr, handle, as_type, object != nullptr,
++             object ? static_cast<uint32_t>(object->type()) : 0, expected_host);
++    // Stale header: fall through and treat it as first use (fresh native object built from the
++    // header's current state) so the guest's signal is not lost.
++  }
++  {
+     // First use, create new.
+     // https://www.nirsoft.net/kernel_struct/vista/KOBJECTS.html
+     XObject* object = nullptr;
+@@ -451,6 +534,7 @@ object_ref<XObject> XObject::GetNativeObject(KernelState* kernel_state, void* na
+     // Stash pointer in struct.
+     // FIXME: This assumes the object contains a dispatch header (some don't!)
+     StashHandle(header, object->handle());
++    object->bound_native_host_ = reinterpret_cast<uintptr_t>(native_ptr);
+ 
+     return object_ref<XObject>(object);
+   }
+diff --git a/tests/obj-fix-test.cpp b/tests/obj-fix-test.cpp
+new file mode 100644
+index 00000000..c2c7fe13
+--- /dev/null
++++ b/tests/obj-fix-test.cpp
+@@ -0,0 +1,50 @@
++#include <cstdio>
++#include <vector>
++#include "rex/system/util/obj_fix.h"
++using namespace rex::system::util::objfix;
++static int fails = 0;
++#define CHECK(c) do { if (!(c)) { std::printf("FAIL line %d: %s\n", __LINE__, #c); ++fails; } } while (0)
++
++int main() {
++  const uint32_t cap = 16;
++  std::vector<bool> used(cap, false);
++  auto is_free = [&](uint32_t s) { return !used[s]; };
++  uint32_t last = 0, slot = 0;
++
++  // first alloc is never 0
++  CHECK(FindFreeSlotRoundRobin(is_free, cap, &last, &slot)); CHECK(slot == 1); used[slot] = true;
++  // free + alloc does not give the same number back
++  used[1] = false;
++  CHECK(FindFreeSlotRoundRobin(is_free, cap, &last, &slot)); CHECK(slot == 2); used[2] = true;
++  // fill the table; slot 0 stays untouched
++  uint32_t n = 0;
++  while (FindFreeSlotRoundRobin(is_free, cap, &last, &slot)) { CHECK(slot != 0 && slot < cap); used[slot] = true; ++n; }
++  CHECK(n == 14);  // slots 3..15 then wrapped to freed 1
++  CHECK(used[1] && !used[0]);
++  // wrap: free slot 5, last is after 15 -> wraps to 1.. and finds 5
++  used[5] = false; used[9] = false;
++  CHECK(FindFreeSlotRoundRobin(is_free, cap, &last, &slot)); CHECK(slot == 5); used[5] = true;
++  // freed 5 again: next alloc must prefer 9 (rotation), not 5
++  used[5] = false;
++  CHECK(FindFreeSlotRoundRobin(is_free, cap, &last, &slot)); CHECK(slot == 9); used[9] = true;
++  CHECK(FindFreeSlotRoundRobin(is_free, cap, &last, &slot)); CHECK(slot == 5); used[5] = true;
++  // full -> false
++  CHECK(!FindFreeSlotRoundRobin(is_free, cap, &last, &slot));
++  // a handle freed is not reused for a whole cycle
++  std::vector<bool> u2(cap, false); last = 0;
++  auto f2 = [&](uint32_t s) { return !u2[s]; };
++  FindFreeSlotRoundRobin(f2, cap, &last, &slot); u2[slot] = true; uint32_t first = slot; u2[slot] = false;
++  for (uint32_t i = 0; i < cap - 2; ++i) { FindFreeSlotRoundRobin(f2, cap, &last, &slot); CHECK(slot != first); u2[slot] = false; }
++  // degenerate
++  CHECK(!FindFreeSlotRoundRobin(is_free, 1, &last, &slot));
++  CHECK(!FindFreeSlotRoundRobin(is_free, 0, &last, &slot));
++
++  // identity
++  CHECK(NativeObjectIdentityOk(true, true, 0x1000, 0x1000));
++  CHECK(NativeObjectIdentityOk(true, true, 0, 0x1000));       // unknown binding accepted
++  CHECK(!NativeObjectIdentityOk(false, true, 0x1000, 0x1000));  // handle gone
++  CHECK(!NativeObjectIdentityOk(true, false, 0x1000, 0x1000));  // wrong type (XFile)
++  CHECK(!NativeObjectIdentityOk(true, true, 0x2000, 0x1000));   // bound to another struct
++  std::printf(fails ? "FAILED %d\n" : "obj-fix-test OK\n", fails);
++  return fails != 0;
++}
+-- 
+2.43.0
+

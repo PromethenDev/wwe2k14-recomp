@@ -79,12 +79,39 @@ std::vector<GpuInfo> ListGpus() {
           {"stub:780m", "AMD Radeon 780M Graphics", true, 1}};
 }
 
-Recommendation RecommendedSettings(const std::vector<GpuInfo>& gpus) {
+Recommendation RecommendedSettings(const std::vector<GpuInfo>& gpus, unsigned) {
   Recommendation recommendation;
   recommendation.settings = Settings{};
   recommendation.reason = gpus.empty() ? "Settings picked automatically" : gpus.front().name + " · discrete graphics";
   return recommendation;
 }
+
+Recommendation RecommendedSettingsFor(const std::vector<GpuInfo>& gpus, const std::string& gpu_id, unsigned) {
+  if (!gpu_id.empty()) {
+    const auto selected = std::find_if(gpus.begin(), gpus.end(), [&](const GpuInfo& gpu) { return gpu.id == gpu_id; });
+    if (selected != gpus.end()) return RecommendedSettings({*selected});
+  }
+  return RecommendedSettings(gpus);
+}
+
+Settings ApplyRecommendedSettings(const Settings& current, const Settings& recommended, bool replace_manual) {
+  Settings result = current;
+  const bool legacy_manual = current.explicit_choice && !current.recommendation_fields_tracked;
+  if (replace_manual || !(legacy_manual || current.manual_resolution)) result.resolution = recommended.resolution;
+  if (replace_manual || !(legacy_manual || current.manual_picture_size)) result.picture_size = recommended.picture_size;
+  if (replace_manual || !(legacy_manual || current.manual_frame_rate)) result.frame_rate = recommended.frame_rate;
+  if (replace_manual || !(legacy_manual || current.manual_xbox_frame_rate)) {
+    result.xbox_frame_rate = recommended.xbox_frame_rate;
+  }
+  if (replace_manual) {
+    result.recommendation_fields_tracked = true;
+    result.manual_resolution = result.manual_picture_size = result.manual_frame_rate = result.manual_xbox_frame_rate = false;
+    result.explicit_choice = false;
+  }
+  return result;
+}
+
+std::vector<RecommendationChange> CompareRecommendedSettings(const Settings&, const Settings&) { return {}; }
 
 GameFilesStatus CheckGameFolder(const fs::path& folder, const Paths&) { return ReadyStatus(folder); }
 

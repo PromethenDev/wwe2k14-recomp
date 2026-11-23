@@ -1,7 +1,7 @@
 From eabbe5832760e39842b3ba9b422e4fb2178e4fe2 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 07:24:17 -0700
-Subject: [PATCH 79/97] edram_tiles=4096: patch the prebuilt Vulkan
+Subject: [PATCH 079/149] edram_tiles=4096: patch the prebuilt Vulkan
  resolve/clear modules' EDRAM modulus (2048 -> 4096 tiles); D3D12 refuses 4096
 
 The prebuilt resolve/clear compute shaders wrap EDRAM addresses at 2048 tiles (OpUMod 2621440 unscaled /
@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 110 insertions(+), 9 deletions(-)
 
 diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
-index 13576d8..70d0b03 100644
+index 13576d83..70d0b033 100644
 --- a/src/graphics/d3d12/render_target_cache.cpp
 +++ b/src/graphics/d3d12/render_target_cache.cpp
 @@ -174,6 +174,16 @@ bool D3D12RenderTargetCache::Initialize() {
@@ -40,7 +40,7 @@ index 13576d8..70d0b03 100644
      path_ = Path::kHostRenderTargets;
    } else if (REXCVAR_GET(render_target_path_d3d12) == "rov") {
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 443e528..45778a9 100644
+index 443e5281..45778a95 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -15,6 +15,7 @@

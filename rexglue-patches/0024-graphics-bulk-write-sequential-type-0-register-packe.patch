@@ -1,7 +1,8 @@
 From 1ecfa21bb0d0e8ba723e4ea226330e4591199b21 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 16:21:09 -0700
-Subject: [PATCH 24/97] graphics: bulk-write sequential type-0 register packets
+Subject: [PATCH 024/149] graphics: bulk-write sequential type-0 register
+ packets
 
 ExecutePacketType0 called the virtual WriteRegister once per dword, even for
 long sequential runs of shader constants. Sequential packets now go through
@@ -21,7 +22,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 13 insertions(+), 4 deletions(-)
 
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 59d12fc..2749a56 100644
+index 59d12fc5..2749a56e 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -13,6 +13,7 @@

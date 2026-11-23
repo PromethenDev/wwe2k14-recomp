@@ -1,7 +1,7 @@
 From aded2273ef9e281b8c258ec7be0b23b32ebe59d3 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 18:56:04 -0700
-Subject: [PATCH 63/97] mnk: keyboard-only by default - new mnk_mouse cvar
+Subject: [PATCH 063/149] mnk: keyboard-only by default - new mnk_mouse cvar
  (default off) gates cursor capture/hide/re-centre and mouse input; right
  stick on I/J/K/L, LT=Z, RT=Control, RS press=M (no mouse defaults)
 
@@ -12,7 +12,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 36 insertions(+), 10 deletions(-)
 
 diff --git a/include/rex/input/mnk/mnk_input_driver.h b/include/rex/input/mnk/mnk_input_driver.h
-index 2483b99..13fca03 100644
+index 2483b99a..13fca03d 100644
 --- a/include/rex/input/mnk/mnk_input_driver.h
 +++ b/include/rex/input/mnk/mnk_input_driver.h
 @@ -69,6 +69,7 @@ class MnkInputDriver final : public InputDriver,
@@ -24,7 +24,7 @@ index 2483b99..13fca03 100644
  
    // Keystroke queue
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index b005782..3410a0c 100644
+index b0057828..3410a0cf 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
 @@ -27,6 +27,7 @@

@@ -1,0 +1,149 @@
+From 034cceb7ae74ab482e2ddbe161296ec155f119fd Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 14:01:46 -0700
+Subject: [PATCH 122/149] memory: opt-in zero of newly committed physical-heap
+ pages (WWE2K14_ZERO_PHYSICAL_ON_ALLOC, default off)
+
+WWE 2K14 writes some textures sparsely (only non-zero DXT blocks) into freshly
+allocated physical memory and relies on it being zero; reused ranges kept the
+previous owner's bytes (card G35: hard rope-shadow lines on the ring mat).
+Zeroes only writable pages committed by PhysicalHeap::Alloc/AllocRange; host
+test [g35] in heap_allocation_test. Owner approved 2026-10-24.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xmemory.cpp                     | 36 ++++++++++++++++++++
+ tests/unit/memory/heap_allocation_test.cpp | 38 ++++++++++++++++++++++
+ 2 files changed, 74 insertions(+)
+
+diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
+index 6002cb01..214e1a96 100644
+--- a/src/system/xmemory.cpp
++++ b/src/system/xmemory.cpp
+@@ -86,6 +86,13 @@ REXCVAR_DEFINE_BOOL(protect_on_release, false, "Memory",
+ 
+ REXCVAR_DEFINE_BOOL(scribble_heap, false, "Memory", "Scribble 0xCD into all allocated heap memory");
+ 
++// WWE 2K14 card G35 (PROPOSED, owner decision): zero physical pages when they are committed by a physical-heap
++// allocation (MmAllocatePhysicalMemoryEx, physical NtAllocateVirtualMemory). The heaps never decommit host memory
++// (Release/Decommit keep the bytes), so a reused physical range still holds the previous owner's data; WWE 2K14 fills
++// some textures sparsely (only non-zero DXT blocks) and relies on zeroed memory (WM V rope-shadow decal, G35).
++REXCVAR_DEFINE_BOOL(WWE2K14_ZERO_PHYSICAL_ON_ALLOC, false, "Memory",
++                    "Zero physical-heap pages on allocation (G35: titles that rely on zero-filled new memory)");
++
+ namespace rex::memory {
+ 
+ uint32_t get_page_count(uint32_t value, uint32_t page_size, uint32_t page_size_shift) {
+@@ -1837,6 +1844,31 @@ void PhysicalHeap::Initialize(memory::Memory* memory, uint8_t* membase, HeapType
+   system_page_flags_.resize((system_page_count_ + 63) / 64);
+ }
+ 
++// Card G35 (proposed): zero a freshly committed physical range (no-op unless the cvar is set or for reserve-only).
++// Called only from Alloc/AllocRange, whose pages were free (state 0) before this allocation.
++static void ZeroCommittedPhysical(memory::Memory* mem, uint32_t address, uint32_t size, uint32_t allocation_type,
++                                  uint32_t protect) {
++  // Only writable commits: a no-access / read-only commit cannot be written by the host either (lane g35-zero zv1:
++  // a PAGE_NOACCESS physical commit at BFC90000 faulted in this memset at boot). Same rule as scribble_heap.
++  if (!REXCVAR_GET(WWE2K14_ZERO_PHYSICAL_ON_ALLOC) || !(allocation_type & memory::kMemoryAllocationCommit) || !size ||
++      !(protect & memory::kMemoryProtectWrite)) {
++    return;
++  }
++  const auto t0 = std::chrono::steady_clock::now();
++  std::memset(mem->TranslateVirtual(address), 0, size);
++  const uint64_t ns = uint64_t(
++      std::chrono::duration_cast<std::chrono::nanoseconds>(std::chrono::steady_clock::now() - t0).count());
++  // Cost accounting (only when the cvar is on): a summary line per 64 MiB zeroed.
++  static std::atomic<uint64_t> total_bytes{0}, total_ns{0}, calls{0};
++  const uint64_t before = total_bytes.fetch_add(size);
++  total_ns += ns;
++  ++calls;
++  if ((before >> 26) != ((before + size) >> 26)) {
++    REXSYS_INFO("[g35-zero] zeroed {} MiB in {:.1f} ms over {} allocations (last {:08X}+{:X})",
++                (before + size) >> 20, total_ns.load() / 1e6, calls.load(), address, size);
++  }
++}
++
+ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_type,
+                          uint32_t protect, bool top_down, uint32_t* out_address) {
+   *out_address = 0;
+@@ -1869,6 +1901,7 @@ bool PhysicalHeap::Alloc(uint32_t size, uint32_t alignment, uint32_t allocation_
+     // TODO(benvanik): don't leak parent memory.
+     return false;
+   }
++  ZeroCommittedPhysical(memory_, address, size, allocation_type, protect);
+   *out_address = address;
+   return true;
+ }
+@@ -1899,6 +1932,8 @@ bool PhysicalHeap::AllocFixed(uint32_t base_address, uint32_t size, uint32_t ali
+     // TODO(benvanik): don't leak parent memory.
+     return false;
+   }
++  // No zeroing here: AllocFixed may commit pages that are already committed and in use (NtAllocateVirtualMemory
++  // MEM_COMMIT over a live range must keep its contents, as on Windows/Xbox). Alloc/AllocRange only pick free pages.
+ 
+   return true;
+ }
+@@ -1934,6 +1969,7 @@ bool PhysicalHeap::AllocRange(uint32_t low_address, uint32_t high_address, uint3
+     // TODO(benvanik): don't leak parent memory.
+     return false;
+   }
++  ZeroCommittedPhysical(memory_, address, size, allocation_type, protect);
+   *out_address = address;
+   return true;
+ }
+diff --git a/tests/unit/memory/heap_allocation_test.cpp b/tests/unit/memory/heap_allocation_test.cpp
+index 07800317..45d4657e 100644
+--- a/tests/unit/memory/heap_allocation_test.cpp
++++ b/tests/unit/memory/heap_allocation_test.cpp
+@@ -11,6 +11,9 @@
+ 
+ #include <catch2/catch_test_macros.hpp>
+ 
++#include <cstring>
++
++#include <rex/cvar.h>
+ #include <rex/system/xmemory.h>
+ 
+ #include "test_memory.h"
+@@ -742,3 +745,38 @@ TEST_CASE("LookupHeapByType selects correct heap", "[memory][heap]") {
+     // Should be vC0000000 heap
+   }
+ }
++
++// Card G35: WWE2K14_ZERO_PHYSICAL_ON_ALLOC zeroes reused physical pages on allocation (off: old bytes survive).
++static bool G35AllocWriteFreeRealloc(rex::memory::Memory& memory, uint32_t* out_first_word, uint32_t* out_nonzero) {
++  auto* heap = static_cast<rex::memory::PhysicalHeap*>(MutableHeap(memory.LookupHeap(0xE0000000)));
++  const uint32_t kType = rex::memory::kMemoryAllocationReserve | rex::memory::kMemoryAllocationCommit;
++  const uint32_t kProt = rex::memory::kMemoryProtectRead | rex::memory::kMemoryProtectWrite;
++  uint32_t a = 0;
++  if (!heap->AllocRange(0xE0000000, 0xFFCFFFFF, 0x4000, 4096, kType, kProt, true, &a)) return false;
++  std::memset(memory.TranslateVirtual(a), 0xAB, 0x4000);
++  heap->Release(a, nullptr);
++  uint32_t b = 0;
++  if (!heap->AllocRange(0xE0000000, 0xFFCFFFFF, 0x4000, 4096, kType, kProt, true, &b)) return false;
++  const uint8_t* p = memory.TranslateVirtual(b);
++  uint32_t nz = 0;
++  for (uint32_t i = 0; i < 0x4000; ++i) nz += p[i] != 0;
++  std::memcpy(out_first_word, p, 4);
++  *out_nonzero = nz;
++  const bool same = a == b;
++  heap->Release(b, nullptr);
++  return same;
++}
++
++TEST_CASE("G35 zero physical pages on allocation", "[memory][physical][g35]") {
++  auto& memory = GetTestMemory();
++  uint32_t w = 0, nz = 0;
++  REQUIRE(rex::cvar::SetFlagByName("WWE2K14_ZERO_PHYSICAL_ON_ALLOC", "false"));
++  REQUIRE(G35AllocWriteFreeRealloc(memory, &w, &nz));  // same range handed out again (top-down, no other allocs)
++  CHECK(w == 0xABABABABu);
++  CHECK(nz == 0x4000u);
++  REQUIRE(rex::cvar::SetFlagByName("WWE2K14_ZERO_PHYSICAL_ON_ALLOC", "true"));
++  REQUIRE(G35AllocWriteFreeRealloc(memory, &w, &nz));
++  CHECK(w == 0u);
++  CHECK(nz == 0u);
++  REQUIRE(rex::cvar::SetFlagByName("WWE2K14_ZERO_PHYSICAL_ON_ALLOC", "false"));
++}
+-- 
+2.43.0
+

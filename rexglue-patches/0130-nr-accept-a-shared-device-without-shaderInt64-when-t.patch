@@ -1,0 +1,32 @@
+From 5c8801e0c34dd73513adc5b5c7fef916fdac00b7 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 28 Oct 2026 17:18:55 -0700
+Subject: [PATCH 130/149] nr: accept a shared device without shaderInt64 when
+ the game runs the 32-bit-constants shader set (WWE2K14_NR_CONSTANTS32=1; card
+ G56, GitHub #56, owner OK 2026-10-29)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/graphics/vulkan/command_processor.cpp | 6 +++++-
+ 1 file changed, 5 insertions(+), 1 deletion(-)
+
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 7724d102..7c0a5a81 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -9204,7 +9204,11 @@ bool GetNrVulkanDevice(NrVulkanDevice* out) {
+   std::memcpy(out->device_luid, p.deviceLUID, sizeof(out->device_luid));
+   out->wait_external_present_slot = NrWaitExternalPresentSlot;
+   out->external_present_slot_context = g_nr_vulkan_command_processor;
+-  return nr.shader_int64 && nr.buffer_device_address && nr.descriptor_indexing;
++  // WWE 2K14 card G56 (GitHub #56, owner OK 2026-10-29): GPUs without shaderInt64 (Intel Gen11) can run the native
++  // renderer with its 32-bit-constants shader set; the game sets WWE2K14_NR_CONSTANTS32=1 only when that set is loaded.
++  const char* constants32 = std::getenv("WWE2K14_NR_CONSTANTS32");
++  const bool int64_free_ok = constants32 && std::strcmp(constants32, "1") == 0;
++  return (nr.shader_int64 || int64_free_ok) && nr.buffer_device_address && nr.descriptor_indexing;
+ }
+ 
+ void SetNrExternalSwap(const NrExternalSwap& swap) {
+-- 
+2.43.0
+

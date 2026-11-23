@@ -1,7 +1,7 @@
 From e6ebc241883e52983e9280e50466021498920805 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 18:59:56 -0700
-Subject: [PATCH 50/97] shared memory: no heap allocation or sort per
+Subject: [PATCH 050/149] shared memory: no heap allocation or sort per
  RequestRange(s) call
 
 RequestRange (index buffers, changed vertex buffers, every draw) went through RequestRanges, which built a new
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 11 insertions(+), 6 deletions(-)
 
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index 208359b..abb870f 100644
+index 208359b5..abb870f1 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -179,6 +179,7 @@ class SharedMemory {
@@ -28,7 +28,7 @@ index 208359b..abb870f 100644
    // GPU-written memory downloading for traces. <Start address, length>.
    std::vector<std::pair<uint32_t, uint32_t>> trace_download_ranges_;
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index 078ddd0..2b5b4db 100644
+index 078ddd04..2b5b4db2 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -431,8 +431,10 @@ bool SharedMemory::RequestRanges(const std::pair<uint32_t, uint32_t>* ranges, si

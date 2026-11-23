@@ -1,8 +1,8 @@
 From 591170195331a86febb91f28a3f93bf13cee5100 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 10:25:09 -0700
-Subject: [PATCH 60/97] debug_ui cvar (default off): gate built-in overlays, F9
- trace, console log capture and the Windows console; player-visible window
+Subject: [PATCH 060/149] debug_ui cvar (default off): gate built-in overlays,
+ F9 trace, console log capture and the Windows console; player-visible window
  title via GetWindowTitle()
 
 Release profile for WWE '13 Classic v1.0 (game ACTION-LIST D1). Wine gate PASS (d1-release-rerun, exe dad8aa66).
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 35 insertions(+), 21 deletions(-)
 
 diff --git a/include/rex/rex_app.h b/include/rex/rex_app.h
-index e644ab3..6865a50 100644
+index e644ab38..6865a507 100644
 --- a/include/rex/rex_app.h
 +++ b/include/rex/rex_app.h
 @@ -91,6 +91,9 @@ class ReXApp : public ui::WindowedApp, public ui::WindowListener, public ui::Win
@@ -29,7 +29,7 @@ index e644ab3..6865a50 100644
    virtual void OnCreateDialogs(ui::ImGuiDrawer* drawer) { (void)drawer; }
  
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index f99e258..43a8813 100644
+index f99e258a..43a8813a 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -55,6 +55,9 @@ REXCVAR_DEFINE_INT32(replay_trace_repeat, 1, "GPU",
@@ -130,7 +130,7 @@ index f99e258..43a8813 100644
  
    if (!REXCVAR_GET(replay_trace).empty()) {
 diff --git a/src/ui/windowed_app_main_win.cpp b/src/ui/windowed_app_main_win.cpp
-index 33092ba..3f223c4 100644
+index 33092ba0..3f223c46 100644
 --- a/src/ui/windowed_app_main_win.cpp
 +++ b/src/ui/windowed_app_main_win.cpp
 @@ -23,6 +23,7 @@

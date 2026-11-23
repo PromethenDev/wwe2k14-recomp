@@ -1,7 +1,7 @@
 From a62c013e516702c204d8aa774f386b873aff9f02 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 17:23:00 -0700
-Subject: [PATCH 08/97] graphics/ui: build the trace player and add
+Subject: [PATCH 008/149] graphics/ui: build the trace player and add
  --replay_trace
 
 Compiles trace_reader.cpp and trace_player.cpp (fixing a malformed snappy
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 57 insertions(+), 1 deletion(-)
 
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
-index a977ca5..d5ebabd 100644
+index a977ca5d..d5ebabd7 100644
 --- a/src/graphics/CMakeLists.txt
 +++ b/src/graphics/CMakeLists.txt
 @@ -20,6 +20,8 @@ set(REXGRAPHICS_SYSTEM_SOURCES
@@ -31,7 +31,7 @@ index a977ca5..d5ebabd 100644
      pipeline/texture/util.cpp
      util/draw_extent_estimator.cpp
 diff --git a/src/graphics/trace_reader.cpp b/src/graphics/trace_reader.cpp
-index 86eb1b3..83348e5 100644
+index 86eb1b37..83348e5a 100644
 --- a/src/graphics/trace_reader.cpp
 +++ b/src/graphics/trace_reader.cpp
 @@ -21,7 +21,7 @@
@@ -44,7 +44,7 @@ index 86eb1b3..83348e5 100644
  namespace rex::graphics {
  
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 25f26e8..293d9fa 100644
+index 25f26e8f..293d9fa1 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -21,6 +21,7 @@

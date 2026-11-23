@@ -1,8 +1,8 @@
 From 08622cb831267d5064ec55a44619efa51e8bc5e4 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 13 Oct 2026 05:23:10 -0700
-Subject: [PATCH 99/99] close: hard exit via TerminateProcess on Windows (+ 2 s
- lock-free backstop) when shutdown is still running 3 s after the window
+Subject: [PATCH 099/149] close: hard exit via TerminateProcess on Windows (+ 2
+ s lock-free backstop) when shutdown is still running 3 s after the window
  closed
 
 Owner laptop 2026-10-13 (rc8): 'Window closing' + 'Execution complete' logged, no 'exiting now', process kept running in the background. _Exit/ExitProcess runs DLL_PROCESS_DETACH under the loader lock (a GPU driver DLL waiting on a thread frozen by TerminateTitle can block forever); the log call before it can also block on a lock held by a suspended guest thread. Wine: exits 3 s after WM_CLOSE.
@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 23 insertions(+), 1 deletion(-)
 
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index c13d462..ea655c1 100644
+index c13d462f..ea655c1e 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -14,6 +14,9 @@

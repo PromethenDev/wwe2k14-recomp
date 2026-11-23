@@ -1,7 +1,7 @@
 From 415a408af1ec6b8a02127af9cfabfcbf4a830896 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 15:35:54 -0700
-Subject: [PATCH 57/97] kernel: W5 stub audit - device info reports
+Subject: [PATCH 057/149] kernel: W5 stub audit - device info reports
  FILE_DEVICE_DISK; XCTD keeps INVALID_PARAMETER with caller diagnostics;
  XNetLogonGetTitleID and XAM message dispatch log caller once
 
@@ -32,7 +32,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 tests/unit/kernel/xboxkrnl_io_info_test.cpp
 
 diff --git a/src/kernel/xam/xam_misc.cpp b/src/kernel/xam/xam_misc.cpp
-index d163fb1..be59a94 100644
+index d163fb15..be59a947 100644
 --- a/src/kernel/xam/xam_misc.cpp
 +++ b/src/kernel/xam/xam_misc.cpp
 @@ -11,6 +11,56 @@
@@ -102,7 +102,7 @@ index d163fb1..be59a94 100644
  XAM_EXPORT_STUB(__imp__XNetLogonGetUserPrivileges);
  XAM_EXPORT_STUB(__imp__XNetLogonInitOverrideInfo);
 diff --git a/src/kernel/xam/xam_msg.cpp b/src/kernel/xam/xam_msg.cpp
-index d15d5a7..9428422 100644
+index d15d5a77..9428422b 100644
 --- a/src/kernel/xam/xam_msg.cpp
 +++ b/src/kernel/xam/xam_msg.cpp
 @@ -20,31 +20,79 @@
@@ -202,7 +202,7 @@ index d15d5a7..9428422 100644
  }
  
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-index d73269d..487c587 100644
+index d73269d5..487c5872 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 @@ -12,6 +12,8 @@
@@ -231,7 +231,7 @@ index d73269d..487c587 100644
  }
  
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
-index 80e430c..17e01c4 100644
+index 80e430cf..17e01c48 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
 @@ -23,6 +23,7 @@
@@ -308,7 +308,7 @@ index 80e430c..17e01c4 100644
      default: {
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info_helpers.h b/src/kernel/xboxkrnl/xboxkrnl_io_info_helpers.h
 new file mode 100644
-index 0000000..5780959
+index 00000000..57809597
 --- /dev/null
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io_info_helpers.h
 @@ -0,0 +1,20 @@
@@ -333,7 +333,7 @@ index 0000000..5780959
 +
 +}  // namespace rex::kernel::xboxkrnl::internal
 diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
-index a5b9fa9..79dc730 100644
+index a5b9fa94..79dc7309 100644
 --- a/tests/unit/CMakeLists.txt
 +++ b/tests/unit/CMakeLists.txt
 @@ -7,6 +7,7 @@ add_executable(unit_tests
@@ -346,7 +346,7 @@ index a5b9fa9..79dc730 100644
      core/sha256_test.cpp
 diff --git a/tests/unit/kernel/xboxkrnl_io_info_test.cpp b/tests/unit/kernel/xboxkrnl_io_info_test.cpp
 new file mode 100644
-index 0000000..2563109
+index 00000000..25631091
 --- /dev/null
 +++ b/tests/unit/kernel/xboxkrnl_io_info_test.cpp
 @@ -0,0 +1,13 @@

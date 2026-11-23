@@ -97,6 +97,11 @@ Paths ResolvePaths(const fs::path& launcher_executable) {
 #else
   result.game_exe = result.exe_dir / "wwe2k14";
 #endif
+  // Native renderer test package: the game is in bin\ next to the launcher (shaders\, logs\, userdata\ beside it).
+  if (fs::exists(result.exe_dir / "bin" / result.game_exe.filename(), error)) {
+    result.game_exe = result.exe_dir / "bin" / result.game_exe.filename();
+  }
+  error.clear();
   result.settings_file = result.exe_dir / "wwe2k14-enhanced.ini";
   result.userdata_dir = result.exe_dir / "userdata";
   result.music_dir = result.exe_dir / "music";

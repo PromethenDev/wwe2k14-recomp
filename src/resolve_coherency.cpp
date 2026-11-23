@@ -4,8 +4,8 @@
 // (the character-select tile showed a corrupted image and "overall 76" next to it). The game renders the portrait
 // on the GPU, resolves it into guest memory and then untiles it on the CPU with the XDK function XGUntileSurface.
 // The recompiled GPU keeps resolve results in its own buffer (readback_resolve=none), so the CPU untiled stale
-// memory. This is the same defect WWE '13 hit with its retro-attire textures;
-// the fix is the same: read back only the tiled source surface of each untile instead of every resolve
+// memory. This is the same defect WWE '13 hit with its retro-attire textures (wwe13-recomp/src/resolve_coherency.cpp,
+// cycle 213); the fix is the same: read back only the tiled source surface of each untile instead of every resolve
 // (readback_resolve=full halves the in-ring frame rate).
 //
 // sub_82CFD800 is the 2K14 copy of WWE '13's sub_82BE19E8 (identical prologue and body; neighbours line up at a

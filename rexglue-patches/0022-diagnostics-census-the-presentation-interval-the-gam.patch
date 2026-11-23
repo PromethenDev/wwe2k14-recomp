@@ -1,8 +1,8 @@
 From c5b7cc236d9640ebdb5d25732cca07d2c45d7abe Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 13:55:36 -0700
-Subject: [PATCH 22/97] diagnostics: census the presentation interval the game
- requests per swap
+Subject: [PATCH 022/149] diagnostics: census the presentation interval the
+ game requests per swap
 
 With WWE13_RATE_CENSUS=1, VdSwap reads the guest D3D device (VdGlobalDevice)
 field +0x36B0 that the WWE 13 swap path uses as its presentation interval and
@@ -17,7 +17,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 36 insertions(+)
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
-index 8ad8d4b..ffde2f5 100644
+index 8ad8d4b9..ffde2f5f 100644
 --- a/include/rex/diagnostics/rate_census.h
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -58,6 +58,8 @@ std::optional<Sample> GetLatestSample();
@@ -30,7 +30,7 @@ index 8ad8d4b..ffde2f5 100644
  void RecordGpuBusyStart();
  void RecordGpuBusyEnd();
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index 0cb8648..3caab3e 100644
+index 0cb8648a..3caab3e3 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -80,6 +80,7 @@ struct Counters {
@@ -94,7 +94,7 @@ index 0cb8648..3caab3e 100644
  
  void RecordGpuBusyStart() { g_rate_census.RecordGpuBusyStart(); }
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_video.cpp b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
-index c1c6c76..353ea9a 100644
+index c1c6c76b..353ea9a0 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_video.cpp
 @@ -447,6 +447,9 @@ ppc_u32_result_t VdRetrainEDRAM_entry(ppc_unknown_t unk0, ppc_unknown_t unk1, pp

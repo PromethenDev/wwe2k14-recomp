@@ -1,7 +1,7 @@
 From 4509bff63b91117d2847b19992fc4f4f8614d72d Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 21:05:40 -0700
-Subject: [PATCH 26/97] vulkan: asynchronous submission worker for non-swap
+Subject: [PATCH 026/149] vulkan: asynchronous submission worker for non-swap
  submissions
 
 The GPU command thread replayed the deferred command buffer into a
@@ -33,7 +33,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 470 insertions(+), 74 deletions(-)
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
-index 5146000..00ea740 100644
+index 5146000b..00ea7401 100644
 --- a/include/rex/diagnostics/rate_census.h
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -25,11 +25,13 @@ struct Sample {
@@ -70,7 +70,7 @@ index 5146000..00ea740 100644
  // vertex (true) or pixel (false) shader stage.
  void RecordDescriptorSetUpdate(bool is_vertex, bool reused);
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index d5e9099..bfd90dd 100644
+index d5e90991..bfd90ddb 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -11,13 +11,17 @@
@@ -152,7 +152,7 @@ index d5e9099..bfd90dd 100644
    std::vector<SparseBufferBind> sparse_buffer_binds_;
    // SparseBufferBind converted to VkSparseBufferMemoryBindInfo to this buffer
 diff --git a/include/rex/graphics/vulkan/deferred_command_buffer.h b/include/rex/graphics/vulkan/deferred_command_buffer.h
-index 9d2a848..3d0fa3f 100644
+index 9d2a8485..3d0fa3fd 100644
 --- a/include/rex/graphics/vulkan/deferred_command_buffer.h
 +++ b/include/rex/graphics/vulkan/deferred_command_buffer.h
 @@ -29,6 +29,7 @@ class DeferredCommandBuffer {
@@ -164,7 +164,7 @@ index 9d2a848..3d0fa3f 100644
  
    // render_pass_begin->pNext of all barriers must be null.
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index 763308c..c20e43a 100644
+index 763308c0..c20e43a4 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -81,6 +81,8 @@ struct Counters {
@@ -294,7 +294,7 @@ index 763308c..c20e43a 100644
    g_rate_census.RecordDescriptorSetUpdate(is_vertex, reused);
  }
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 23dafe6..286ccd0 100644
+index 23dafe6b..286ccd03 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -94,6 +94,14 @@ bool TextureDescriptorSetReuseEnabled() {

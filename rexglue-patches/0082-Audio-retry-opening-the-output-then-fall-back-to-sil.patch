@@ -1,7 +1,7 @@
 From f3ed54a17af3e98d592275a0d8ee913f54f9ead4 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 20:29:40 -0700
-Subject: [PATCH 82/97] Audio: retry opening the output, then fall back to
+Subject: [PATCH 082/149] Audio: retry opening the output, then fall back to
  silent real-time output instead of hanging
 
 WWE13 2026-10-01: SDL_InitSubSystem(AUDIO) failed ('Could not setup connection to PulseAudio', a streaming host
@@ -16,7 +16,7 @@ connects first try.
  2 files changed, 44 insertions(+)
 
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
-index b79e5bc..9239d78 100644
+index b79e5bc6..9239d787 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
 +++ b/include/rex/audio/sdl/sdl_audio_driver.h
 @@ -43,6 +43,9 @@ class SDLAudioDriver : public AudioDriver {
@@ -30,7 +30,7 @@ index b79e5bc..9239d78 100644
    uint8_t sdl_device_channels_ = 0;
  
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 6c299e3..562f7ce 100644
+index 6c299e38..562f7ce5 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
 @@ -92,6 +92,47 @@ bool SDLAudioDriver::Initialize() {

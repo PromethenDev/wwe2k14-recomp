@@ -1,6 +1,6 @@
 // Linux wall-clock thread sampler ported from WWE 13's src/thread_profiler.cpp.
 // The WWE13_* environment/API names and WWE13TP1 binary format intentionally
-// remain stable for external profiling scripts.
+// remain compatible with ../wwe13-recomp/tools/thread-profile.py.
 
 #include "thread_profiler.h"
 
@@ -72,7 +72,7 @@ std::mutex g_lifecycle;
 // been presenting, the worker dumps the most recent SIGPROF stack of every
 // attached guest thread (host PCs) plus /proc/self/maps so the freeze can be
 // symbolized offline. Off unless the env var is set. This is the capture hook
-// kept for hang investigations on user machines.
+// kept for the owner's laptop runs (see docs/BUGHUNT-2K14.md R7 regression).
 std::atomic<bool> g_hang_dump_enabled{false};
 std::string g_hang_dump_path;
 
@@ -277,7 +277,13 @@ bool AttachThread(pid_t tid, const std::string& name, long interval_ns) {
   sev.sigev_notify = SIGEV_THREAD_ID;
   sev.sigev_signo = SIGPROF;
   sev._sigev_un._tid = tid;
-  if (timer_create(CLOCK_MONOTONIC, &sev, &ring->timer) != 0) {
+  // cpu1 lane: WWE13_THREAD_PROFILE_CPU=1 samples per thread CPU time instead of wall time (work and spin only).
+  static const bool cpu_clock = [] {
+    const char* e = std::getenv("WWE13_THREAD_PROFILE_CPU");
+    return e && *e == '1';
+  }();
+  const clockid_t profile_clock = cpu_clock ? clockid_t(((~uint32_t(tid)) << 3) | 6) : CLOCK_MONOTONIC;
+  if (timer_create(profile_clock, &sev, &ring->timer) != 0) {
     REXLOG_WARN("[wwe13-thread-profile] timer_create failed for tid {} ({})", tid, name);
     delete ring;
     return false;

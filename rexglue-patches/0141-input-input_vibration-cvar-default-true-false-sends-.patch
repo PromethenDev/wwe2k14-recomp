@@ -1,0 +1,38 @@
+From 96eaf4cb2085aeaf6d1e558a219797a0df104d52 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 8 Nov 2026 07:36:45 -0800
+Subject: [PATCH 141/149] input: input_vibration cvar (default true); false
+ sends the game's rumble requests as motors off (#102, owner OK 2026-11-08)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/input/input_system.cpp | 6 ++++++
+ 1 file changed, 6 insertions(+)
+
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 74c63ec9..2054a85a 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -27,6 +27,7 @@ REXCVAR_DEFINE_STRING(input_backend, "sdl", "Input", "Input backend: sdl, xinput
+     .allowed({"sdl", "xinput"});
+ 
+ REXCVAR_DEFINE_BOOL(guide_button, false, "Input", "Enable guide button pass-through");
++REXCVAR_DEFINE_BOOL(input_vibration, true, "Input", "Controller vibration (false: the game's rumble requests are sent as motors off)");
+ namespace rex::input {
+ 
+ InputSystem::InputSystem(rex::ui::Window* window) : window_(window) {}
+@@ -158,6 +159,11 @@ X_RESULT InputSystem::GetState(uint32_t user_index, X_INPUT_STATE* out_state) {
+ X_RESULT InputSystem::SetState(uint32_t user_index, X_INPUT_VIBRATION* vibration) {
+   SCOPE_profile_cpu_f("hid");
+ 
++  // Vibration off (launcher option, player request #102): keep the game's call and its result, but with motors off,
++  // so a pad that was already rumbling stops too.
++  X_INPUT_VIBRATION motors_off{};
++  if (vibration && !REXCVAR_GET(input_vibration)) vibration = &motors_off;
++
+   bool any_connected = false;
+   for (auto& driver : drivers_) {
+     X_RESULT result = driver->SetState(user_index, vibration);
+-- 
+2.43.0
+

@@ -4,10 +4,12 @@
 
 #include <algorithm>
 #include <array>
+#include <cctype>
 #include <cerrno>
 #include <cstring>
 #include <fstream>
 #include <limits>
+#include <map>
 #include <system_error>
 
 namespace wwe2k14::launcher {
@@ -268,6 +270,119 @@ Result ExtractDiscImage(const fs::path& iso, const fs::path& dest_folder,
     return fail("The disc image could not be extracted.");
   } catch (...) {
     return fail("The disc image could not be extracted.");
+  }
+}
+
+namespace {
+
+void IndexDiscEntries(const std::vector<internal::XdvdfsEntry>& entries,
+                      std::map<std::string, const internal::XdvdfsEntry*>* index) {
+  for (const auto& entry : entries) {
+    if (entry.directory) {
+      IndexDiscEntries(entry.children, index);
+      continue;
+    }
+    std::string key = entry.relative_path.generic_string();
+    std::transform(key.begin(), key.end(), key.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    index->emplace(std::move(key), &entry);
+  }
+}
+
+std::string LowerDiscPath(std::string path) {
+  std::replace(path.begin(), path.end(), '\\', '/');
+  std::transform(path.begin(), path.end(), path.begin(), [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+  return path;
+}
+
+}  // namespace
+
+std::vector<DiscImageFile> ListDiscImageFiles(const fs::path& iso) {
+  std::vector<DiscImageFile> files;
+  try {
+    internal::XdvdfsReader reader;
+    std::string error;
+    if (!reader.Open(iso, &error)) return files;
+    std::map<std::string, const internal::XdvdfsEntry*> index;
+    IndexDiscEntries(reader.root_entries(), &index);
+    for (const auto& [key, entry] : index) files.push_back({entry->relative_path.generic_string(), entry->size});
+  } catch (...) {
+    files.clear();
+  }
+  return files;
+}
+
+bool ReadDiscImageFile(const fs::path& iso, const std::string& relative_path, std::vector<uint8_t>* bytes) {
+  try {
+    internal::XdvdfsReader reader;
+    std::string error;
+    if (!bytes || !reader.Open(iso, &error)) return false;
+    std::map<std::string, const internal::XdvdfsEntry*> index;
+    IndexDiscEntries(reader.root_entries(), &index);
+    const auto found = index.find(LowerDiscPath(relative_path));
+    if (found == index.end()) return false;
+    bytes->assign(found->second->size, 0);
+    return bytes->empty() || reader.ReadRange(*found->second, 0, bytes->data(), bytes->size(), &error);
+  } catch (...) {
+    return false;
+  }
+}
+
+Result CopyDiscImageFiles(const fs::path& iso, const std::vector<std::string>& relative_paths, const fs::path& dest_folder,
+                          const ProgressFn& progress, const CancelFlag* cancel) {
+  const auto stopped = [&] { return cancel && cancel->load(std::memory_order_relaxed); };
+  try {
+    internal::XdvdfsReader reader;
+    std::string error;
+    if (!reader.Open(iso, &error)) return Result::Fail(error.empty() ? "This is not an Xbox 360 disc image." : error);
+    std::map<std::string, const internal::XdvdfsEntry*> index;
+    IndexDiscEntries(reader.root_entries(), &index);
+    std::vector<const internal::XdvdfsEntry*> entries;
+    uint64_t total = 0;
+    for (const std::string& relative : relative_paths) {
+      const auto found = index.find(LowerDiscPath(relative));
+      if (found == index.end()) return Result::Fail("The disc image has no " + relative + ". Nothing has been changed.");
+      entries.push_back(found->second);
+      total += found->second->size;
+    }
+    uint64_t done = 0;
+    for (const internal::XdvdfsEntry* entry : entries) {
+      if (stopped()) return Result::Fail("Cancelled. Nothing has been changed.");
+      fs::path output;
+      if (!MakeSafeOutputPath(dest_folder, entry->relative_path, &output))
+        return Result::Fail("The disc image contains an unsafe path. Nothing has been changed.");
+      std::error_code filesystem_error;
+      fs::create_directories(output.parent_path(), filesystem_error);
+      std::ofstream stream(output, std::ios::binary | std::ios::trunc);
+      if (filesystem_error || !stream) return Result::Fail("Could not write " + output.string() + ". Nothing has been changed.");
+      const std::string label = "Reading " + entry->relative_path.generic_string() + " from the disc image…";
+      const bool copied = reader.CopyFile(*entry, stream, [&](uint64_t chunk) {
+        done += chunk;
+        if (progress) progress(done, total, label);
+        return !stopped();
+      }, &error);
+      stream.close();
+      if (!copied || !stream) {
+        if (stopped()) return Result::Fail("Cancelled. Nothing has been changed.");
+        return Result::Fail("Could not copy " + entry->relative_path.generic_string() + " out of the disc image" +
+                            (error.empty() ? std::string() : " (" + error + ")") + ". Nothing has been changed.");
+      }
+    }
+    return Result::Ok();
+  } catch (const std::exception&) {
+    return Result::Fail("The disc image could not be read. Nothing has been changed.");
+  }
+}
+
+uint32_t ReadDiscImageTitleId(const fs::path& iso) {
+  try {
+    internal::XdvdfsReader reader;
+    std::string error;
+    if (!reader.Open(iso, &error)) return 0;
+    const internal::XdvdfsEntry* xex = reader.FindRootFile("default.xex");
+    uint32_t title_id = 0;
+    return xex && ReadXexTitleId(reader, *xex, &title_id) ? title_id : 0;
+  } catch (...) {
+    return 0;
   }
 }
 

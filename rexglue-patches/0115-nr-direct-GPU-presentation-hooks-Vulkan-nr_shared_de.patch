@@ -1,0 +1,273 @@
+From 03376c02e2c050e4a2a42386751e0634a4810356 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 10:26:06 -0700
+Subject: [PATCH 115/149] nr: direct GPU presentation hooks (Vulkan):
+ nr_shared_device features, GetNrVulkanDevice, SetNrExternalSwap
+
+- cvar nr_shared_device (default off): enable shaderInt64, bufferDeviceAddress and the
+  descriptor-indexing features (when supported) for a renderer drawing on this device.
+- GetNrVulkanDevice: instance, device, graphics+compute queue 0 and its lock.
+- SetNrExternalSwap: the next IssueSwap presents the given image view instead of
+  loading the guest frontbuffer texture. Inert unless called.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit e9e80ba909abf1032c7385d9854df7434f5d538d)
+---
+ include/rex/graphics/draw_observer.h      | 31 +++++++++
+ include/rex/ui/vulkan/device.h            | 10 +++
+ src/graphics/vulkan/command_processor.cpp | 77 ++++++++++++++++++++++-
+ src/ui/vulkan/vulkan_device.cpp           | 48 ++++++++++++++
+ 4 files changed, 163 insertions(+), 3 deletions(-)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 4a4c415b..6977aa6c 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -75,6 +75,37 @@ void RequestNrCompareFrame();
+ // playback runs there). Inert until called; never called by the SDK itself.
+ void NrInvalidateGuestRange(uint32_t physical_base, uint32_t length);
+ 
++// Direct GPU presentation (WWE '13 nr, Vulkan backend only). Handles are passed as opaque pointers so this
++// header needs no Vulkan headers.
++// GetNrVulkanDevice: the emulator's Vulkan instance / device and its graphics+compute queue 0, for a renderer
++// that draws on the same device (plume adopting it). The queue must only be used under queue_mutex (the
++// emulator's own lock for that queue). False when the backend is not Vulkan, the device does not exist yet, or
++// the cvar nr_shared_device did not enable the features the renderer needs (the flags say which).
++struct NrVulkanDevice {
++  void* instance = nullptr;                // VkInstance
++  void* get_instance_proc_addr = nullptr;  // PFN_vkGetInstanceProcAddr of the loader the instance came from
++  uint32_t api_version = 0;
++  void* physical_device = nullptr;  // VkPhysicalDevice
++  void* device = nullptr;           // VkDevice
++  uint32_t queue_family = 0;
++  void* queue = nullptr;  // VkQueue
++  void* queue_mutex = nullptr;  // std::recursive_mutex*
++  bool shader_int64 = false, buffer_device_address = false, descriptor_indexing = false;
++  bool scalar_block_layout = false, null_descriptor = false, sampler_mirror_clamp_to_edge = false;
++  bool geometry_shader = false;
++};
++bool GetNrVulkanDevice(NrVulkanDevice* out);
++// SetNrExternalSwap: the next IssueSwap presents this image view (an image on the device above, in
++// SHADER_READ_ONLY_OPTIMAL layout, written by work submitted to the queue above before the swap) instead of the
++// guest frontbuffer texture (texture fetch 0 from guest memory). Consumed by that one swap. width / height are the
++// frontbuffer's guest size; needs_rb_swap as VulkanTextureCache::RequestSwapTexture reports it for the view.
++struct NrExternalSwap {
++  uint64_t image_view = 0;  // VkImageView
++  uint32_t width = 0, height = 0;
++  bool needs_rb_swap = false;
++};
++void SetNrExternalSwap(const NrExternalSwap& swap);
++
+ // Not thread-safe to change while the GPU thread runs; set before the title or replay starts.
+ void SetDrawObserver(DrawObserver* observer);
+ DrawObserver* GetDrawObserver();
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 947817fe..653e6f45 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -20,6 +20,16 @@ namespace rex {
+ namespace ui {
+ namespace vulkan {
+ 
++// [wwe13 nr] cvar nr_shared_device: the native renderer (plume) draws on this device and hands its frame to the
++// presenter (direct GPU presentation). What CreateIfSupported enabled for it (all false when not requested).
++struct NrSharedDeviceFeatures {
++  bool requested = false;
++  bool shader_int64 = false;
++  bool buffer_device_address = false;
++  bool descriptor_indexing = false;  // runtime arrays, partially bound, variable count, update after bind
++};
++const NrSharedDeviceFeatures& GetNrSharedDeviceFeatures();
++
+ class VulkanDevice {
+  public:
+   static std::unique_ptr<VulkanDevice> CreateIfSupported(const VulkanInstance* vulkan_instance,
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index cb60d968..98c251bb 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -44,6 +44,8 @@
+ #include <rex/graphics/pipeline/shader/spirv_translator.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/vulkan/command_processor.h>
++#include <rex/graphics/draw_observer.h>
++#include <rex/ui/vulkan/device.h>
+ #include "gpu_timing.h"
+ #include <rex/system/mmio_handler.h>
+ #include <rex/graphics/vulkan/pipeline_cache.h>
+@@ -92,6 +94,11 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+                     "device (falls back to render passes otherwise)")
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
++namespace rex::graphics {
++void NrSetVulkanDevice(ui::vulkan::VulkanDevice* device);
++bool NrTakeExternalSwap(NrExternalSwap* out);
++}  // namespace rex::graphics
++
+ namespace rex::graphics::vulkan {
+ 
+ namespace {
+@@ -1499,6 +1506,7 @@ bool VulkanCommandProcessor::SetupContext() {
+   const VkDevice device = vulkan_device->device();
+   const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
+   gpu_timing_->Initialize(vulkan_device, vulkan_device->queue_family_graphics_compute());
++  NrSetVulkanDevice(GetVulkanDevice());  // [wwe13 nr] direct GPU presentation (GetNrVulkanDevice)
+ 
+   // The unconditional inclusion of the vertex shader stage also covers the case
+   // of manual index / factor buffer fetch (the system constants and the shared
+@@ -3087,9 +3095,21 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+   xenos::TextureFormat frontbuffer_format;
+   bool swap_source_needs_rb_swap = false;
+-  VkImageView swap_texture_view = texture_cache_->RequestSwapTexture(
+-      frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+-      &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
++  VkImageView swap_texture_view = VK_NULL_HANDLE;
++  NrExternalSwap nr_swap;
++  if (NrTakeExternalSwap(&nr_swap)) {
++    // [wwe13 nr] Direct GPU presentation: the native renderer's image of the frontbuffer (same device and queue,
++    // already in SHADER_READ_ONLY_OPTIMAL) replaces the guest frontbuffer texture; guest memory is not read.
++    swap_texture_view = reinterpret_cast<VkImageView>(nr_swap.image_view);
++    frontbuffer_width_scaled = frontbuffer_width_unscaled = nr_swap.width;
++    frontbuffer_height_scaled = frontbuffer_height_unscaled = nr_swap.height;
++    frontbuffer_format = xenos::TextureFormat::k_8_8_8_8;
++    swap_source_needs_rb_swap = nr_swap.needs_rb_swap;
++  } else {
++    swap_texture_view = texture_cache_->RequestSwapTexture(
++        frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
++        &frontbuffer_width_unscaled, &frontbuffer_height_unscaled, &swap_source_needs_rb_swap);
++  }
+   if (swap_texture_view == VK_NULL_HANDLE) {
+     REXGPU_ERROR("XELOG_GPU PRESENT: swap_texture_view=NULL");
+     return;
+@@ -8846,3 +8866,54 @@ uint32_t VulkanCommandProcessor::WriteTransientTextureBindings(
+ }
+ 
+ }  // namespace rex::graphics::vulkan
++
++namespace rex::graphics {
++namespace {
++// [wwe13 nr] Direct GPU presentation state (GPU command processor thread only).
++ui::vulkan::VulkanDevice* g_nr_vulkan_device = nullptr;  // set by VulkanCommandProcessor::SetupContext
++NrExternalSwap g_nr_external_swap;
++bool g_nr_external_swap_set = false;
++}  // namespace
++
++void NrSetVulkanDevice(ui::vulkan::VulkanDevice* device) { g_nr_vulkan_device = device; }
++
++bool GetNrVulkanDevice(NrVulkanDevice* out) {
++  const ui::vulkan::VulkanDevice* d = g_nr_vulkan_device;
++  const ui::vulkan::NrSharedDeviceFeatures& nr = ui::vulkan::GetNrSharedDeviceFeatures();
++  if (!d || !out || !nr.requested) return false;
++  const uint32_t family = d->queue_family_graphics_compute();
++  if (family >= d->queue_families().size() || d->queue_families()[family].queues.empty()) return false;
++  ui::vulkan::VulkanDevice::Queue& queue = *d->queue_families()[family].queues[0];
++  const ui::vulkan::VulkanInstance* instance = d->vulkan_instance();
++  out->instance = instance->instance();
++  out->get_instance_proc_addr = reinterpret_cast<void*>(instance->functions().vkGetInstanceProcAddr);
++  out->api_version = instance->api_version();
++  out->physical_device = d->physical_device();
++  out->device = d->device();
++  out->queue_family = family;
++  out->queue = queue.queue;
++  out->queue_mutex = &queue.mutex;
++  out->shader_int64 = nr.shader_int64;
++  out->buffer_device_address = nr.buffer_device_address;
++  out->descriptor_indexing = nr.descriptor_indexing;
++  const ui::vulkan::VulkanDevice::Properties& p = d->properties();
++  out->scalar_block_layout = p.scalarBlockLayout;
++  out->null_descriptor = p.nullDescriptor;
++  out->sampler_mirror_clamp_to_edge = p.samplerMirrorClampToEdge;
++  out->geometry_shader = p.geometryShader;
++  return nr.shader_int64 && nr.buffer_device_address && nr.descriptor_indexing;
++}
++
++void SetNrExternalSwap(const NrExternalSwap& swap) {
++  g_nr_external_swap = swap;
++  g_nr_external_swap_set = swap.image_view != 0;
++}
++
++bool NrTakeExternalSwap(NrExternalSwap* out) {
++  if (!g_nr_external_swap_set) return false;
++  *out = g_nr_external_swap;
++  g_nr_external_swap_set = false;
++  return true;
++}
++
++}  // namespace rex::graphics
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 14504370..30a00678 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -21,6 +21,9 @@
+ #include <rex/platform.h>
+ #include <rex/ui/vulkan/device.h>
+ 
++REXCVAR_DEFINE_BOOL(nr_shared_device, false, "GPU",
++                    "[wwe13 nr] Enable the Vulkan 1.2 features the native renderer needs to draw on the emulator's "
++                    "device (shaderInt64, bufferDeviceAddress, descriptor indexing) for direct GPU presentation");
+ REXCVAR_DEFINE_BOOL(vulkan_stencil_export, true, "UI/Vulkan",
+                     "Use VK_EXT_shader_stencil_export when available (false = per-bit stencil fallback, as on "
+                     "NVIDIA; WWE13 BUG-7 A/B for the Radeon 780M)");
+@@ -45,6 +48,11 @@ namespace rex {
+ namespace ui {
+ namespace vulkan {
+ 
++namespace {
++NrSharedDeviceFeatures g_nr_shared_device_features;
++}  // namespace
++const NrSharedDeviceFeatures& GetNrSharedDeviceFeatures() { return g_nr_shared_device_features; }
++
+ template <typename Structure, VkStructureType StructureType>
+ struct VulkanFeatures {
+   Structure supported = {StructureType};
+@@ -732,6 +740,46 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     }
+   }
+ 
++  // [wwe13 nr] nr_shared_device: features plume and the native renderer's shaders need on this device (64-bit integer
++  // and physical-storage-buffer pointers for the constant loads, bindless descriptor arrays with update-after-bind).
++  // Only features the device supports are enabled; the native renderer checks GetNrSharedDeviceFeatures().
++  if (REXCVAR_GET(nr_shared_device) && with_gpu_emulation && get_physical_device_properties2_supported &&
++      properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
++    NrSharedDeviceFeatures& nr = g_nr_shared_device_features;
++    nr = {};
++    nr.requested = true;
++    enabled_features.shaderInt64 = supported_features.shaderInt64;
++    nr.shader_int64 = supported_features.shaderInt64 != VK_FALSE;
++    const VkPhysicalDeviceVulkan12Features& s = features_1_2.supported;
++    VkPhysicalDeviceVulkan12Features& e = features_1_2.enabled;
++    e.bufferDeviceAddress = s.bufferDeviceAddress;
++    nr.buffer_device_address = s.bufferDeviceAddress != VK_FALSE;
++    e.descriptorIndexing = s.descriptorIndexing;
++    e.shaderInputAttachmentArrayDynamicIndexing = s.shaderInputAttachmentArrayDynamicIndexing;
++    e.shaderUniformTexelBufferArrayDynamicIndexing = s.shaderUniformTexelBufferArrayDynamicIndexing;
++    e.shaderStorageTexelBufferArrayDynamicIndexing = s.shaderStorageTexelBufferArrayDynamicIndexing;
++    e.shaderUniformBufferArrayNonUniformIndexing = s.shaderUniformBufferArrayNonUniformIndexing;
++    e.shaderSampledImageArrayNonUniformIndexing = s.shaderSampledImageArrayNonUniformIndexing;
++    e.shaderStorageBufferArrayNonUniformIndexing = s.shaderStorageBufferArrayNonUniformIndexing;
++    e.shaderStorageImageArrayNonUniformIndexing = s.shaderStorageImageArrayNonUniformIndexing;
++    e.descriptorBindingUniformBufferUpdateAfterBind = s.descriptorBindingUniformBufferUpdateAfterBind;
++    e.descriptorBindingSampledImageUpdateAfterBind = s.descriptorBindingSampledImageUpdateAfterBind;
++    e.descriptorBindingStorageImageUpdateAfterBind = s.descriptorBindingStorageImageUpdateAfterBind;
++    e.descriptorBindingStorageBufferUpdateAfterBind = s.descriptorBindingStorageBufferUpdateAfterBind;
++    e.descriptorBindingUniformTexelBufferUpdateAfterBind = s.descriptorBindingUniformTexelBufferUpdateAfterBind;
++    e.descriptorBindingStorageTexelBufferUpdateAfterBind = s.descriptorBindingStorageTexelBufferUpdateAfterBind;
++    e.descriptorBindingUpdateUnusedWhilePending = s.descriptorBindingUpdateUnusedWhilePending;
++    e.descriptorBindingPartiallyBound = s.descriptorBindingPartiallyBound;
++    e.descriptorBindingVariableDescriptorCount = s.descriptorBindingVariableDescriptorCount;
++    e.runtimeDescriptorArray = s.runtimeDescriptorArray;
++    nr.descriptor_indexing = s.runtimeDescriptorArray && s.descriptorBindingPartiallyBound &&
++                             s.descriptorBindingVariableDescriptorCount &&
++                             s.descriptorBindingSampledImageUpdateAfterBind &&
++                             s.descriptorBindingStorageBufferUpdateAfterBind;
++    REXLOG_INFO("[nr] shared device features: shaderInt64={} bufferDeviceAddress={} descriptorIndexing={}",
++                nr.shader_int64, nr.buffer_device_address, nr.descriptor_indexing);
++  }
++
+ #undef XE_UI_VULKAN_LIMIT
+ #undef XE_UI_VULKAN_ENUM_LIMIT
+ #undef XE_UI_VULKAN_FEATURE
+-- 
+2.43.0
+

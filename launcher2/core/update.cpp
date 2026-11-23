@@ -703,7 +703,8 @@ bool InstallFile(const std::vector<uint8_t>& bytes, const fs::path& destination,
 bool IsRunningLauncherName(const fs::path& destination) {
 #ifdef _WIN32
   const std::string name = LowerAscii(PathToUtf8(destination.filename()));
-  return name == "wwe 2k14 launcher.exe" || name == "wwe2k14-launcher.exe";
+  // The launcher keeps its LZX library loaded, and Windows will not overwrite a loaded file: move it aside the same way.
+  return name == "wwe 2k14 launcher.exe" || name == "wwe2k14-launcher.exe" || name == "wwe2k14_lzx.dll";
 #else
   (void)destination;
   return false;  // Linux replaces a running binary by rename, atomically.
@@ -742,6 +743,22 @@ bool MapEntry(const Paths& paths, const fs::path& root_parent, const std::string
   return true;
 }
 
+const Json* SelectReleaseAsset(const Json& assets, bool windows_platform) {
+  if (assets.type != Json::Type::kArray) return nullptr;
+  for (const Json& asset : assets.items) {
+    if (asset.type != Json::Type::kObject) continue;
+    const std::string lowered = LowerAscii(JsonString(asset, "name"));
+    const bool platform_name =
+        windows_platform ? lowered.starts_with("wwe2k14-recomp") && !lowered.starts_with("linux-")
+                         : lowered.starts_with("linux-wwe2k14-recomp");
+    if (!platform_name || !lowered.ends_with(".zip") || lowered.find("source") != std::string::npos) {
+      continue;
+    }
+    return &asset;
+  }
+  return nullptr;
+}
+
 }  // namespace
 
 // --------------------------------------------------------------------------------------------- public
@@ -772,7 +789,8 @@ bool IsNeverTouchPath(std::string_view relative_path) {
   return false;
 }
 
-std::optional<UpdateInfo> ParseLatestReleaseJson(std::string_view json, std::string_view current_version) {
+std::optional<UpdateInfo> update_internal::ParseLatestReleaseJsonForPlatform(
+    std::string_view json, std::string_view current_version, bool windows_platform) {
   Json root;
   JsonParser parser(json);
   if (!parser.Parse(root) || root.type != Json::Type::kObject) return std::nullopt;
@@ -787,20 +805,12 @@ std::optional<UpdateInfo> ParseLatestReleaseJson(std::string_view json, std::str
   }
   info.notes = JsonString(root, "body");
 
-  if (const Json* assets = root.Find("assets"); assets != nullptr && assets->type == Json::Type::kArray) {
-    for (const Json& asset : assets->items) {
-      if (asset.type != Json::Type::kObject) continue;
-      const std::string name = JsonString(asset, "name");
-      const std::string lowered = LowerAscii(name);
-      if (!lowered.ends_with(".zip") || !lowered.starts_with("wwe2k14-recomp") ||
-          lowered.find("source") != std::string::npos) {
-        continue;
-      }
-      info.name = name;
-      info.url = JsonString(asset, "browser_download_url");
-      info.size = JsonUint64(asset, "size");
-      info.sha256 = ParseDigest(JsonString(asset, "digest"));
-      break;
+  if (const Json* assets = root.Find("assets"); assets != nullptr) {
+    if (const Json* asset = SelectReleaseAsset(*assets, windows_platform); asset != nullptr) {
+      info.name = JsonString(*asset, "name");
+      info.url = JsonString(*asset, "browser_download_url");
+      info.size = JsonUint64(*asset, "size");
+      info.sha256 = ParseDigest(JsonString(*asset, "digest"));
     }
   }
 
@@ -809,6 +819,15 @@ std::optional<UpdateInfo> ParseLatestReleaseJson(std::string_view json, std::str
   info.available = !draft && !prerelease && !info.url.empty() && !info.sha256.empty() &&
                    CompareVersions(info.version, current_version) > 0;
   return info;
+}
+
+std::optional<UpdateInfo> ParseLatestReleaseJson(std::string_view json, std::string_view current_version) {
+#ifdef _WIN32
+  constexpr bool kWindowsPlatform = true;
+#else
+  constexpr bool kWindowsPlatform = false;
+#endif
+  return update_internal::ParseLatestReleaseJsonForPlatform(json, current_version, kWindowsPlatform);
 }
 
 UpdateInfo CheckLatestUpdate(std::string_view current_version, double timeout_seconds) {
@@ -1073,12 +1092,12 @@ Result RelaunchLauncher(const fs::path& launcher_executable) {
   }
 }
 
-bool GameProcessRunning(const Paths& paths) {
+static bool ProcessRunningFrom(const fs::path& game_exe) {
   try {
-    if (paths.game_exe.empty()) return false;
+    if (game_exe.empty()) return false;
     std::error_code error;
-    const fs::path game = fs::weakly_canonical(paths.game_exe, error);
-    const fs::path wanted = error ? paths.game_exe : game;
+    const fs::path game = fs::weakly_canonical(game_exe, error);
+    const fs::path wanted = error ? game_exe : game;
 #ifdef _WIN32
     const std::wstring wanted_text = wanted.wstring();
     HANDLE snapshot = CreateToolhelp32Snapshot(TH32CS_SNAPPROCESS, 0);
@@ -1132,6 +1151,15 @@ bool GameProcessRunning(const Paths& paths) {
   } catch (...) {
     return false;
   }
+}
+
+// v1.7.0: the Xbox program (wwe2k14.exe) and the three new-renderer programs all count as the game.
+bool GameProcessRunning(const Paths& paths) {
+  if (paths.game_exe.empty()) return false;
+  for (const fs::path& exe : AllGameExecutables(paths)) {
+    if (ProcessRunningFrom(exe)) return true;
+  }
+  return false;
 }
 
 void CleanupUpdateLeftovers(const Paths& paths) {

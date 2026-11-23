@@ -1,0 +1,20 @@
+[package]
+name = "nihav_core"
+version = "0.1.0"
+authors = ["Kostya Shishkov <kostya.shishkov@gmail.com>"]
+edition = "2018"
+
+[features]
+default = [
+    "decoders",
+    "demuxers",
+    "muxers",
+    "compr"
+]
+
+decoders = []
+demuxers = []
+muxers = []
+
+compr = ["deflate"]
+deflate = []

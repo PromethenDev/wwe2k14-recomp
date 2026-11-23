@@ -1,0 +1,1404 @@
+From 1e07ebcbe14a4483c3d23df966c14dcfe6766b27 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 00:02:03 -0700
+Subject: [PATCH 119/149] xthread: reclaim guest stacks of fully finished
+ threads (cvar WWE2K14_THREAD_FREE_STACK_ON_EXIT, default off)
+
+WWE 2K14 #5/#19/#29: repeated created-superstar saves ran out of guest stack space (C0000017).
+On Windows ExitThread skips XThread's self reference, so exited threads never freed their stacks.
+Externally cancelled threads are quarantined. Host test: thread_stack_reclamation_driver.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/system/kernel_state.h             |   3 +
+ include/rex/system/xobject.h                  |   2 +
+ include/rex/system/xthread.h                  |   3 +
+ include/rex/thread.h                          |  11 +-
+ src/core/threading_posix.cpp                  |  75 +-
+ src/core/threading_win.cpp                    |   6 +-
+ src/system/kernel_state.cpp                   |  17 +
+ src/system/xobject.cpp                        |  13 +
+ src/system/xthread.cpp                        | 166 +++-
+ .../thread_stack_reclamation_driver.cpp       | 769 ++++++++++++++++++
+ 10 files changed, 1037 insertions(+), 28 deletions(-)
+ create mode 100644 tests/unit/system/thread_stack_reclamation_driver.cpp
+
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 269e8fe2..792976ea 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -262,6 +262,9 @@ class KernelState {
+   void OnThreadExecute(XThread* thread);
+   void OnThreadExit(XThread* thread);
+   object_ref<XThread> GetThreadByID(uint32_t thread_id);
++  // Takes a nonblocking snapshot of registered threads. False means the global
++  // critical region was contended and the caller should defer the operation.
++  bool TryGetThreadsSnapshot(std::vector<object_ref<XThread>>& threads);
+ 
+   FiberInfo* LookupFiber(uint32_t guest_addr);
+   void RegisterFiber(uint32_t guest_addr, const FiberInfo& info);
+diff --git a/include/rex/system/xobject.h b/include/rex/system/xobject.h
+index 0a43f07e..4f2c4377 100644
+--- a/include/rex/system/xobject.h
++++ b/include/rex/system/xobject.h
+@@ -174,6 +174,8 @@ class XObject {
+   void RetainHandle();
+   bool ReleaseHandle();
+   void Retain();
++  // Retains only if the object has not begun destruction.
++  bool TryRetain();
+   void Release();
+   X_STATUS Delete();
+ 
+diff --git a/include/rex/system/xthread.h b/include/rex/system/xthread.h
+index 1b2e0c17..5dcc3269 100644
+--- a/include/rex/system/xthread.h
++++ b/include/rex/system/xthread.h
+@@ -10,6 +10,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <atomic>
+ #include <condition_variable>
+ #include <mutex>
+ #include <string>
+@@ -388,6 +389,7 @@ class XThread : public XObject {
+  protected:
+   bool AllocateStack(uint32_t size);
+   void FreeStack();
++  void ReclaimExitedStacks();
+   void InitializeGuestObject();
+ 
+   void RundownAPCs();
+@@ -409,6 +411,7 @@ class XThread : public XObject {
+   uint32_t stack_alloc_size_ = 0;  // Stack alloc size
+   uint32_t stack_base_ = 0;        // High address
+   uint32_t stack_limit_ = 0;       // Low address
++  std::atomic<bool> externally_cancelled_{false};
+   bool guest_thread_ = false;
+   bool main_thread_ = false;  // Entry-point thread
+   bool running_ = false;
+diff --git a/include/rex/thread.h b/include/rex/thread.h
+index 30b207dd..96d0dcb9 100644
+--- a/include/rex/thread.h
++++ b/include/rex/thread.h
+@@ -414,6 +414,11 @@ class Thread : public WaitHandle {
+   // Returns the ID of the thread.
+   virtual uint32_t system_id() const = 0;
+ 
++  // Returns true only after the host thread has been signaled and its native
++  // completion has been observed without blocking. POSIX implementations also
++  // join/reap the thread; Windows thread handles are complete when signaled.
++  virtual bool TryJoinIfSignaledAndComplete() = 0;
++
+   // Returns the current name of the thread, if previously specified.
+   const std::string& name() const { return name_; }
+ 
+@@ -452,11 +457,11 @@ class Thread : public WaitHandle {
+   // Suspends the specified thread.
+   virtual bool Suspend(uint32_t* out_previous_suspend_count = nullptr) = 0;
+ 
+-  // Terminates the thread.
+-  // No destructors are called, and this function does not return.
++  // Terminates the thread. No destructors are called. Returns true only when
++  // the platform termination operation was issued successfully.
+   // The state of the thread object becomes signaled, releasing any other
+   // threads that had been waiting for the thread to terminate.
+-  virtual void Terminate(int exit_code) = 0;
++  virtual bool Terminate(int exit_code) = 0;
+ 
+  protected:
+   std::string name_;
+diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
+index a88bdc4d..496ba965 100644
+--- a/src/core/threading_posix.cpp
++++ b/src/core/threading_posix.cpp
+@@ -624,6 +624,43 @@ class PosixCondition<Thread> : public PosixConditionBase {
+ 
+   bool Signal() override { return true; }
+ 
++  bool TryJoinIfSignaledAndComplete() {
++    std::unique_lock<std::mutex> condition_lock(mutex_, std::try_to_lock);
++    if (!condition_lock.owns_lock() || !signaled_) {
++      return false;
++    }
++
++    if (joined_by_reclaimer_) {
++      return true;
++    }
++    if (host_joined_) {
++      joined_by_reclaimer_ = true;
++      suspend_sem_destroyed_by_reclaimer_ = true;
++      return true;
++    }
++
++#if REX_PLATFORM_LINUX
++    // Unlike Wait(), tryjoin never blocks on a signaled thread that has not
++    // actually reached the host thread exit yet (for example after cancel).
++    const int join_result = pthread_tryjoin_np(thread_, nullptr);
++    if (join_result == 0) {
++      host_joined_ = true;
++      joined_by_reclaimer_ = true;
++      DestroySuspendSemaphoreAfterReclaim();
++      return true;
++    }
++    // Only join_result == 0 above, host_joined_, or joined_by_reclaimer_ proves
++    // that native execution has completed. EINVAL/ESRCH do not prove a join.
++    if (join_result != EBUSY) {
++      return false;
++    }
++    return false;
++#else
++    // No nonblocking pthread join primitive is available on other POSIX hosts.
++    return false;
++#endif
++  }
++
+   std::string name() const {
+     WaitStarted();
+     auto result = std::array<char, 17>{'\0'};
+@@ -860,7 +897,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     return result == 0;
+   }
+ 
+-  void Terminate(int exit_code) {
++  bool Terminate(int exit_code) {
+     bool is_current_thread = pthread_self() == thread_;
+     {
+       std::unique_lock<std::mutex> lock(state_mutex_);
+@@ -873,7 +910,7 @@ class PosixCondition<Thread> : public PosixConditionBase {
+             // Wait for pthread_cancel() to actually happen.
+           }
+         }
+-        return;
++        return false;
+       }
+       state_ = State::kFinished;
+     }
+@@ -888,16 +925,20 @@ class PosixCondition<Thread> : public PosixConditionBase {
+     }
+     if (is_current_thread) {
+       pthread_exit(reinterpret_cast<void*>(exit_code));
++      return true;
+     } else {
+ #if REX_PLATFORM_ANDROID
+-      if (pthread_kill(thread_, GetSystemSignal(SignalType::kThreadTerminate)) != 0) {
++      const int result = pthread_kill(thread_, GetSystemSignal(SignalType::kThreadTerminate));
++      if (result != 0) {
+         assert_always();
+       }
+ #else
+-      if (pthread_cancel(thread_) != 0) {
++      const int result = pthread_cancel(thread_);
++      if (result != 0) {
+         assert_always();
+       }
+ #endif
++      return result == 0;
+     }
+   }
+ 
+@@ -920,13 +961,27 @@ class PosixCondition<Thread> : public PosixConditionBase {
+   static void* ThreadStartRoutine(void* parameter);
+   inline bool signaled() const override { return signaled_; }
+   inline void post_execution() override {
+-    if (thread_) {
+-      pthread_join(thread_, nullptr);
++    if (thread_ && !joined_by_reclaimer_) {
++      if (pthread_join(thread_, nullptr) == 0) {
++        host_joined_ = true;
++      }
++    }
++    if (!suspend_sem_destroyed_by_reclaimer_) {
++      sem_destroy(&suspend_sem_);
++    }
++  }
++  void DestroySuspendSemaphoreAfterReclaim() {
++    if (!suspend_sem_destroyed_by_reclaimer_) {
++      sem_destroy(&suspend_sem_);
++      suspend_sem_destroyed_by_reclaimer_ = true;
+     }
+-    sem_destroy(&suspend_sem_);
+   }
+   pthread_t thread_;
+   bool signaled_;
++  // Accessed while mutex_ is held by Wait/post_execution or TryJoin.
++  bool host_joined_ = false;
++  bool joined_by_reclaimer_ = false;
++  bool suspend_sem_destroyed_by_reclaimer_ = false;
+   int exit_code_;
+   State state_;             // Protected by state_mutex_
+   uint32_t suspend_count_;  // Protected by state_mutex_
+@@ -1341,6 +1396,10 @@ class PosixThread : public PosixConditionHandle<Thread> {
+ 
+   uint32_t system_id() const override { return handle_.system_id(); }
+ 
++  bool TryJoinIfSignaledAndComplete() override {
++    return handle_.TryJoinIfSignaledAndComplete();
++  }
++
+   uint64_t affinity_mask() override { return handle_.affinity_mask(); }
+   void set_affinity_mask(uint64_t mask) override { handle_.set_affinity_mask(mask); }
+ 
+@@ -1359,7 +1418,7 @@ class PosixThread : public PosixConditionHandle<Thread> {
+     return handle_.Suspend(out_previous_suspend_count);
+   }
+ 
+-  void Terminate(int exit_code) override { handle_.Terminate(exit_code); }
++  bool Terminate(int exit_code) override { return handle_.Terminate(exit_code); }
+ 
+   void WaitSuspended() { handle_.WaitSuspended(); }
+ };
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 1cb2cd2e..01cb0ee3 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -491,6 +491,10 @@ class Win32Thread : public Win32Handle<Thread> {
+   int32_t priority() override { return GetThreadPriority(handle_); }
+   uint32_t system_id() const override { return GetThreadId(handle_); }
+ 
++  bool TryJoinIfSignaledAndComplete() override {
++    return WaitForSingleObject(handle_, 0) == WAIT_OBJECT_0;
++  }
++
+   void set_priority(int32_t new_priority) override { SetThreadPriority(handle_, new_priority); }
+ 
+   uint64_t affinity_mask() override {
+@@ -547,7 +551,7 @@ class Win32Thread : public Win32Handle<Thread> {
+     return true;
+   }
+ 
+-  void Terminate(int exit_code) override { TerminateThread(handle_, exit_code); }
++  bool Terminate(int exit_code) override { return TerminateThread(handle_, exit_code) != 0; }
+ 
+  private:
+   void AssertCallingThread() { assert_true(GetCurrentThreadId() == GetThreadId(handle_)); }
+diff --git a/src/system/kernel_state.cpp b/src/system/kernel_state.cpp
+index b9e9c830..3a650474 100644
+--- a/src/system/kernel_state.cpp
++++ b/src/system/kernel_state.cpp
+@@ -784,6 +784,23 @@ object_ref<XThread> KernelState::GetThreadByID(uint32_t thread_id) {
+   return retain_object(thread);
+ }
+ 
++bool KernelState::TryGetThreadsSnapshot(std::vector<object_ref<XThread>>& threads) {
++  threads.clear();
++  auto global_lock = global_critical_region_.TryAcquire();
++  if (!global_lock.owns_lock()) {
++    return false;
++  }
++
++  threads.reserve(threads_by_id_.size());
++  for (const auto& [thread_id, thread] : threads_by_id_) {
++    (void)thread_id;
++    if (thread->TryRetain()) {
++      threads.emplace_back(thread);
++    }
++  }
++  return true;
++}
++
+ void KernelState::RegisterNotifyListener(XNotifyListener* listener) {
+   auto global_lock = global_critical_region_.Acquire();
+   notify_listeners_.push_back(retain_object(listener));
+diff --git a/src/system/xobject.cpp b/src/system/xobject.cpp
+index b3282446..cf7ec7b9 100644
+--- a/src/system/xobject.cpp
++++ b/src/system/xobject.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <limits>
+ #include <vector>
+ 
+ #include <rex/chrono/clock.h>
+@@ -92,6 +93,18 @@ void XObject::Retain() {
+   ++pointer_ref_count_;
+ }
+ 
++bool XObject::TryRetain() {
++  int32_t ref_count = pointer_ref_count_.load(std::memory_order_relaxed);
++  while (ref_count > 0 && ref_count < std::numeric_limits<int32_t>::max()) {
++    if (pointer_ref_count_.compare_exchange_weak(ref_count, ref_count + 1,
++                                                std::memory_order_acquire,
++                                                std::memory_order_relaxed)) {
++      return true;
++    }
++  }
++  return false;
++}
++
+ void XObject::Release() {
+   if (--pointer_ref_count_ == 0) {
+     delete this;
+diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
+index f648300c..3ba0863f 100644
+--- a/src/system/xthread.cpp
++++ b/src/system/xthread.cpp
+@@ -12,6 +12,7 @@
+ #include <algorithm>
+ #include <atomic>
+ #include <cstring>
++#include <string_view>
+ 
+ #include <fmt/format.h>
+ 
+@@ -43,6 +44,9 @@ REXCVAR_DEFINE_BOOL(ignore_thread_priorities, true, "Kernel",
+ REXCVAR_DEFINE_BOOL(ignore_thread_affinities, true, "Kernel",
+                     "Ignores game-specified thread affinities");
+ 
++REXCVAR_DEFINE_BOOL(WWE2K14_THREAD_FREE_STACK_ON_EXIT, false, "Kernel",
++                    "Reclaims completed guest-thread stacks during later thread creation");
++
+ namespace rex::system {
+ 
+ const uint32_t XAPC::kSize;
+@@ -52,6 +56,7 @@ const uint32_t XAPC::kDummyRundownRoutine;
+ using namespace rex::literals;
+ 
+ uint32_t next_xthread_id_ = 0;
++static std::mutex xthread_stack_reclaim_mutex_;
+ 
+ XThread::XThread(KernelState* kernel_state)
+     : XObject(kernel_state, kObjectType), guest_thread_(true) {}
+@@ -267,6 +272,11 @@ void XThread::InitializeGuestObject() {
+ }
+ 
+ bool XThread::AllocateStack(uint32_t size) {
++  const bool reclaim_exited_stacks = REXCVAR_GET(WWE2K14_THREAD_FREE_STACK_ON_EXIT);
++  if (reclaim_exited_stacks) {
++    ReclaimExitedStacks();
++  }
++
+   auto heap = memory()->LookupHeap(kStackAddressRangeBegin);
+ 
+   auto alignment = heap->page_size();
+@@ -275,11 +285,22 @@ bool XThread::AllocateStack(uint32_t size) {
+   auto actual_size = size + padding;
+ 
+   uint32_t address = 0;
+-  if (!heap->AllocRange(kStackAddressRangeBegin, kStackAddressRangeEnd, actual_size, alignment,
+-                        memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
+-                        memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false,
+-                        &address)) {
+-    return false;
++  auto allocate_range = [&]() {
++    return heap->AllocRange(kStackAddressRangeBegin, kStackAddressRangeEnd, actual_size, alignment,
++                            memory::kMemoryAllocationReserve | memory::kMemoryAllocationCommit,
++                            memory::kMemoryProtectRead | memory::kMemoryProtectWrite, false,
++                            &address);
++  };
++  if (!allocate_range()) {
++    if (!reclaim_exited_stacks) {
++      return false;
++    }
++    // A thread may have completed while the first allocation was attempted.
++    // Sweep once more before reporting stack-arena exhaustion.
++    ReclaimExitedStacks();
++    if (!allocate_range()) {
++      return false;
++    }
+   }
+ 
+   stack_alloc_base_ = address;
+@@ -297,16 +318,71 @@ bool XThread::AllocateStack(uint32_t size) {
+   return true;
+ }
+ 
++void XThread::ReclaimExitedStacks() {
++  std::unique_lock<std::mutex> reclaim_lock(xthread_stack_reclaim_mutex_, std::try_to_lock);
++  if (!reclaim_lock.owns_lock() || !kernel_state_) {
++    return;
++  }
++
++  std::vector<object_ref<XThread>> threads;
++  if (!kernel_state_->TryGetThreadsSnapshot(threads)) {
++    return;
++  }
++
++  for (const auto& candidate : threads) {
++    if (candidate.get() == this) {
++      continue;
++    }
++
++    // Serialize termination with the completion query and release. A cancelled
++    // thread may have abandoned a heap mutex, so its stack must remain reserved.
++    std::unique_lock<std::mutex> thread_lock(candidate->thread_lock_, std::try_to_lock);
++    if (!thread_lock.owns_lock() || !candidate->thread_ ||
++        candidate->externally_cancelled_.load(std::memory_order_acquire)) {
++      continue;
++    }
++
++    // This nonblocking query requires both the host signaled state and actual
++    // native completion (joined on POSIX), so a terminating/running thread is
++    // never reclaimed just because the guest dispatcher state was signaled.
++    if (candidate->thread_->TryJoinIfSignaledAndComplete()) {
++      candidate->FreeStack();
++    }
++  }
++}
++
+ void XThread::FreeStack() {
+-  if (stack_alloc_base_) {
++  if (!stack_alloc_base_) {
++    return;
++  }
++
++  const bool reclaim_exited_stacks = REXCVAR_GET(WWE2K14_THREAD_FREE_STACK_ON_EXIT);
++  if (reclaim_exited_stacks) {
++    // KTHREAD and PCR are guest-visible and may be read after the host thread
++    // has exited. Tombstone only when the opt-in reclamation behavior is active.
++    auto* guest_thread = guest_object<X_KTHREAD>();
++    guest_thread->stack_base = 0;
++    guest_thread->stack_limit = 0;
++    guest_thread->stack_kernel = 0;
++    guest_thread->stack_alloc_base = 0;
++    if (pcr_address_) {
++      auto* pcr = memory()->TranslateVirtual<X_KPCR*>(pcr_address_);
++      pcr->stack_base_ptr = 0;
++      pcr->stack_end_ptr = 0;
++    }
++  }
++
++  // Keep an actually cancelled thread's range reserved while opt-in reclamation
++  // is enabled: asynchronous cancellation may abandon a heap mutex.
++  if (!reclaim_exited_stacks || !externally_cancelled_.load(std::memory_order_acquire)) {
+     auto heap = memory()->LookupHeap(kStackAddressRangeBegin);
+     heap->Release(stack_alloc_base_);
+-
+-    stack_alloc_base_ = 0;
+-    stack_alloc_size_ = 0;
+-    stack_base_ = 0;
+-    stack_limit_ = 0;
+   }
++
++  stack_alloc_base_ = 0;
++  stack_alloc_size_ = 0;
++  stack_base_ = 0;
++  stack_limit_ = 0;
+ }
+ 
+ X_STATUS XThread::Create() {
+@@ -418,7 +494,7 @@ X_STATUS XThread::Create() {
+   rex::thread::Thread::CreationParameters params;
+   params.stack_size = 16_MiB;  // Allocate a big host stack.
+   params.create_suspended = true;
+-  thread_ = rex::thread::Thread::Create(params, [this]() {
++  auto host_thread = rex::thread::Thread::Create(params, [this]() {
+     rex::initialize_seh_thread();
+     runtime::ThreadState::Bind(thread_state_.get());
+ 
+@@ -449,6 +525,10 @@ X_STATUS XThread::Create() {
+     // Release the self-reference to the thread.
+     ReleaseHandle();
+   });
++  {
++    std::lock_guard<std::mutex> lock(thread_lock_);
++    thread_ = std::move(host_thread);
++  }
+ 
+   if (!thread_) {
+     // TODO(benvanik): translate error?
+@@ -528,6 +608,7 @@ X_STATUS XThread::Exit(int exit_code) {
+ 
+ X_STATUS XThread::Terminate(int exit_code) {
+   // TODO(benvanik): inform the profiler that this thread is exiting.
++  const bool is_current_thread = XThread::IsInThread(this);
+ 
+   // Set exit code.
+   X_KTHREAD* thread = guest_object<X_KTHREAD>();
+@@ -537,14 +618,25 @@ X_STATUS XThread::Terminate(int exit_code) {
+   // TODO(tomc): do we need thread notifications (related to processor thread management)?
+ 
+   running_ = false;
+-  if (XThread::IsInThread(this)) {
++  if (is_current_thread) {
+     // Same lifetime rule as Exit(): don't allow ReleaseHandle() to destroy
+     // the thread object before Thread::Exit() reaches pthread_exit().
+     auto self = retain_object(this);
+     ReleaseHandle();
+     rex::thread::Thread::Exit(exit_code);
+   } else {
+-    thread_->Terminate(exit_code);
++    if (REXCVAR_GET(WWE2K14_THREAD_FREE_STACK_ON_EXIT)) {
++      // The sweep takes this same per-thread lock. Publish the marker only after
++      // the platform call confirms cancellation was issued.
++      std::lock_guard<std::mutex> lock(thread_lock_);
++      const bool already_complete = thread_->TryJoinIfSignaledAndComplete();
++      if (!already_complete && thread_->Terminate(exit_code)) {
++        externally_cancelled_.store(true, std::memory_order_release);
++      }
++    } else {
++      // Preserve the base path while stack reclamation is disabled.
++      thread_->Terminate(exit_code);
++    }
+     ReleaseHandle();
+   }
+ 
+@@ -1274,6 +1366,14 @@ static void LoadContext(PPCContext* ctx, const ThreadSavedState& state) {
+ }
+ 
+ bool XThread::Save(stream::ByteStream* stream) {
++  // Serialize the saved stack fields with ReclaimExitedStacks/FreeStack. The
++  // sweep only runs with the opt-in cvar, so the OFF path stays identical to base.
++  const bool reclaim_exited_stacks = REXCVAR_GET(WWE2K14_THREAD_FREE_STACK_ON_EXIT);
++  std::unique_lock<std::mutex> thread_lock(thread_lock_, std::defer_lock);
++  if (reclaim_exited_stacks) {
++    thread_lock.lock();
++  }
++
+   if (!guest_thread_) {
+     // Host XThreads are expected to be recreated on their own.
+     return false;
+@@ -1295,7 +1395,13 @@ bool XThread::Save(stream::ByteStream* stream) {
+   }
+ 
+   stream->Write(kThreadSaveSignature);
+-  stream->Write(thread_name_);
++  if (reclaim_exited_stacks) {
++    // Length-prefixed, matching ByteStream::Read<std::string>() in Restore.
++    stream->Write(std::string_view(thread_name_));
++  } else {
++    // Base behavior (OFF must stay identical): selects the raw Write<T> template.
++    stream->Write(thread_name_);
++  }
+ 
+   ThreadSavedState state;
+   state.thread_id = thread_id_;
+@@ -1342,6 +1448,28 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+ 
+   ThreadSavedState state;
+   stream->Read(&state, sizeof(ThreadSavedState));
++  const bool has_complete_stack = state.stack_base && state.stack_limit &&
++                                  state.stack_alloc_base && state.stack_alloc_size;
++  // Only opt-in reclamation can produce a zero-stack record; OFF keeps base behavior.
++  const bool reject_incomplete_stack = REXCVAR_GET(WWE2K14_THREAD_FREE_STACK_ON_EXIT);
++  if (reject_incomplete_stack && state.is_running && !has_complete_stack) {
++    REXSYS_ERROR("Could not restore running XThread {:08X} without a complete stack",
++                 thread->handle());
++    thread->tls_static_address_ = state.tls_static_address;
++    thread->tls_dynamic_address_ = state.tls_dynamic_address;
++    thread->tls_total_size_ = state.tls_total_size;
++    thread->pcr_address_ = state.pcr_address;
++
++    // RestoreObject inserted these saved handles before the state could be
++    // validated. Remove those table references before dropping the local ref.
++    const auto restored_handles = thread->handles();
++    for (const auto handle : restored_handles) {
++      kernel_state->object_table()->RemoveHandle(handle);
++    }
++    thread->Release();
++    return nullptr;
++  }
++
+   thread->thread_id_ = state.thread_id;
+   thread->main_thread_ = state.is_main_thread;
+   thread->running_ = state.is_running;
+@@ -1359,6 +1487,8 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+   kernel_state->RegisterThread(thread);
+ 
+   // Create thread state
++  // A reclaimed completed thread is restored without a guest stack. Its saved
++  // zero stack fields stay zero, and this non-running ThreadState is not resumed.
+   thread->thread_state_ = std::make_unique<runtime::ThreadState>(
+       thread->thread_id_, thread->stack_base_, thread->pcr_address_, kernel_state->memory());
+ 
+@@ -1373,7 +1503,7 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+     rex::thread::Thread::CreationParameters params;
+     params.create_suspended = true;  // Not done restoring yet.
+     params.stack_size = 16_MiB;
+-    thread->thread_ = rex::thread::Thread::Create(params, [thread, state]() {
++    auto host_thread = rex::thread::Thread::Create(params, [thread, state]() {
+       // Set thread ID override. This is used by logging.
+       rex::thread::set_current_thread_id(thread->handle());
+       runtime::ThreadState::Bind(thread->thread_state_.get());
+@@ -1408,6 +1538,10 @@ object_ref<XThread> XThread::Restore(KernelState* kernel_state, stream::ByteStre
+       // Release the self-reference to the thread.
+       thread->ReleaseHandle();
+     });
++    {
++      std::lock_guard<std::mutex> lock(thread->thread_lock_);
++      thread->thread_ = std::move(host_thread);
++    }
+     assert_not_null(thread->thread_);
+ 
+     // NOTE(tomc): if this is kept and processor notification dispatch is implemented,
+diff --git a/tests/unit/system/thread_stack_reclamation_driver.cpp b/tests/unit/system/thread_stack_reclamation_driver.cpp
+new file mode 100644
+index 00000000..a23d9901
+--- /dev/null
++++ b/tests/unit/system/thread_stack_reclamation_driver.cpp
+@@ -0,0 +1,769 @@
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstring>
++#include <filesystem>
++#include <iostream>
++#include <memory>
++#include <thread>
++#include <vector>
++
++#include <rex/cvar.h>
++#include <rex/platform.h>
++#include <rex/runtime.h>
++#include <rex/stream.h>
++#include <rex/system/kernel_state.h>
++#include <rex/system/xobject.h>
++#include <rex/system/xthread.h>
++
++REXCVAR_DECLARE(bool, WWE2K14_THREAD_FREE_STACK_ON_EXIT);
++
++namespace {
++
++using rex::system::KernelState;
++using rex::system::XThread;
++
++struct SavedThreadStatePrefix {
++  uint32_t thread_id;
++  bool is_main_thread;
++  bool is_running;
++  uint32_t apc_head;
++  uint32_t tls_static_address;
++  uint32_t tls_dynamic_address;
++  uint32_t tls_total_size;
++  uint32_t pcr_address;
++  uint32_t stack_base;
++  uint32_t stack_limit;
++  uint32_t stack_alloc_base;
++  uint32_t stack_alloc_size;
++};
++
++static_assert(offsetof(SavedThreadStatePrefix, pcr_address) == 24);
++static_assert(offsetof(SavedThreadStatePrefix, stack_base) == 28);
++
++constexpr uint32_t kThreadCount = 24;
++constexpr uint32_t kGuestStackRequest = 16 * 1024;
++constexpr auto kWaitTimeout = std::chrono::seconds(5);
++constexpr uint64_t kGuestWaitTimeoutTicks = uint64_t(-50000000ll);
++constexpr uint32_t kPcrSize = 0x2D8;
++
++class TestThread : public XThread {
++ public:
++  explicit TestThread(KernelState* kernel_state)
++      : XThread(kernel_state, kGuestStackRequest, 0, 0, 0, 0, true) {}
++
++  uint32_t stack_base_for_test() const { return stack_alloc_base_; }
++  uint32_t stack_size_for_test() const { return stack_alloc_size_; }
++  bool external_termination_for_test() const {
++    return externally_cancelled_.load(std::memory_order_acquire);
++  }
++
++  bool guest_stack_metadata_zero_for_test() {
++    auto* kthread = guest_object<rex::system::X_KTHREAD>();
++    auto* pcr = memory()->TranslateVirtual<rex::system::X_KPCR*>(pcr_address_);
++    return !kthread->stack_base && !kthread->stack_limit && !kthread->stack_kernel &&
++           !kthread->stack_alloc_base && !pcr->stack_base_ptr && !pcr->stack_end_ptr;
++  }
++};
++
++class ImmediateExitThread final : public TestThread {
++ public:
++  ImmediateExitThread(KernelState* kernel_state, int32_t exit_code,
++                      std::shared_ptr<std::atomic<bool>> destructor_observed = nullptr)
++      : TestThread(kernel_state), exit_code_(exit_code),
++        destructor_observed_(destructor_observed) {}
++
++  ~ImmediateExitThread() override {
++    if (destructor_observed_) {
++      destructor_observed_->store(true, std::memory_order_release);
++    }
++  }
++
++  void Execute() override {
++    exit_started_.store(true, std::memory_order_release);
++    Exit(exit_code_);
++  }
++
++  bool exit_started() const { return exit_started_.load(std::memory_order_acquire); }
++
++ private:
++  std::atomic<bool> exit_started_{false};
++  int32_t exit_code_;
++  std::shared_ptr<std::atomic<bool>> destructor_observed_;
++};
++
++class BlockingThread final : public TestThread {
++ public:
++  explicit BlockingThread(KernelState* kernel_state) : TestThread(kernel_state) {}
++
++  void Execute() override {
++    started_.store(true, std::memory_order_release);
++    while (!release_.load(std::memory_order_acquire)) {
++      std::this_thread::yield();
++    }
++    Exit(0xB10C);
++  }
++
++  bool started() const { return started_.load(std::memory_order_acquire); }
++  void Release() { release_.store(true, std::memory_order_release); }
++
++ private:
++  std::atomic<bool> started_{false};
++  std::atomic<bool> release_{false};
++};
++
++bool WaitForGuestThread(XThread* thread) {
++  uint64_t timeout_ticks = kGuestWaitTimeoutTicks;
++  return thread->Wait(0, 0, 0, &timeout_ticks) == 0;
++}
++
++bool WaitForExitStarted(const ImmediateExitThread* thread) {
++  const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
++  while (!thread->exit_started() && std::chrono::steady_clock::now() < deadline) {
++    std::this_thread::yield();
++  }
++  return thread->exit_started();
++}
++
++bool WaitForHostCompletion(XThread* thread) {
++  const auto deadline = std::chrono::steady_clock::now() + kWaitTimeout;
++  while (std::chrono::steady_clock::now() < deadline) {
++    auto* host_thread = thread->thread();
++    if (host_thread && host_thread->TryJoinIfSignaledAndComplete()) {
++      return true;
++    }
++    std::this_thread::yield();
++  }
++  return false;
++}
++
++template <typename T>
++T ReadAt(const std::vector<uint8_t>& data, size_t offset) {
++  T value{};
++  if (offset + sizeof(value) <= data.size()) {
++    std::memcpy(&value, data.data() + offset, sizeof(value));
++  }
++  return value;
++}
++
++template <typename T>
++bool WriteAt(std::vector<uint8_t>* data, size_t offset, T value) {
++  if (!data || offset + sizeof(value) > data->size()) {
++    return false;
++  }
++  std::memcpy(data->data() + offset, &value, sizeof(value));
++  return true;
++}
++
++bool ReadSavedThread(std::vector<uint8_t>* data, size_t* state_offset,
++                     uint32_t* guest_object_address, SavedThreadStatePrefix* state) {
++  if (!data || !state_offset || !guest_object_address || !state || data->size() < 20) {
++    return false;
++  }
++  const uint32_t handle_count = ReadAt<uint32_t>(*data, 8);
++  size_t offset = 12 + size_t(handle_count) * sizeof(uint32_t);
++  if (ReadAt<uint32_t>(*data, offset) != rex::system::kThreadSaveSignature) {
++    return false;
++  }
++  offset += sizeof(uint32_t);
++  const uint32_t name_size = ReadAt<uint32_t>(*data, offset);
++  offset += sizeof(uint32_t) + name_size;
++  if (offset + sizeof(*state) > data->size()) {
++    return false;
++  }
++  *guest_object_address = ReadAt<uint32_t>(*data, 4);
++  std::memcpy(state, data->data() + offset, sizeof(*state));
++  *state_offset = offset;
++  return *guest_object_address != 0;
++}
++
++bool MakeIndependentRestoreRecord(KernelState* kernel_state, std::vector<uint8_t>* data,
++                                  size_t state_offset, uint32_t source_guest_object,
++                                  SavedThreadStatePrefix* state) {
++  auto* memory = kernel_state->memory();
++  uint32_t object_allocation = 0;
++  uint32_t tls_allocation = 0;
++  uint32_t pcr_allocation = 0;
++  const uint32_t object_allocation_size = sizeof(rex::system::X_OBJECT_HEADER) +
++                                         sizeof(rex::system::X_KTHREAD);
++
++  object_allocation = memory->SystemHeapAlloc(object_allocation_size);
++  if (!object_allocation) {
++    return false;
++  }
++  memory->Copy(object_allocation, source_guest_object - sizeof(rex::system::X_OBJECT_HEADER),
++               object_allocation_size);
++  const uint32_t guest_object_address = object_allocation + sizeof(rex::system::X_OBJECT_HEADER);
++  auto* object_header = memory->TranslateVirtual<rex::system::X_OBJECT_HEADER*>(object_allocation);
++  // Restore does not consult the type object; leave ownership of the source's
++  // type allocation with the source object and avoid sharing it with the clone.
++  object_header->object_type_ptr = 0;
++
++  if (!state->tls_static_address || !state->tls_total_size || !state->pcr_address ||
++      state->tls_dynamic_address < state->tls_static_address ||
++      state->tls_dynamic_address - state->tls_static_address >= state->tls_total_size) {
++    memory->SystemHeapFree(object_allocation);
++    return false;
++  }
++  tls_allocation = memory->SystemHeapAlloc(state->tls_total_size);
++  pcr_allocation = memory->SystemHeapAlloc(kPcrSize);
++  if (!tls_allocation || !pcr_allocation) {
++    memory->SystemHeapFree(object_allocation);
++    memory->SystemHeapFree(tls_allocation);
++    memory->SystemHeapFree(pcr_allocation);
++    return false;
++  }
++  memory->Copy(tls_allocation, state->tls_static_address, state->tls_total_size);
++  memory->Copy(pcr_allocation, state->pcr_address, kPcrSize);
++
++  const uint32_t tls_dynamic_offset = state->tls_dynamic_address - state->tls_static_address;
++  state->tls_static_address = tls_allocation;
++  state->tls_dynamic_address = tls_allocation + tls_dynamic_offset;
++  state->pcr_address = pcr_allocation;
++
++  auto* kthread = memory->TranslateVirtual<rex::system::X_KTHREAD*>(guest_object_address);
++  auto* pcr = memory->TranslateVirtual<rex::system::X_KPCR*>(pcr_allocation);
++  kthread->tls_address = state->tls_dynamic_address;
++  kthread->a_prcb_ptr = pcr_allocation + offsetof(rex::system::X_KPCR, prcb_data);
++  kthread->another_prcb_ptr = pcr_allocation + offsetof(rex::system::X_KPCR, prcb_data);
++  pcr->tls_ptr = tls_allocation;
++  pcr->pcr_ptr = pcr_allocation;
++  pcr->prcb = pcr_allocation + offsetof(rex::system::X_KPCR, prcb_data);
++  pcr->prcb_data.current_thread = guest_object_address;
++
++  if (!WriteAt(data, 4, guest_object_address)) {
++    memory->SystemHeapFree(object_allocation);
++    memory->SystemHeapFree(tls_allocation);
++    memory->SystemHeapFree(pcr_allocation);
++    return false;
++  }
++  std::memcpy(data->data() + state_offset, state, sizeof(*state));
++  return true;
++}
++
++bool GuestStackMetadataZero(KernelState* kernel_state, uint32_t guest_object_address,
++                            uint32_t pcr_address) {
++  auto* kthread = kernel_state->memory()->TranslateVirtual<rex::system::X_KTHREAD*>(
++      guest_object_address);
++  auto* pcr = kernel_state->memory()->TranslateVirtual<rex::system::X_KPCR*>(pcr_address);
++  return !kthread->stack_base && !kthread->stack_limit && !kthread->stack_kernel &&
++         !kthread->stack_alloc_base && !pcr->stack_base_ptr && !pcr->stack_end_ptr;
++}
++
++uint32_t CountHeldStacks(const std::vector<rex::system::object_ref<ImmediateExitThread>>& threads,
++                         uint64_t* bytes_out) {
++  uint32_t count = 0;
++  uint64_t bytes = 0;
++  for (const auto& thread : threads) {
++    if (thread->stack_base_for_test()) {
++      ++count;
++      bytes += thread->stack_size_for_test();
++    }
++  }
++  if (bytes_out) {
++    *bytes_out = bytes;
++  }
++  return count;
++}
++
++bool ReleaseHandles(KernelState* kernel_state,
++                    const std::vector<rex::system::object_ref<ImmediateExitThread>>& threads) {
++  for (const auto& thread : threads) {
++    if (kernel_state->object_table()->ReleaseHandle(thread->handle()) != 0) {
++      std::cerr << "failed to close completed thread handle\n";
++      return false;
++    }
++  }
++  return true;
++}
++
++bool RunRetentionCase(KernelState* kernel_state, bool enabled) {
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, enabled);
++  const auto* stack_heap = kernel_state->memory()->LookupHeap(XThread::kStackAddressRangeBegin);
++  if (!stack_heap) {
++    std::cerr << "stack arena lookup failed\n";
++    return false;
++  }
++  const uint32_t page_size = stack_heap->page_size();
++  const uint32_t rounded_stack =
++      ((kGuestStackRequest + page_size - 1) / page_size) * page_size;
++  const uint64_t bytes_per_stack = rounded_stack + 2 * page_size;
++
++  std::vector<rex::system::object_ref<ImmediateExitThread>> threads;
++  threads.reserve(kThreadCount);
++  for (uint32_t i = 0; i < kThreadCount; ++i) {
++    auto thread = rex::system::object_ref<ImmediateExitThread>(
++        new ImmediateExitThread(kernel_state, static_cast<int32_t>(0xCA00 + i)));
++    if (thread->Create() != 0 ||
++        (enabled ? !WaitForExitStarted(thread.get()) : !WaitForGuestThread(thread.get()))) {
++      std::cerr << "thread creation or completion barrier failed at index " << i << '\n';
++      return false;
++    }
++    if (!enabled && thread->guest_object<rex::system::X_KTHREAD>()->exit_status != 0xCA00 + i) {
++      std::cerr << "guest exit status changed before stack reclamation\n";
++      return false;
++    }
++    threads.push_back(std::move(thread));
++  }
++
++  uint64_t bytes_after_batch = 0;
++  const uint32_t held_after_batch = CountHeldStacks(threads, &bytes_after_batch);
++  const bool batch_measurement_ok =
++      enabled ? held_after_batch <= kThreadCount
++              : held_after_batch == kThreadCount &&
++                    bytes_after_batch == uint64_t(kThreadCount) * bytes_per_stack;
++  if (!batch_measurement_ok || bytes_after_batch != uint64_t(held_after_batch) * bytes_per_stack) {
++    std::cerr << "stack retention mismatch: option=" << (enabled ? "on" : "off")
++              << " held=" << held_after_batch << " bytes=" << bytes_after_batch
++              << " expected_per_stack=" << bytes_per_stack << '\n';
++    return false;
++  }
++
++  std::vector<rex::system::object_ref<ImmediateExitThread>> trigger_threads;
++  uint32_t held_after_trigger = held_after_batch;
++  uint64_t bytes_after_trigger = 0;
++  const auto reclaim_deadline = std::chrono::steady_clock::now() + kWaitTimeout;
++  do {
++    auto trigger = rex::system::object_ref<ImmediateExitThread>(
++        new ImmediateExitThread(kernel_state, 0xCAFE));
++    if (trigger->Create() != 0) {
++      std::cerr << "trigger thread create failed\n";
++      return false;
++    }
++    trigger_threads.push_back(std::move(trigger));
++    if (!WaitForGuestThread(trigger_threads.back().get())) {
++      std::cerr << "trigger thread failed to finish\n";
++      return false;
++    }
++    held_after_trigger = CountHeldStacks(threads, &bytes_after_trigger);
++  } while (enabled && held_after_trigger != 0 &&
++           std::chrono::steady_clock::now() < reclaim_deadline);
++
++  const uint32_t expected_after_trigger = enabled ? 0 : kThreadCount;
++  if (held_after_trigger != expected_after_trigger ||
++      bytes_after_trigger != uint64_t(expected_after_trigger) * bytes_per_stack) {
++    std::cerr << "next-create reclaim mismatch: option=" << (enabled ? "on" : "off")
++              << " held=" << held_after_trigger << " bytes=" << bytes_after_trigger << '\n';
++    return false;
++  }
++  for (uint32_t i = 0; i < threads.size(); ++i) {
++    if (threads[i]->guest_object<rex::system::X_KTHREAD>()->exit_status != 0xCA00 + i) {
++      std::cerr << "guest exit status changed after stack reclamation\n";
++      return false;
++    }
++    if (enabled && !threads[i]->guest_stack_metadata_zero_for_test()) {
++      std::cerr << "guest KTHREAD/PCR stack metadata remained after reclamation\n";
++      return false;
++    }
++  }
++
++  std::cout << "thread-stack-reclamation option=" << (enabled ? "on" : "off")
++            << " completed=" << kThreadCount << " after_batch_held=" << held_after_batch
++            << " after_batch_bytes=" << bytes_after_batch
++            << " after_next_create_held=" << held_after_trigger
++            << " after_next_create_bytes=" << bytes_after_trigger << '\n';
++
++  return ReleaseHandles(kernel_state, threads) && ReleaseHandles(kernel_state, trigger_threads);
++}
++
++bool RunOffDestructorReleaseCase(KernelState* kernel_state) {
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, false);
++
++  auto destructor_observed = std::make_shared<std::atomic<bool>>(false);
++  auto completed = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA51, destructor_observed));
++  // The guest wait is signaled by XThread exit before the native Windows thread
++  // handle is signaled. Wait for native completion too before testing destructor
++  // release/reuse; closing that handle in XThread::~XThread does not join it.
++  if (completed->Create() != 0 || !WaitForGuestThread(completed.get()) ||
++      !WaitForHostCompletion(completed.get())) {
++    std::cerr << "OFF-mode destructor test thread did not finish\n";
++    return false;
++  }
++  const uint32_t released_stack = completed->stack_base_for_test();
++  const uint32_t released_stack_size = completed->stack_size_for_test();
++  auto* stack_heap = kernel_state->memory()->LookupHeap(XThread::kStackAddressRangeBegin);
++  rex::memory::HeapAllocationInfo stack_info{};
++  if (!released_stack || !released_stack_size || !stack_heap ||
++      !stack_heap->QueryRegionInfo(released_stack, &stack_info) ||
++      stack_info.allocation_base != released_stack ||
++      stack_info.allocation_size != released_stack_size || !stack_info.state ||
++      kernel_state->object_table()->ReleaseHandle(completed->handle()) != 0) {
++    std::cerr << "OFF-mode destructor test could not release its thread handle\n";
++    return false;
++  }
++  // Keep a raw pointer only to drop the reference leaked by Windows ExitThread;
++  // it is dereferenced only after the shared flag proves ~XThread has not run.
++  ImmediateExitThread* completed_raw = completed.get();
++  completed.reset();
++
++  // XThread::Exit holds `auto self = retain_object(this)` and then calls
++  // rex::thread::Thread::Exit, which never returns. On POSIX that is
++  // pthread_exit, whose forced unwind runs the `self` destructor, so the reset
++  // above drops the last reference and ~XThread runs synchronously. On Windows
++  // it is ExitThread, which runs no C++ destructors, so `self` leaks exactly one
++  // pointer reference (base and lane alike) and ~XThread cannot run here. The
++  // test drops that one leaked reference itself to exercise the OFF destructor.
++  uint32_t leaked_self_refs = 0;
++  if (!destructor_observed->load(std::memory_order_acquire)) {
++#if REX_PLATFORM_WIN32
++    leaked_self_refs = 1;
++    completed_raw->Release();
++#else
++    std::cerr << "OFF-mode XThread destructor did not run after completed.reset()\n";
++    return false;
++#endif
++  }
++  completed_raw = nullptr;
++
++  // ~XThread runs synchronously inside the final Release; no waiting is needed.
++  rex::memory::HeapAllocationInfo released_info{};
++  if (!destructor_observed->load(std::memory_order_acquire)) {
++    std::cerr << "OFF-mode XThread destructor did not run after its last reference was dropped"
++              << " leaked_self_refs=" << leaked_self_refs << '\n';
++    return false;
++  }
++  if (!stack_heap->QueryRegionInfo(released_stack, &released_info) || released_info.state) {
++    std::cerr << "OFF-mode XThread destructor did not release the guest stack"
++              << " region_state=" << released_info.state << '\n';
++    return false;
++  }
++
++  auto replacement = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA52));
++  if (replacement->Create() != 0 || !WaitForGuestThread(replacement.get())) {
++    std::cerr << "OFF-mode replacement thread did not complete after stack release\n";
++    return false;
++  }
++  if (kernel_state->object_table()->ReleaseHandle(replacement->handle()) != 0) {
++    std::cerr << "OFF-mode destructor test could not release its replacement handle\n";
++    return false;
++  }
++  replacement.reset();
++  std::cout << "thread-stack-reclamation option=off_destructor destructor_observed=1 "
++               "stack_released=1 exit_path_leaked_self_refs="
++            << leaked_self_refs << '\n';
++  return true;
++}
++
++bool RunTerminateAfterExitCase(KernelState* kernel_state) {
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, true);
++
++  auto completed = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA53));
++  if (completed->Create() != 0 || !WaitForGuestThread(completed.get())) {
++    std::cerr << "terminate-after-exit test thread did not finish\n";
++    return false;
++  }
++  const uint32_t released_stack = completed->stack_base_for_test();
++  if (!released_stack || completed->Terminate(0xCA54) != 0 ||
++      completed->external_termination_for_test()) {
++    std::cerr << "terminate-after-exit was incorrectly marked as cancelled\n";
++    return false;
++  }
++  // On Windows the reset does not destroy the object (ExitThread leaks the
++  // Exit() self reference), so the next Create's sweep must free the stack.
++  completed.reset();
++
++  auto* stack_heap = kernel_state->memory()->LookupHeap(XThread::kStackAddressRangeBegin);
++  auto replacement = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA55));
++  rex::memory::HeapAllocationInfo released_info{};
++  const bool replacement_created = replacement->Create() == 0;
++  const bool released_or_reused =
++      replacement_created && stack_heap &&
++      (replacement->stack_base_for_test() == released_stack ||
++       (stack_heap->QueryRegionInfo(released_stack, &released_info) && !released_info.state));
++  if (!released_or_reused || !WaitForGuestThread(replacement.get())) {
++    std::cerr << "terminate-after-exit completed stack was neither released nor reused"
++              << " region_state=" << released_info.state << '\n';
++    return false;
++  }
++  if (kernel_state->object_table()->ReleaseHandle(replacement->handle()) != 0) {
++    std::cerr << "terminate-after-exit test could not release its replacement handle\n";
++    return false;
++  }
++  replacement.reset();
++  std::cout << "thread-stack-reclamation terminate_after_exit_cancel_issued=0 stack_released=1\n";
++  return true;
++}
++
++bool RunSaveRestoreAfterReclaimCase(KernelState* kernel_state) {
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, true);
++
++  auto completed = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA31));
++  if (completed->Create() != 0 || !WaitForGuestThread(completed.get())) {
++    std::cerr << "save/restore test thread did not finish\n";
++    return false;
++  }
++  auto trigger = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA32));
++  const auto trigger_create_status = trigger->Create();
++  const uint32_t completed_stack_after_create = completed->stack_base_for_test();
++  const bool trigger_waited = trigger_create_status == 0 && WaitForGuestThread(trigger.get());
++  const bool metadata_zero = completed->guest_stack_metadata_zero_for_test();
++  if (trigger_create_status != 0 || completed_stack_after_create != 0 || !trigger_waited ||
++      !metadata_zero) {
++    std::cerr << "save/restore reclaim mismatch: create_status=" << trigger_create_status
++              << " completed_stack=" << completed_stack_after_create
++              << " trigger_waited=" << trigger_waited << " guest_metadata_zero=" << metadata_zero
++              << '\n';
++    return false;
++  }
++
++  std::vector<uint8_t> saved_data(64 * 1024);
++  rex::stream::ByteStream save_stream(saved_data.data(), saved_data.size());
++  if (!completed->Save(&save_stream)) {
++    std::cerr << "reclaimed thread Save failed\n";
++    return false;
++  }
++
++  size_t state_offset = 0;
++  uint32_t saved_guest_object = 0;
++  SavedThreadStatePrefix saved_state{};
++  const bool saved_state_read =
++      ReadSavedThread(&saved_data, &state_offset, &saved_guest_object, &saved_state);
++  if (!saved_state_read || saved_state.is_running || saved_state.stack_base ||
++      saved_state.stack_limit || saved_state.stack_alloc_base || saved_state.stack_alloc_size) {
++    std::cerr << "reclaimed thread Save did not serialize a zero-stack completed state"
++              << " parsed=" << saved_state_read << " running=" << saved_state.is_running
++              << " stack_base=" << saved_state.stack_base
++              << " stack_limit=" << saved_state.stack_limit
++              << " stack_alloc_base=" << saved_state.stack_alloc_base
++              << " stack_alloc_size=" << saved_state.stack_alloc_size
++              << " state_offset=" << state_offset << '\n';
++    return false;
++  }
++
++  // Clone the guest allocations named by the saved record so the restored
++  // object can be tested independently after its source object is destroyed.
++  if (!MakeIndependentRestoreRecord(kernel_state, &saved_data, state_offset,
++                                    saved_guest_object, &saved_state)) {
++    std::cerr << "could not prepare isolated reclaimed-thread restore record\n";
++    return false;
++  }
++  auto invalid_data = saved_data;
++  auto invalid_state = saved_state;
++  if (!MakeIndependentRestoreRecord(kernel_state, &invalid_data, state_offset,
++                                    saved_guest_object, &invalid_state)) {
++    std::cerr << "could not prepare isolated invalid running-thread restore record\n";
++    return false;
++  }
++  invalid_state.is_running = true;
++  std::memcpy(invalid_data.data() + state_offset, &invalid_state, sizeof(invalid_state));
++
++  const uint32_t completed_handle = completed->handle();
++  if (kernel_state->object_table()->ReleaseHandle(completed_handle) != 0) {
++    std::cerr << "failed to close source thread handle before restore\n";
++    return false;
++  }
++  completed.reset();
++
++  rex::stream::ByteStream restore_stream(saved_data.data(), saved_data.size());
++  auto restored = XThread::Restore(kernel_state, &restore_stream);
++  const uint32_t restored_guest_object = ReadAt<uint32_t>(saved_data, 4);
++  if (!restored || restored->handle() != completed_handle ||
++      !GuestStackMetadataZero(kernel_state, restored_guest_object, saved_state.pcr_address)) {
++    std::cerr << "reclaimed thread Restore did not preserve zero-stack semantics\n";
++    return false;
++  }
++
++  std::vector<uint8_t> restored_data(64 * 1024);
++  rex::stream::ByteStream restored_save_stream(restored_data.data(), restored_data.size());
++  size_t restored_state_offset = 0;
++  uint32_t restored_save_guest_object = 0;
++  SavedThreadStatePrefix restored_state{};
++  if (!restored->Save(&restored_save_stream) ||
++      !ReadSavedThread(&restored_data, &restored_state_offset, &restored_save_guest_object,
++                       &restored_state) ||
++      restored_state.is_running ||
++      restored_state.stack_base || restored_state.stack_limit ||
++      restored_state.stack_alloc_base || restored_state.stack_alloc_size ||
++      !GuestStackMetadataZero(kernel_state, restored_save_guest_object,
++                              restored_state.pcr_address)) {
++    std::cerr << "restored completed thread did not retain zero stack metadata\n";
++    return false;
++  }
++
++  if (kernel_state->object_table()->ReleaseHandle(restored->handle()) != 0 ||
++      kernel_state->object_table()->ReleaseHandle(trigger->handle()) != 0) {
++    std::cerr << "failed to close save/restore regression handles\n";
++    return false;
++  }
++  restored.reset();
++  trigger.reset();
++  rex::stream::ByteStream invalid_restore_stream(invalid_data.data(), invalid_data.size());
++  if (XThread::Restore(kernel_state, &invalid_restore_stream)) {
++    std::cerr << "Restore accepted an is_running zero-stack record\n";
++    return false;
++  }
++  std::cout << "thread-stack-reclamation save_restore_reclaimed_stack=zero "
++               "guest_kthread_pcr=zero zero_stack_running_restore_rejected=1\n";
++  return true;
++}
++
++bool RunExternalTerminateCase(KernelState* kernel_state) {
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, true);
++  auto* stack_heap = kernel_state->memory()->LookupHeap(XThread::kStackAddressRangeBegin);
++  if (!stack_heap) {
++    std::cerr << "external-terminate stack arena lookup failed\n";
++    return false;
++  }
++
++  auto terminated = rex::system::object_ref<BlockingThread>(new BlockingThread(kernel_state));
++  if (terminated->Create() != 0) {
++    std::cerr << "external-terminate test thread create failed\n";
++    return false;
++  }
++  const auto started_deadline = std::chrono::steady_clock::now() + kWaitTimeout;
++  while (!terminated->started() && std::chrono::steady_clock::now() < started_deadline) {
++    std::this_thread::yield();
++  }
++  const uint32_t original_stack = terminated->stack_base_for_test();
++  const uint32_t original_stack_size = terminated->stack_size_for_test();
++  if (!terminated->started() || !original_stack ||
++      terminated->Terminate(0xCA41) != 0 || !terminated->external_termination_for_test() ||
++      !WaitForHostCompletion(terminated.get())) {
++    std::cerr << "external termination was not marked and joined within the test bound\n";
++    return false;
++  }
++
++  auto trigger = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA42));
++  if (trigger->Create() != 0 || !WaitForGuestThread(trigger.get()) ||
++      terminated->stack_base_for_test() != original_stack) {
++    std::cerr << "next Create reclaimed the externally terminated thread stack\n";
++    return false;
++  }
++
++  if (kernel_state->object_table()->ReleaseHandle(terminated->handle()) != 0 ||
++      kernel_state->object_table()->ReleaseHandle(trigger->handle()) != 0) {
++    std::cerr << "failed to close external-terminate regression handles\n";
++    return false;
++  }
++  terminated.reset();
++  trigger.reset();
++  rex::memory::HeapAllocationInfo retained_stack_info{};
++  const bool quarantined_stack_retained =
++      stack_heap->QueryRegionInfo(original_stack, &retained_stack_info) &&
++      retained_stack_info.allocation_base == original_stack &&
++      retained_stack_info.allocation_size == original_stack_size && retained_stack_info.state;
++  if (!quarantined_stack_retained) {
++    std::cerr << "external-terminate destructor released the quarantined guest stack\n";
++    return false;
++  }
++  std::cout << "thread-stack-reclamation external_terminate_stack_retained=1 "
++               "next_create_completed=1 destructor_stack_still_allocated=1\n";
++  return true;
++}
++
++bool RunLiveThreadCase(KernelState* kernel_state) {
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, true);
++
++  auto blocked = rex::system::object_ref<BlockingThread>(new BlockingThread(kernel_state));
++  if (blocked->Create() != 0) {
++    std::cerr << "blocking thread create failed\n";
++    return false;
++  }
++  const auto started_deadline = std::chrono::steady_clock::now() + kWaitTimeout;
++  while (!blocked->started() && std::chrono::steady_clock::now() < started_deadline) {
++    std::this_thread::yield();
++  }
++  if (!blocked->started()) {
++    std::cerr << "blocking thread did not enter Execute\n";
++    return false;
++  }
++  const uint32_t original_stack = blocked->stack_base_for_test();
++
++  auto completed = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA11));
++  if (completed->Create() != 0 || !WaitForGuestThread(completed.get()) ||
++      blocked->stack_base_for_test() != original_stack || !original_stack) {
++    std::cerr << "a still-running thread's stack was reclaimed\n";
++    return false;
++  }
++
++  blocked->Release();
++  if (!WaitForGuestThread(blocked.get())) {
++    std::cerr << "released blocking thread did not finish\n";
++    return false;
++  }
++  auto trigger = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA12));
++  if (trigger->Create() != 0 || blocked->stack_base_for_test() != 0 ||
++      !WaitForGuestThread(trigger.get()) || !blocked->guest_stack_metadata_zero_for_test()) {
++    std::cerr << "finished blocking thread was not reclaimed on the next create\n";
++    return false;
++  }
++
++  std::cout << "thread-stack-reclamation running_not_reclaimed=1 completed_reclaimed=1\n";
++  const bool handles_released =
++      kernel_state->object_table()->ReleaseHandle(blocked->handle()) == 0 &&
++      kernel_state->object_table()->ReleaseHandle(completed->handle()) == 0 &&
++      kernel_state->object_table()->ReleaseHandle(trigger->handle()) == 0;
++  return handles_released;
++}
++
++bool RunRuntimeShutdownCase(rex::Runtime& runtime) {
++  auto* kernel_state = runtime.kernel_state();
++  if (!kernel_state) {
++    std::cerr << "shutdown test has no KernelState\n";
++    return false;
++  }
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, true);
++
++  auto exited = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA21));
++  if (exited->Create() != 0 || !WaitForGuestThread(exited.get())) {
++    std::cerr << "shutdown test initial thread did not finish\n";
++    return false;
++  }
++  auto trigger = rex::system::object_ref<ImmediateExitThread>(
++      new ImmediateExitThread(kernel_state, 0xCA22));
++  if (trigger->Create() != 0 || exited->stack_base_for_test() != 0 ||
++      !WaitForGuestThread(trigger.get())) {
++    std::cerr << "shutdown test failed to reclaim a completed stack\n";
++    return false;
++  }
++
++  // Keep both handles in the object table, but drop local references. KernelState
++  // resets those handles before Runtime releases guest Memory.
++  exited.reset();
++  trigger.reset();
++  runtime.Shutdown();
++  if (runtime.kernel_state() || runtime.memory()) {
++    std::cerr << "Runtime::Shutdown left KernelState or Memory alive\n";
++    return false;
++  }
++  std::cout << "thread-stack-reclamation runtime_shutdown reclaimed_stack=1 handles_reset=1\n";
++  return true;
++}
++
++}  // namespace
++
++int main() {
++  rex::Runtime runtime(std::filesystem::current_path());
++  rex::RuntimeConfig config;
++  config.tool_mode = true;
++  if (runtime.Setup(std::move(config)) != 0) {
++    std::cerr << "Runtime::Setup(tool_mode=true) failed\n";
++    return 1;
++  }
++
++  REXCVAR_SET(WWE2K14_THREAD_FREE_STACK_ON_EXIT, false);
++  auto* kernel_state = runtime.kernel_state();
++  if (!RunRetentionCase(kernel_state, false) || !RunRetentionCase(kernel_state, true) ||
++      !RunOffDestructorReleaseCase(kernel_state) || !RunTerminateAfterExitCase(kernel_state) ||
++      !RunLiveThreadCase(kernel_state) || !RunExternalTerminateCase(kernel_state) ||
++      !RunSaveRestoreAfterReclaimCase(kernel_state)) {
++    return 1;
++  }
++
++  if (!RunRuntimeShutdownCase(runtime)) {
++    return 1;
++  }
++  std::cout << "thread-stack-reclamation PASS\n";
++  return 0;
++}
+-- 
+2.43.0
+

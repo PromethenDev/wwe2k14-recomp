@@ -1,7 +1,7 @@
 From 621753c702fb9b61376e70f6c71ef1ea340d22cb Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 15:32:50 -0700
-Subject: [PATCH 56/97] system: optional host-backed utility drive
+Subject: [PATCH 056/149] system: optional host-backed utility drive
  (--mount_cache, default off) for the title's cache: partition
 
 Mounts <user_data_root>/cache_drive as \Device\Harddisk0\Cache0 = cache: when enabled; reports real host free space.
@@ -22,7 +22,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 tests/unit/system/cache_drive_test.cpp
 
 diff --git a/src/system/CMakeLists.txt b/src/system/CMakeLists.txt
-index e90504e..89c3b77 100644
+index e90504e9..89c3b775 100644
 --- a/src/system/CMakeLists.txt
 +++ b/src/system/CMakeLists.txt
 @@ -3,6 +3,7 @@
@@ -35,7 +35,7 @@ index e90504e..89c3b77 100644
      kernel_module.cpp
 diff --git a/src/system/cache_drive.cpp b/src/system/cache_drive.cpp
 new file mode 100644
-index 0000000..72dadd3
+index 00000000..72dadd3b
 --- /dev/null
 +++ b/src/system/cache_drive.cpp
 @@ -0,0 +1,93 @@
@@ -134,7 +134,7 @@ index 0000000..72dadd3
 +}  // namespace rex::system::internal
 diff --git a/src/system/cache_drive.h b/src/system/cache_drive.h
 new file mode 100644
-index 0000000..14b6ebe
+index 00000000..14b6ebe8
 --- /dev/null
 +++ b/src/system/cache_drive.h
 @@ -0,0 +1,21 @@
@@ -160,7 +160,7 @@ index 0000000..14b6ebe
 +
 +}  // namespace rex::system::internal
 diff --git a/src/system/runtime.cpp b/src/system/runtime.cpp
-index 7045304..f350458 100644
+index 7045304f..f3504588 100644
 --- a/src/system/runtime.cpp
 +++ b/src/system/runtime.cpp
 @@ -10,6 +10,7 @@
@@ -200,7 +200,7 @@ index 7045304..f350458 100644
    // Cache/STFC code baked into games tries reading/writing to these
    // Using a NullDevice returns success to all IO requests, allowing games
 diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
-index 9396408..a5b9fa9 100644
+index 9396408e..a5b9fa94 100644
 --- a/tests/unit/CMakeLists.txt
 +++ b/tests/unit/CMakeLists.txt
 @@ -5,6 +5,7 @@ add_executable(unit_tests
@@ -221,7 +221,7 @@ index 9396408..a5b9fa9 100644
  # rexsystem references rexkernel symbols; rescan the pair so the static link
 diff --git a/tests/unit/system/cache_drive_test.cpp b/tests/unit/system/cache_drive_test.cpp
 new file mode 100644
-index 0000000..0e75ee0
+index 00000000..0e75ee0c
 --- /dev/null
 +++ b/tests/unit/system/cache_drive_test.cpp
 @@ -0,0 +1,111 @@

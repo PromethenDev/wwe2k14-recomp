@@ -1,0 +1,13 @@
+libmspack 0.11alpha LZX decoder
+
+Upstream project: https://www.cabextract.org.uk/libmspack/
+Upstream source repository: https://github.com/kyz/libmspack
+Vendored source: dependencies/rexglue/thirdparty/libmspack/cabextract/mspack/lzxd.c
+License: LGPL-2.1; see libmspack-COPYING.LIB.
+
+This launcher package builds lzxd.c as the separate shared library
+wwe2k14_lzx (wwe2k14_lzx.dll on Windows, libwwe2k14_lzx.so on Linux).
+The launcher loads it from its own directory. Replacing this library with a
+compatible build that exports lzxd_init, lzxd_decompress, and lzxd_free does
+not require rebuilding the launcher. The library is built from the source
+identified above and the corresponding vendored libmspack headers.

@@ -1,7 +1,7 @@
 From 5905278d0ae5c5ff77e70314d8882b3ad0e5bf28 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 08:41:54 -0700
-Subject: [PATCH 29/97] codegen: vaddsws saturates per word, not per byte
+Subject: [PATCH 029/149] codegen: vaddsws saturates per word, not per byte
 
 The overflow mask (a ^ sum) & (b ^ sum) only carries the overflow flag in bit 31 of each
 word, but blendv_epi8 selects on bit 7 of every byte, so any byte whose own bit 7 was set
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 tests/ppc/asm/instr_vaddsws.s
 
 diff --git a/src/codegen/builders/vector.cpp b/src/codegen/builders/vector.cpp
-index 173b82b..ce08539 100644
+index 173b82bf..ce085390 100644
 --- a/src/codegen/builders/vector.cpp
 +++ b/src/codegen/builders/vector.cpp
 @@ -254,10 +254,12 @@ bool build_vaddsws(BuilderContext& ctx) {
@@ -41,7 +41,7 @@ index 173b82b..ce08539 100644
    return true;
 diff --git a/tests/ppc/asm/instr_vaddsws.s b/tests/ppc/asm/instr_vaddsws.s
 new file mode 100644
-index 0000000..0ebfceb
+index 00000000..0ebfceb2
 --- /dev/null
 +++ b/tests/ppc/asm/instr_vaddsws.s
 @@ -0,0 +1,9 @@

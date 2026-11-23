@@ -1,7 +1,7 @@
 From c1e563fce5c2f12f00bd4cb294130fe791155467 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 13:05:39 -0700
-Subject: [PATCH 20/97] diagnostics: global critical region contention census
+Subject: [PATCH 020/149] diagnostics: global critical region contention census
  with owner sampling
 
 When WWE13_RATE_CENSUS=1, global_critical_region::Acquire/AcquireDirect try
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 145 insertions(+)
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
-index ee1e984..8ad8d4b 100644
+index ee1e984d..8ad8d4b9 100644
 --- a/include/rex/diagnostics/rate_census.h
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -71,6 +71,13 @@ void CpPhaseExit(uint64_t now_ns);
@@ -39,7 +39,7 @@ index ee1e984..8ad8d4b 100644
  // Times a command processor phase when the census is enabled; a no-op
  // otherwise. Must be used on the GPU command thread only.
 diff --git a/include/rex/thread/mutex.h b/include/rex/thread/mutex.h
-index 6e5755a..27895a4 100644
+index 6e5755a4..27895a4f 100644
 --- a/include/rex/thread/mutex.h
 +++ b/include/rex/thread/mutex.h
 @@ -11,6 +11,7 @@
@@ -85,7 +85,7 @@ index 6e5755a..27895a4 100644
    }
  
 diff --git a/src/core/mutex.cpp b/src/core/mutex.cpp
-index d639924..a18b48f 100644
+index d639924c..a18b48fe 100644
 --- a/src/core/mutex.cpp
 +++ b/src/core/mutex.cpp
 @@ -11,8 +11,33 @@
@@ -123,7 +123,7 @@ index d639924..a18b48f 100644
    static std::recursive_mutex global_mutex;
    return global_mutex;
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index d97f221..0cb8648 100644
+index d97f221f..0cb8648a 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -25,8 +25,11 @@

@@ -1,10 +1,10 @@
 From 49b3d4466a6cfec10c76e6121a987f897ac8df7d Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 12:40:55 -0700
-Subject: [PATCH 96/97] freeze logger: WWE2K14_FREEZE_DUMP_NOW=<file> trigger -
- when the file exists the watchdog deletes it and writes a full freeze report
- now (for the W1 DLC boot hang where frames keep presenting); off unless set
-
+Subject: [PATCH 096/149] freeze logger: WWE2K14_FREEZE_DUMP_NOW=<file> trigger
+ - when the file exists the watchdog deletes it and writes a full freeze
+ report now (for the W1 DLC boot hang where frames keep presenting); off
+ unless set (Sonnet worker, Claude reviewed)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -12,7 +12,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 10 insertions(+)
 
 diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
-index 0411719..9ba1a53 100644
+index 0411719b..9ba1a537 100644
 --- a/src/core/freeze_logger.cpp
 +++ b/src/core/freeze_logger.cpp
 @@ -1017,6 +1017,16 @@ void Watchdog() {

@@ -72,3 +72,46 @@ extern "C" PPC_FUNC(sub_8251E6D0) {
   ctx.lr = 0x8251E708;
   __imp__sub_822622E0(ctx, base);
 }
+
+// Second begin() variant, 0x8251E728 (generated/wwe2k14_recomp.23.cpp:8608, reached through the function table): the
+// object comes in r3 instead of the singleton, it also stores [obj+0x10] = 1, and after the handshake it calls
+// 0x824FB140(obj) and 0x82C3F1B0(obj, 0). Same set-StartCloth-then-clear-EndCloth order, so the same lost completion
+// signal (out/night/20261031/jobrace/report.md section 1). Override: identical except EndCloth is cleared first.
+// Owner 2026-10-31 hypothesis: the freezes happen on integrated GPUs (780M start hang, UHD 630 LOW_POWER runs stuck).
+extern "C" PPC_FUNC(sub_822622E0);
+extern "C" PPC_FUNC(sub_82C929E0);
+extern "C" PPC_FUNC(sub_824FB140);
+extern "C" PPC_FUNC(sub_82C3F1B0);
+
+extern "C" PPC_FUNC(sub_8251E728) {
+  // Prologue as generated: save lr and r31, 96-byte frame.
+  PPC_STORE_U32(ctx.r1.u32 + -8, static_cast<uint32_t>(ctx.lr));
+  PPC_STORE_U64(ctx.r1.u32 + -16, ctx.r31.u64);
+  const uint32_t frame = ctx.r1.u32 - 96;
+  PPC_STORE_U32(frame, ctx.r1.u32);
+  ctx.r1.u32 = frame;
+  ctx.r31.u64 = ctx.r3.u64;
+  const uint32_t object = ctx.r31.u32;
+  PPC_STORE_U32(object + 16, 1);
+  if (PPC_LOAD_U32(object + kStartEvent) != 0) {
+    PPC_STORE_U32(object + kRunFlag, 1);
+    // Clear the previous completion signal first, then ask the worker to run (guest return addresses kept).
+    ctx.r3.u64 = PPC_LOAD_U32(object + kEndEvent);
+    ctx.lr = 0x8251E760;
+    sub_82C929E0(ctx, base);
+    ctx.r3.u64 = PPC_LOAD_U32(object + kStartEvent);
+    ctx.lr = 0x8251E758;
+    sub_822622E0(ctx, base);
+  }
+  ctx.r3.u64 = ctx.r31.u64;
+  ctx.lr = 0x8251E768;
+  sub_824FB140(ctx, base);
+  ctx.r4.s64 = 0;
+  ctx.r3.u64 = ctx.r31.u64;
+  ctx.lr = 0x8251E774;
+  sub_82C3F1B0(ctx, base);
+  // Epilogue as generated.
+  ctx.r1.s64 = ctx.r1.s64 + 96;
+  ctx.lr = PPC_LOAD_U32(ctx.r1.u32 + -8);
+  ctx.r31.u64 = PPC_LOAD_U64(ctx.r1.u32 + -16);
+}

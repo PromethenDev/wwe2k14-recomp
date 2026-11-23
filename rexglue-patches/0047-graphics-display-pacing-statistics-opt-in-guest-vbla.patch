@@ -1,7 +1,7 @@
 From d289f5be3832c861a53ce944bf2543b40d4d947c Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 17:32:48 -0700
-Subject: [PATCH 47/97] graphics: display pacing statistics; opt-in guest
+Subject: [PATCH 047/149] graphics: display pacing statistics; opt-in guest
  vblank on the host display vblank
 
 display_pacing_stats (Windows): a thread waits on the host display's vblanks (DXGI output of the window's
@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 189 insertions(+)
 
 diff --git a/include/rex/graphics/graphics_system.h b/include/rex/graphics/graphics_system.h
-index e407a0d..526bfc7 100644
+index e407a0d6..526bfc78 100644
 --- a/include/rex/graphics/graphics_system.h
 +++ b/include/rex/graphics/graphics_system.h
 @@ -119,6 +119,13 @@ class GraphicsSystem : public system::IGraphicsSystem {
@@ -45,7 +45,7 @@ index e407a0d..526bfc7 100644
    std::unique_ptr<CommandProcessor> command_processor_;
  
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index 8358f29..45f45d5 100644
+index 8358f29c..45f45d56 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
 @@ -355,7 +355,17 @@ class Presenter {
@@ -67,7 +67,7 @@ index 8358f29..45f45d5 100644
      kPresented,
      kPresentedSuboptimal,
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index a0b28df..173495a 100644
+index a0b28df8..173495a6 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -13,6 +13,8 @@
@@ -239,7 +239,7 @@ index a0b28df..173495a 100644
    diagnostics::rate_census::RecordVblank();
  
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index b6dc208..4ee2811 100644
+index b6dc208f..4ee28110 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -1609,6 +1609,42 @@ void Presenter::WaitForUITickFromUIThread() {
@@ -286,7 +286,7 @@ index b6dc208..4ee2811 100644
  #if REX_PLATFORM_WIN32
    std::scoped_lock<std::mutex> dxgi_ui_tick_lock(dxgi_ui_tick_mutex_);
 diff --git a/src/ui/vulkan/vulkan_presenter.cpp b/src/ui/vulkan/vulkan_presenter.cpp
-index 30bafba..2fa9642 100644
+index 30bafbaf..2fa9642f 100644
 --- a/src/ui/vulkan/vulkan_presenter.cpp
 +++ b/src/ui/vulkan/vulkan_presenter.cpp
 @@ -1369,6 +1369,14 @@ VkSwapchainKHR VulkanPresenter::PaintContext::CreateSwapchainForVulkanSurface(

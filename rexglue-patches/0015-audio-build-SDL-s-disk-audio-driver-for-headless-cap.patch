@@ -1,7 +1,7 @@
 From aef26073dd13a92092465ea17998300616982173 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 05:24:49 -0700
-Subject: [PATCH 15/97] audio: build SDL's disk audio driver for headless
+Subject: [PATCH 015/149] audio: build SDL's disk audio driver for headless
  capture
 
 Enables SDL_DISKAUDIO so SDL_AUDIODRIVER=disk can record the mixed guest
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 2 insertions(+), 2 deletions(-)
 
 diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
-index fc37ac6..04b2c94 100644
+index fc37ac64..04b2c941 100644
 --- a/thirdparty/CMakeLists.txt
 +++ b/thirdparty/CMakeLists.txt
 @@ -252,8 +252,8 @@ set(SDL_OPENGLES OFF CACHE BOOL "" FORCE)

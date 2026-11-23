@@ -1,8 +1,8 @@
 From 12abb6ff1280d8ec1c065eac042c1f684a9da819 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 15:18:24 -0700
-Subject: [PATCH 71/97] cvar: fail loudly on an invalid launch option (BUG-4) -
- parse errors and invalid values stop the app before any setup (Windows
+Subject: [PATCH 071/149] cvar: fail loudly on an invalid launch option (BUG-4)
+ - parse errors and invalid values stop the app before any setup (Windows
  MessageBox / Linux stderr, exit 1); --help still exits 0
 
 Verified: game 1530584e rejects --resolution_scale=abc with the player-facing message, exit 1,
@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 59 insertions(+), 10 deletions(-)
 
 diff --git a/include/rex/cvar.h b/include/rex/cvar.h
-index 82d23a8..424ba65 100644
+index 82d23a82..424ba659 100644
 --- a/include/rex/cvar.h
 +++ b/include/rex/cvar.h
 @@ -103,7 +103,13 @@ namespace rex::cvar {
@@ -38,7 +38,7 @@ index 82d23a8..424ba65 100644
  void ApplyEnvironment();
  void FinalizeInit();
 diff --git a/src/core/cvar.cpp b/src/core/cvar.cpp
-index 314b388..23b4091 100644
+index 314b3888..23b40916 100644
 --- a/src/core/cvar.cpp
 +++ b/src/core/cvar.cpp
 @@ -345,7 +345,8 @@ void UnregisterChangeCallbacks(std::string_view name) {
@@ -85,7 +85,7 @@ index 314b388..23b4091 100644
  
  void LoadConfig(const std::filesystem::path& config_path) {
 diff --git a/src/rexglue/main.cpp b/src/rexglue/main.cpp
-index 23720e6..7241b3f 100644
+index 23720e6a..7241b3fa 100644
 --- a/src/rexglue/main.cpp
 +++ b/src/rexglue/main.cpp
 @@ -13,8 +13,10 @@
@@ -117,7 +117,7 @@ index 23720e6..7241b3f 100644
  
    std::string command;
 diff --git a/src/ui/windowed_app_main_posix.cpp b/src/ui/windowed_app_main_posix.cpp
-index ea122f0..d917779 100644
+index ea122f02..d917779b 100644
 --- a/src/ui/windowed_app_main_posix.cpp
 +++ b/src/ui/windowed_app_main_posix.cpp
 @@ -15,6 +15,7 @@
@@ -148,7 +148,7 @@ index ea122f0..d917779 100644
  
    int result;
 diff --git a/src/ui/windowed_app_main_win.cpp b/src/ui/windowed_app_main_win.cpp
-index 1005821..b46e23b 100644
+index 1005821b..b46e23b0 100644
 --- a/src/ui/windowed_app_main_win.cpp
 +++ b/src/ui/windowed_app_main_win.cpp
 @@ -14,6 +14,7 @@

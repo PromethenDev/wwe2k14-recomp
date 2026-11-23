@@ -1,0 +1,59 @@
+From fd8e4301446d12a6e50675773c471032e9fa2af0 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 4 Nov 2026 15:11:04 -0800
+Subject: [PATCH 138/149] TEST CPU limit compiled out unless
+ REXGLUE_TEST_CPU_LIMIT=ON (default OFF; public releases never read
+ REX_TEST_CPU_LIMIT / TEST-CPU-LIMIT.txt)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ CMakeLists.txt             | 1 +
+ src/core/CMakeLists.txt    | 4 ++++
+ src/core/threading_win.cpp | 4 ++++
+ 3 files changed, 9 insertions(+)
+
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 410a51d2..c46040c7 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -16,6 +16,7 @@ option(REXGLUE_ENABLE_SANITIZERS "Enable UndefinedBehaviorSanitizer" OFF)
+ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (experimental)" OFF)
+ option(REXGLUE_ENABLE_TRACY                "Enable Tracy profiler integration" OFF)
+ option(REXGLUE_ENABLE_PERF_COUNTERS        "Enable lightweight perf counter registry and overlay" OFF)
++option(REXGLUE_TEST_CPU_LIMIT             "TEST builds only: honour REX_TEST_CPU_LIMIT / TEST-CPU-LIMIT.txt (never in public releases)" OFF)
+ option(REXGLUE_PROFILE_GUEST_FUNCTIONS     "Enable per-function Tracy zones in recompiled guest code (high overhead)" OFF)
+ option(REXGLUE_FFMPEG_SHARED "Build FFmpeg libavutil/libavcodec as shared libraries" ON)
+ 
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 5fbc5921..924006b8 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -104,6 +104,10 @@ if(REXGLUE_ENABLE_TRACY)
+         $<$<NOT:$<CONFIG:Release>>:REXGLUE_ENABLE_PROFILING>)
+ endif()
+ 
++if(REXGLUE_TEST_CPU_LIMIT)
++    target_compile_definitions(rexcore PRIVATE REXGLUE_TEST_CPU_LIMIT=1)
++endif()
++
+ if(REXGLUE_ENABLE_PERF_COUNTERS)
+     target_sources(rexcore PRIVATE perf/counter.cpp)
+     target_compile_definitions(rexcore PUBLIC
+diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
+index 39dc39cc..74c369d3 100644
+--- a/src/core/threading_win.cpp
++++ b/src/core/threading_win.cpp
+@@ -164,6 +164,10 @@ bool ParseTestCpuLimit(const std::string& text, uint32_t* cores, uint32_t* tpc)
+ const TestCpuLimit& GetTestCpuLimit() {
+   static const TestCpuLimit limit = [] {
+     TestCpuLimit out;
++#if !defined(REXGLUE_TEST_CPU_LIMIT)
++    // Public builds: the TEST-only limit is compiled out (env and file are never read).
++    if (true) return out;
++#endif
+     std::string text;
+     if (const char* env = std::getenv("REX_TEST_CPU_LIMIT"); env && *env) {
+       text = env;
+-- 
+2.43.0
+

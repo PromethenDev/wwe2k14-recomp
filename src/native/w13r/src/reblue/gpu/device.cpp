@@ -1,0 +1,1160 @@
+/**
+ * @file    gpu/device.cpp
+ * @brief   Starting the host device: the plume interface, swap chain, pipeline
+ *          layout, copy/resolve pipelines, and the device-lost watch.
+ *
+ * @copyright Copyright (c) 2026 Tom Clay <tomc@tctechstuff.com>
+ *            All rights reserved.
+ * @license   BSD 3-Clause License
+ *            See LICENSE file in the project root for full license text.
+ */
+#include "gpu/device.h"
+
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <format>
+#include <memory>
+#include <mutex>
+#include <thread>
+#include <unordered_map>
+
+#include <plume_render_interface.h>
+#include <plume_render_interface_builders.h>
+#if defined(REBLUE_D3D11)
+#include <plume_d3d11.h>
+#elif defined(REBLUE_D3D12)
+#include <plume_d3d12.h>
+#else
+#include <plume_vulkan.h>
+#endif
+#include <rex/cvar.h>
+#include <rex/filesystem.h>
+#include <rex/runtime.h>
+#include <rex/ui/flags.h>
+#include <rex/ui/window.h>
+
+#include "gpu/gpu_profiling.h"
+
+#include "core/logging.h"
+#include "core/memory_helpers.h"
+#include "core/settings.h"
+#include "core/shutdown.h"
+#include "gpu/backend.h"
+#include "gpu/bindless_allocator.h"
+#include "gpu/constant_buffers.h"
+#include "gpu/dred.h"
+#include "gpu/format.h"
+#include "gpu/frame.h"
+#include "gpu/host_heap.h"
+#include "gpu/host_resource_heap.h"
+#include "gpu/output.h"
+#include "gpu/pipeline/pso_recorder.h"
+#include "gpu/settings.h"
+#include "gpu/surface_registry.h"
+#include "platform/platform.h"
+
+namespace plume {
+#if defined(REBLUE_D3D11)
+#elif defined(REBLUE_D3D12)
+extern std::unique_ptr<RenderInterface> CreateD3D12Interface();
+#else
+extern std::unique_ptr<RenderInterface> CreateVulkanInterface();
+#if defined(_WIN32)
+extern bool VulkanDxgiPresent;  // plume_vulkan_dxgi.cpp
+#endif
+#endif
+} // namespace plume
+
+#if !defined(REBLUE_D3D11) && !defined(REBLUE_D3D12) && defined(_WIN32)
+REXCVAR_DEFINE_BOOL(wwe13_vk_dxgi_present, true, "WWE13",
+                    "Vulkan: present through a DXGI flip-model swap chain (shared D3D11 textures + keyed "
+                    "mutex) instead of the Vulkan swap chain, which the Intel UHD 630 composes by a copy")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+REXCVAR_DEFINE_INT32(wwe13_vk_dxgi_fallback_test, 0, "WWE13",
+                     "Test only: 1 = treat the DXGI swap chain as failed at start, 2 = after 600 presents "
+                     "(exercises the fall-back to the Vulkan swap chain)")
+    .lifecycle(rex::cvar::Lifecycle::kInitOnly);
+#endif
+
+REXCVAR_DEFINE_STRING(svr_gpu_device, "", "SvR",
+                      "Vulkan name of the GPU to render with (empty = the most capable)");
+
+REXCVAR_DEFINE_BOOL(svr_rt_no_compression, false, "SvR",
+                    "Test for the coloured blocks on the right of the picture on Intel HD/UHD "
+                    "Graphics and the Steam Deck: create render targets as storage images, so the "
+                    "driver doesn't compress them.");
+
+#if defined(REBLUE_D3D12)
+REXCVAR_DEFINE_BOOL(svr_d3d12_depth32, false, "SvR",
+                    "D3D12: 32-bit float depth on NVIDIA and Intel too, as Vulkan (default: 24-bit "
+                    "there). Test for depth faults on old Intel drivers (WWE '12 PC #7).");
+#endif
+
+namespace bd::gpu {
+
+namespace {
+
+float ChannelFromArgb(u32 argb, int shift) {
+  return static_cast<float>((argb >> shift) & 0xFF) / 255.0f;
+}
+
+} // namespace
+
+plume::RenderColor ArgbToRenderColor(u32 argb) {
+  return plume::RenderColor(ChannelFromArgb(argb, 16), ChannelFromArgb(argb, 8),
+                            ChannelFromArgb(argb, 0),
+                            ChannelFromArgb(argb, 24));
+}
+
+#if !defined(REBLUE_D3D11) && !defined(REBLUE_D3D12) && defined(_WIN32)
+// The DXGI present path passed its start-up probe but then failed (first resize, or presents):
+// build the plain Vulkan swap chain on the same window instead, so the game still shows a picture.
+// Caller has waited all frame fences. Frame-buffers and present semaphores are left for the caller
+// to rebuild; acquire semaphores are made new (a failed DXGI acquire may have left one pending).
+bool FallBackToVulkanSwapChain(VideoState &s, const char *why) {
+  if (!plume::VulkanDxgiPresentActive || !s.swap_chain)
+    return false;
+  BD_WARN("[present] DXGI flip swap chain failed ({}): switching to the Vulkan swap chain", why);
+  const plume::RenderWindow window = s.swap_chain->getWindow();
+  s.framebuffers.clear();
+  s.render_semaphores.clear();
+  s.swap_chain.reset();
+  plume::VulkanDxgiPresent = false;
+  for (u32 i = 0; i < kNumFrames; ++i)
+    s.acquire_semaphores[i] = s.device->createCommandSemaphore();
+  plume::RenderSwapChainDesc desc(window, kSwapChainFormat, kNumFrames + 1, false, kNumFrames);
+  s.swap_chain = s.queue->createSwapChain(desc);
+  if (s.swap_chain)
+    s.swap_chain->resize();
+  if (!s.swap_chain || s.swap_chain->isEmpty()) {
+    BD_ERROR("[present] Vulkan swap chain fall-back failed too");
+    return false;
+  }
+  BD_INFO("[present] Vulkan frames go through the Vulkan swap chain (fall-back)");
+  return true;
+}
+#endif
+
+bool BuildFramebuffers(VideoState &s) {
+  s.framebuffers.clear();
+  const u32 count = s.swap_chain->getTextureCount();
+  s.framebuffers.reserve(count);
+  for (u32 i = 0; i < count; ++i) {
+    plume::RenderTexture *tex = s.swap_chain->getTexture(i);
+    const plume::RenderTexture *color_attachments[1] = {tex};
+    plume::RenderFramebufferDesc desc(color_attachments, 1);
+    auto fb = s.device->createFramebuffer(desc);
+    if (!fb) {
+      BD_ERROR("Plume createFramebuffer failed for back buffer {}", i);
+      s.framebuffers.clear(); // never leave a partial set, Present's empty()
+                              // gate is all-or-nothing
+      return false;
+    }
+    s.framebuffers.push_back(std::move(fb));
+  }
+  return true;
+}
+
+// Rebuilt alongside BuildFramebuffers, because a resize can change the
+// surface's negotiated image count. See render_semaphores for why this is not
+// sized to kNumFrames.
+bool BuildPresentSemaphores(VideoState &s) {
+  s.render_semaphores.clear();
+  const u32 count = s.swap_chain->getTextureCount();
+  s.render_semaphores.reserve(count);
+  for (u32 i = 0; i < count; ++i) {
+    auto sem = s.device->createCommandSemaphore();
+    if (!sem) {
+      BD_ERROR("Plume createCommandSemaphore failed for present semaphore {}",
+               i);
+      s.render_semaphores.clear();
+      return false;
+    }
+    s.render_semaphores.push_back(std::move(sem));
+  }
+  return true;
+}
+
+plume::RenderSampleCounts Video::CvarMSAASampleCount() {
+  auto &s = state();
+  plume::RenderSampleCounts requested;
+  switch (Settings::Get().MSAA()) {
+  case 2:
+    requested = plume::RenderSampleCount::COUNT_2;
+    break;
+  case 4:
+    requested = plume::RenderSampleCount::COUNT_4;
+    break;
+  case 8:
+    requested = plume::RenderSampleCount::COUNT_8;
+    break;
+  default:
+    return plume::RenderSampleCount::COUNT_1;
+  }
+  // Power-of-two bitmask: a level is supported iff its bit is set in the mask.
+  if ((s.supported_sample_mask & requested) == 0)
+    return plume::RenderSampleCount::COUNT_1;
+  return requested;
+}
+
+// Per-signature time throttle, so a sustained failure stays visible for its
+// whole duration instead of going dark after a fixed count, and one noisy site
+// cannot drown out another. The printed occurrence number carries the
+// suppressed volume.
+bool DiagShouldLog(u64 site, const GuestTexture *t, u32 *n_out) {
+  *n_out = 0;
+  if (!::bd::Settings::Get().Devmode())
+    return false;
+  const u64 key =
+      (site << 56) |
+      (t ? (u64(t->width) << 40) | (u64(t->height) << 24) | u64(t->format) : 0);
+  using Clock = std::chrono::steady_clock;
+  struct DiagState {
+    u32 count = 0;
+    Clock::time_point last_log{};
+  };
+  static std::mutex m;
+  static std::unordered_map<u64, DiagState> states;
+  std::lock_guard lock(m);
+  DiagState &st = states[key];
+  const u32 n = st.count++;
+  *n_out = n;
+  const auto now = Clock::now();
+  if (n == 0 || now - st.last_log >= std::chrono::seconds(1)) {
+    st.last_log = now;
+    return true;
+  }
+  return false;
+}
+
+namespace {
+
+// The dims BD believes its backbuffer has, which the implicit RT[0]
+// placeholder and the default viewport must use rather than the raw swapchain
+// dims: this size defines full-screen for the posteff chain seeding, and a
+// swap-sized backbuffer on a non-16:9 output matches none of BD's fit-sized
+// composite RTs.
+void GuestBackBufferDims(u32 &w, u32 &h) {
+  if (!Output::RenderSize(w, h)) {
+    w = static_cast<u32>(kDesignCanvasWidth);
+    h = static_cast<u32>(kDesignCanvasHeight);
+  }
+}
+
+// (Re)create the back buffer placeholder's texture and view at w x h. Caller
+// guarantees no in-flight GPU references (init, or the resize path's full-ring
+// fence wait) and rebinds the SRV slot.
+bool CreateBackBufferTexture(VideoState &s, GuestTexture *bb, u32 w, u32 h) {
+  bb->framebuffers.clear();
+  bb->width = w;
+  bb->height = h;
+  bb->format = plume::RenderFormat::B8G8R8A8_UNORM;
+  bb->mipLevels = 1;
+  bb->viewDimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+  bb->layout = plume::RenderTextureLayout::UNKNOWN;
+
+  plume::RenderTextureDesc desc;
+  desc.dimension = plume::RenderTextureDimension::TEXTURE_2D;
+  desc.width = w;
+  desc.height = h;
+  desc.depth = 1;
+  desc.mipLevels = 1;
+  desc.arraySize = 1;
+  desc.format = bb->format;
+  desc.flags = plume::RenderTextureFlag::RENDER_TARGET;
+  desc.multisampling.sampleCount = plume::RenderSampleCount::COUNT_1;
+  desc.committed = true; // avoid placed-resource uninit GBV debug fill
+  bb->textureHolder = CreateHostTexture(s.device.get(), desc, "backbuffer-rt");
+  bb->texture = bb->textureHolder.get();
+  if (!bb->texture)
+    return false;
+
+  plume::RenderTextureViewDesc view_desc;
+  view_desc.format = bb->format;
+  view_desc.dimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+  view_desc.mipLevels = 1;
+  bb->textureView = bb->texture->createTextureView(view_desc);
+  return true;
+}
+
+// D3D12 has no single version number, so the highest feature level the device
+// accepts stands in for one. plume probes shader model 6.0 alone, so its
+// cached shaderModel says nothing.
+std::string DescribeBackend(plume::RenderDevice *device) {
+#if defined(REBLUE_D3D11)
+  auto *dev = static_cast<plume::D3D11Device *>(device);
+  const u32 fl = dev ? static_cast<u32>(dev->featureLevel) : 0;
+  return std::format("D3D11 {}_{}", (fl >> 12) & 0xF, (fl >> 8) & 0xF);
+#elif defined(REBLUE_D3D12)
+  auto *dev = static_cast<plume::D3D12Device *>(device);
+  static const D3D_FEATURE_LEVEL kLevels[] = {
+      D3D_FEATURE_LEVEL_12_2, D3D_FEATURE_LEVEL_12_1, D3D_FEATURE_LEVEL_12_0,
+      D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
+  D3D12_FEATURE_DATA_FEATURE_LEVELS levels = {};
+  levels.NumFeatureLevels = static_cast<u32>(std::size(kLevels));
+  levels.pFeatureLevelsRequested = kLevels;
+  if (dev && dev->d3d &&
+      dev->d3d->CheckFeatureSupport(D3D12_FEATURE_FEATURE_LEVELS, &levels,
+                                    sizeof(levels)) >= 0) {
+    const u32 fl = static_cast<u32>(levels.MaxSupportedFeatureLevel);
+    return std::format("D3D12 {}_{}", (fl >> 12) & 0xF, (fl >> 8) & 0xF);
+  }
+  return "D3D12";
+#else
+  auto *dev = static_cast<plume::VulkanDevice *>(device);
+  if (!dev)
+    return "Vulkan";
+#if defined(__APPLE__)
+  const u32 drv = dev->physicalDeviceProperties.driverVersion;
+  const u32 mvk_major = drv / 10000, mvk_minor = (drv / 100) % 100,
+            mvk_patch = drv % 100;
+  if (mvk_major >= 1 && mvk_major <= 9)
+    return std::format("MoltenVK {}.{}.{}", mvk_major, mvk_minor, mvk_patch);
+#endif
+  // The physical device's own version, not the 1.2 plume asks the instance for:
+  // this is the number a driver bug report needs.
+  const u32 v = dev->physicalDeviceProperties.apiVersion;
+  return std::format("Vulkan {}.{}.{}", VK_API_VERSION_MAJOR(v),
+                     VK_API_VERSION_MINOR(v), VK_API_VERSION_PATCH(v));
+#endif
+}
+
+plume::RenderFormat
+PickDepthStencilFormat([[maybe_unused]] plume::RenderDevice *device) {
+#if defined(REBLUE_D3D12)
+  const auto vendor = device->getDescription().vendor;
+  if (!REXCVAR_GET(svr_d3d12_depth32) &&
+      (vendor == plume::RenderDeviceVendor::NVIDIA ||
+       vendor == plume::RenderDeviceVendor::INTEL) &&
+      (device->getSampleCountsSupported(
+           plume::RenderFormat::D24_UNORM_S8_UINT) &
+       plume::RenderSampleCount::COUNT_1)) {
+    return plume::RenderFormat::D24_UNORM_S8_UINT;
+  }
+#endif
+  return plume::RenderFormat::D32_FLOAT_S8_UINT;
+}
+
+plume::RenderFormat PickSceneColorFormat(plume::RenderDevice *device) {
+  if (Settings::Get().SceneColorR11G11B10() &&
+      (device->getSampleCountsSupported(
+           plume::RenderFormat::R11G11B10_FLOAT) &
+       plume::RenderSampleCount::COUNT_1)) {
+    return plume::RenderFormat::R11G11B10_FLOAT;
+  }
+  return plume::RenderFormat::R16G16B16A16_FLOAT;
+}
+
+} // namespace
+
+VideoState &state() {
+  static VideoState s;
+  return s;
+}
+
+// Registered by the app (ReblueApp::OnPreLaunchModule), invoked from Present.
+Video::OverlayDrawHook g_overlay_draw_hook;
+
+bool Video::CreateHostDevice(rex::ui::Window *window) {
+  if (!window) {
+    BD_ERROR("Video::CreateHostDevice called with null window");
+    return false;
+  }
+  auto &s = state();
+  std::lock_guard lock(s.mutex);
+  if (s.ready) {
+    return true;
+  }
+
+  if (!s.device) { // pre-Runtime path: no guest memory required
+    Output::Init(window);
+    plume::RenderWindow render_window{};
+    if (!bd::platform::GetNativeRenderWindow(window, render_window)) {
+      return false;
+    }
+
+    for (u32 i = 0; i < std::size(s.input_slots); ++i) {
+      s.input_slots[i].index = i;
+    }
+
+#if defined(REBLUE_D3D11)
+    s.render_iface = plume::CreateD3D11Interface();
+    if (!s.render_iface) {
+      BD_ERROR("Plume CreateD3D11Interface failed");
+      return false;
+    }
+    const bool dred_armed = false;
+#elif defined(REBLUE_D3D12)
+    s.render_iface = plume::CreateD3D12Interface();
+    if (!s.render_iface) {
+      BD_ERROR("Plume CreateD3D12Interface failed");
+      return false;
+    }
+    // After the interface, before the device: asking earlier can bind the
+    // process-wide settings to the system runtime rather than the Agility
+    // D3D12Core.dll that ends up owning the device.
+    const bool dred_armed = EnableDred();
+#else
+#if defined(_WIN32)
+    plume::VulkanDxgiPresent = REXCVAR_GET(wwe13_vk_dxgi_present);
+#endif
+    s.render_iface = plume::CreateVulkanInterface();
+    if (!s.render_iface) {
+      BD_ERROR("Plume CreateVulkanInterface failed");
+      return false;
+    }
+#if defined(SVR_NATIVE_RENDERER)
+    // plume-pipeline-cache.patch: the driver's pipeline cache lives in cache/ beside the exe (a
+    // driver blob, never packaged), so pipelines compiled once are not compiled again next launch.
+    {
+      const auto cache_dir = (rex::filesystem::GetExecutableFolder() / "cache").string();
+      plume::setVulkanPipelineCacheDirectory(cache_dir.c_str());
+    }
+#endif
+#endif
+    // svr_gpu_device: the Vulkan name of the GPU to use (as vulkaninfo lists it), e.g. a laptop's
+    // integrated one; empty picks the most capable (a discrete GPU first). plume reports why a
+    // device fails only on stderr, so list the GPUs here, and when the chosen one can't run the
+    // game (an old discrete GPU beside a newer integrated one, or the other way round) try the
+    // others before giving up.
+    std::vector<std::string> gpu_names;
+#if !defined(REBLUE_D3D12)
+    if (auto *vk = static_cast<plume::VulkanInterface *>(s.render_iface.get()); vk && vk->instance) {
+      uint32_t count = 0;
+      vkEnumeratePhysicalDevices(vk->instance, &count, nullptr);
+      std::vector<VkPhysicalDevice> devices(count);
+      vkEnumeratePhysicalDevices(vk->instance, &count, devices.data());
+      for (VkPhysicalDevice d : devices) {
+        VkPhysicalDeviceProperties p{};
+        vkGetPhysicalDeviceProperties(d, &p);
+        BD_INFO("Vulkan GPU: '{}' type {} API {}.{}.{} driver 0x{:X} vendor 0x{:04X}",
+                p.deviceName, u32(p.deviceType), VK_API_VERSION_MAJOR(p.apiVersion),
+                VK_API_VERSION_MINOR(p.apiVersion), VK_API_VERSION_PATCH(p.apiVersion),
+                p.driverVersion, p.vendorID);
+        gpu_names.emplace_back(p.deviceName);
+      }
+    }
+#endif
+    // plume treats these as optional, the recompiled shaders don't: without them every draw
+    // reads nothing and the game runs behind a black screen (old drivers, e.g. issue #14 on a
+    // Radeon HD 8790M). Fail if no GPU has them, so the player gets the "Vulkan too old" message.
+    auto usable = [](plume::RenderDevice *device) {
+      if constexpr (!g_vulkan)
+        return true;  // (Direct3D 12 / 11: Vulkan's needs only)
+      const auto &caps = device->getCapabilities();
+      if (caps.bufferDeviceAddress && caps.descriptorIndexing)
+        return true;
+      BD_WARN("GPU '{}' lacks Vulkan features the game needs (bufferDeviceAddress {}, "
+              "descriptorIndexing {}): driver too old or GPU too old",
+              device->getDescription().name, caps.bufferDeviceAddress, caps.descriptorIndexing);
+      return false;
+    };
+    const std::string wanted = REXCVAR_GET(svr_gpu_device);
+    s.device = s.render_iface->createDevice(wanted);
+    if (s.device && !usable(s.device.get()))
+      s.device.reset();
+    if (!s.device)
+      BD_WARN("GPU '{}' can't be used (missing Vulkan extensions or features), trying the others",
+              wanted.empty() ? "default" : wanted);
+    for (const std::string &name : gpu_names) {
+      if (s.device)
+        break;
+      if (name == wanted)
+        continue;
+      s.device = s.render_iface->createDevice(name);
+      // plume falls back to the highest-ranked GPU when the name isn't chosen: keep only a match.
+      if (s.device && (s.device->getDescription().name != name || !usable(s.device.get())))
+        s.device.reset();
+      else if (s.device)
+        BD_WARN("Using GPU '{}' instead", name);
+    }
+    if (!s.device) {
+      BD_ERROR("No {} GPU can run the game (see the 'Vulkan GPU' and warning lines above)",
+               g_vulkan ? "Vulkan" : "Direct3D");
+      return false;
+    }
+#if defined(SVR_NATIVE_RENDERER) && !defined(REBLUE_D3D12)
+    if (auto *vk_device = static_cast<plume::VulkanDevice *>(s.device.get())) {
+      VkFormatProperties props{};
+      vkGetPhysicalDeviceFormatProperties(vk_device->physicalDevice, VK_FORMAT_R16G16_UNORM, &props);
+      const bool rt = (props.optimalTilingFeatures & VK_FORMAT_FEATURE_COLOR_ATTACHMENT_BIT) != 0;
+      SetR16G16UnormRenderTargetSupported(rt);
+      BD_INFO("R16G16_UNORM colour attachment: {}", rt ? "supported" : "not supported");
+    }
+#elif defined(SVR_NATIVE_RENDERER)
+    // Direct3D 12 and 11 (feature level 10_0 and up) require R16G16_UNORM render targets.
+    SetR16G16UnormRenderTargetSupported(true);
+#endif
+    s.backend_info = DescribeBackend(s.device.get());
+    // bd_msaa is clamped to the color/depth intersection. Everything
+    // shader-resolves, so no hardware resolve capability is needed.
+    s.depth_stencil_format = PickDepthStencilFormat(s.device.get());
+    s.scene_color_format = PickSceneColorFormat(s.device.get());
+    const auto color_counts =
+        s.device->getSampleCountsSupported(s.scene_color_format);
+    const auto depth_counts =
+        s.device->getSampleCountsSupported(s.depth_stencil_format);
+    s.supported_sample_mask = color_counts & depth_counts;
+
+    s.queue =
+        s.device->createCommandQueue(plume::RenderCommandListType::DIRECT);
+    // Each list owns its allocator, so begin() resets independently. present()
+    // waits the render semaphore, so the swapchain never scans out an
+    // unfinished back buffer.
+    for (u32 i = 0; i < kNumFrames; ++i) {
+      s.command_lists[i] = s.queue->createCommandList();
+      s.fences[i] = s.device->createCommandFence();
+      s.acquire_semaphores[i] = s.device->createCommandSemaphore();
+    }
+    s.command_list = s.command_lists[0].get(); // recording alias -> slot 0
+    [[maybe_unused]] const bool dred_breadcrumbs = PrepareDredCommandObjects();
+
+    const bool upload_caps = s.device->getCapabilities().gpuUploadHeap;
+    const bool upload_on = upload_caps && Settings::Get().GeometryGPUUpload();
+    std::string caps = std::format(
+        "GPU caps: {} on {} (driver 0x{:X}, {} MB) | scene {} {} | MSAA color=0x{:X} "
+        "depth=0x{:X} usable=0x{:X} | geometry GPU_UPLOAD {}",
+        s.backend_info, s.device->getDescription().name,
+        s.device->getDescription().driverVersion,
+        s.device->getDescription().dedicatedVideoMemory / (1024 * 1024),
+        s.scene_color_format == plume::RenderFormat::R11G11B10_FLOAT
+            ? "R11G11B10"
+            : "RGBA16F",
+        s.depth_stencil_format == plume::RenderFormat::D24_UNORM_S8_UINT
+            ? "D24S8"
+            : "D32S8",
+        color_counts, depth_counts, s.supported_sample_mask,
+        upload_on      ? "on"
+        : !upload_caps ? "unsupported"
+                       : "off (bd_geometry_gpu_upload)");
+#if defined(REBLUE_D3D12)
+    const char *dred_state = !dred_armed        ? "off"
+                             : dred_breadcrumbs ? "on"
+                                                : "armed, no breadcrumb writes";
+    caps += std::format(" | DRED {}", dred_state);
+#endif
+    BD_INFO("{}", caps);
+
+    // kNumFrames + 1: a flip model swapchain needs one back buffer beyond the
+    // frames in flight so acquiring N+1 never waits on scanout.
+    plume::RenderSwapChainDesc desc(render_window,
+                                    kSwapChainFormat,
+                                    kNumFrames + 1, false, kNumFrames);
+    s.swap_chain = s.queue->createSwapChain(desc);
+#if !defined(REBLUE_D3D12)
+    // plume's VulkanSwapChain defers VkSwapchain creation to resize(), so a
+    // fresh swapchain is always empty until the first resize. The D3D12 backend
+    // creates its swapchain in the constructor, so this stays Vulkan-only.
+    if (s.swap_chain) {
+      s.swap_chain->resize();
+    }
+#if defined(_WIN32) && !defined(REBLUE_D3D11)
+    if (s.swap_chain && plume::VulkanDxgiPresentActive &&
+        (s.swap_chain->isEmpty() || REXCVAR_GET(wwe13_vk_dxgi_fallback_test) == 1))
+      FallBackToVulkanSwapChain(s, s.swap_chain->isEmpty() ? "first resize" : "test");
+#endif
+#endif
+    if (!s.swap_chain || s.swap_chain->isEmpty()) {
+      BD_ERROR("Plume createSwapChain failed");
+      return false;
+    }
+#if !defined(REBLUE_D3D11) && !defined(REBLUE_D3D12) && defined(_WIN32)
+    // Which present path ran (plume's own [plume-dxgi] lines go to stderr only).
+    BD_INFO("[present] Vulkan frames go through {}",
+            plume::VulkanDxgiPresentActive ? "a DXGI flip swap chain (wwe13_vk_dxgi_present)"
+                                           : "the Vulkan swap chain");
+#endif
+#if defined(__ANDROID__)
+    NoteSwapChainWindow(render_window);
+#endif
+    if (!BuildFramebuffers(s)) {
+      return false;
+    }
+    if (!BuildPresentSemaphores(s)) {
+      return false;
+    }
+    if (!BuildPipelineLayout(s)) {
+      return false;
+    }
+    if (!BuildCopyPipeline(s)) {
+      return false;
+    }
+    // overlay drawer uploads textures through this
+    if (!TryInit()) {
+      BD_ERROR("TryInit failed, shader constants disabled");
+    }
+  }
+
+  if (!rex::Runtime::instance()) {
+    return true; // guest tail waits for the post-Runtime call
+  }
+
+  // Must precede any HostResourceHeap::Alloc.
+  if (!bd::gpu::HostHeap::Get().Init()) {
+    BD_ERROR("HostHeap init failed");
+    return false;
+  }
+
+  // Implicit back buffer placeholder. BD draws post-bloom menu/UI without ever
+  // calling SetRenderTarget (RT[0] is implicitly the back buffer on X360), so
+  // BindDrawFramebuffer falls back to s.back_buffer_surface for such draws.
+  {
+    auto *bb = bd::gpu::HostResourceHeap::Alloc<bd::gpu::GuestTexture>(
+        bd::gpu::ResourceType::RenderTarget);
+    if (!bb) {
+      BD_ERROR("HostResourceHeap::Alloc for back-buffer GuestTexture failed");
+      return false;
+    }
+    u32 bb_w = 0, bb_h = 0;
+    GuestBackBufferDims(bb_w, bb_h);
+    if (!CreateBackBufferTexture(s, bb, bb_w, bb_h)) {
+      BD_ERROR("Plume createTexture for back-buffer failed");
+      return false;
+    }
+
+    // Inline SRV register (BindTextureSRV would re-take the held s.mutex) so
+    // the per-Present blit can sample this back buffer.
+    const u32 slot = AllocateSlot(s);
+    if (slot == kInvalidDescriptorIndex) {
+      BD_ERROR("Back-buffer SRV bind failed: bindless heap full");
+      return false;
+    }
+    s.texture_descriptor_set->setTexture(
+        slot, bb->texture, plume::RenderTextureLayout::SHADER_READ,
+        bb->textureView.get());
+    bb->descriptorIndex = slot;
+
+    s.back_buffer_surface = bb;
+  }
+  // Default viewport = the BD-believed backbuffer, not the raw swapchain.
+  s.viewport.width = static_cast<float>(s.back_buffer_surface->width);
+  s.viewport.height = static_cast<float>(s.back_buffer_surface->height);
+  s.dirtyStates.viewport = true;
+#if defined(REXGLUE_ENABLE_PROFILING) && defined(REBLUE_D3D12)
+  InitGPUProfiler(static_cast<plume::D3D12Device *>(s.device.get())->d3d,
+                  static_cast<plume::D3D12CommandQueue *>(s.queue.get())->d3d);
+#endif
+  s.ready = true;
+  BD_DEBUG("Plume backend ready: {}x{} ({} buffers, {} bindless slots)",
+           static_cast<u32>(s.viewport.width),
+           static_cast<u32>(s.viewport.height),
+           static_cast<u32>(s.framebuffers.size()), kBindlessTextureCount);
+
+  // Background-precompile the static PSO cache. Entries whose shaders/decls do
+  // not exist yet are deferred until CreateShader/CreateVertexDeclaration.
+  ReplayBootCache();
+  return true;
+}
+
+void Video::SyncBackBufferSizeLocked() {
+  auto &s = state();
+  GuestTexture *bb = s.back_buffer_surface;
+  if (!bb)
+    return;
+  u32 w = 0;
+  u32 h = 0;
+  GuestBackBufferDims(w, h);
+  if (bb->width == w && bb->height == h)
+    return;
+
+  SubmitOpenListLocked(s);
+  for (u32 i = 0; i < kNumFrames; ++i) {
+    if (s.command_list_submitted[i]) {
+      s.queue->waitForCommandFence(s.fences[i].get());
+      s.command_list_submitted[i] = false;
+    }
+  }
+
+  if (!CreateBackBufferTexture(s, bb, w, h)) {
+    BD_ERROR("Back-buffer resize to {}x{} failed", w, h);
+    return;
+  }
+  if (bb->descriptorIndex != kInvalidDescriptorIndex) {
+    s.texture_descriptor_set->setTexture(
+        bb->descriptorIndex, bb->texture,
+        plume::RenderTextureLayout::SHADER_READ, bb->textureView.get());
+  }
+  s.viewport.width = static_cast<float>(w);
+  s.viewport.height = static_cast<float>(h);
+  s.dirtyStates.viewport = true;
+  BD_INFO("[output-res] back buffer -> {}x{}", w, h);
+}
+
+void Video::ResizeTexture(GuestTexture *tex, u32 width, u32 height) {
+  if (!tex || !tex->texture || (tex->width == width && tex->height == height))
+    return;
+  if (tex->viewDimension != plume::RenderTextureViewDimension::TEXTURE_2D)
+    return;
+  auto *device = HostDevice();
+  if (!device)
+    return;
+
+  NotifyTextureDestroyed(tex);
+  ParkTextureGPUObjects(tex);
+
+  const bool is_depth = IsDepthFormat(tex->format);
+  plume::RenderTextureDesc desc;
+  desc.dimension = plume::RenderTextureDimension::TEXTURE_2D;
+  desc.width = width;
+  desc.height = height;
+  desc.depth = 1;
+  desc.mipLevels = tex->mipLevels ? tex->mipLevels : 1;
+  desc.arraySize = 1;
+  desc.format = tex->format;
+  if (is_depth) {
+    desc.flags = plume::RenderTextureFlag::DEPTH_TARGET;
+  } else if (IsRenderTargetCapable(tex->format)) {
+    desc.flags = plume::RenderTextureFlag::RENDER_TARGET;
+  } else {
+    desc.flags = plume::RenderTextureFlag::NONE;
+  }
+  desc.multisampling.sampleCount = tex->sampleCount;
+  desc.committed = false;
+
+  tex->textureHolder = CreateHostTexture(device, desc, "resized-texture");
+  tex->texture = tex->textureHolder.get();
+  if (!tex->texture) {
+    BD_ERROR("Texture resize to {}x{} failed", width, height);
+    return;
+  }
+  tex->width = width;
+  tex->height = height;
+  tex->layout = plume::RenderTextureLayout::UNKNOWN;
+  tex->framebufferAttached = false;
+  if (!is_depth)
+    BindTextureSRV(tex);
+}
+
+void Video::BeginShutdown() {
+  // No lock: a guest thread parked inside Present (its overlay hook marshals to
+  // the UI thread, which is the thread running the shutdown) holds s.mutex, so
+  // taking it here would deadlock stage 1 of the sequence.
+  state().shutting_down.store(true, std::memory_order_release);
+}
+
+void Video::Shutdown(const std::function<void()> &ui_pump) {
+  auto &s = state();
+
+  // Bounded, not a plain lock: the render thread can be parked in Present's
+  // overlay marshal holding s.mutex, waiting on the UI thread running this.
+  // Skipping the drain beats a quit that hangs until the watchdog kills it.
+  using Clock = std::chrono::steady_clock;
+  const auto deadline = Clock::now() + std::chrono::milliseconds(250);
+  std::unique_lock lock(s.mutex, std::defer_lock);
+  while (!lock.try_lock()) {
+    if (ui_pump)
+      ui_pump();
+    if (Clock::now() >= deadline) {
+      BD_WARN("Shutdown: renderer busy, skipping GPU drain");
+      return;
+    }
+    std::this_thread::sleep_for(std::chrono::milliseconds(2));
+  }
+
+  s.ready = false;
+
+  // Fences never signal on a removed device, and the swap chain is already
+  // invalid, so flushing anything here would just hang until the watchdog.
+  if (DeviceIsLost()) {
+    BD_WARN("Shutdown: device lost, skipping GPU drain");
+    return;
+  }
+
+  // Whatever the guest was recording is abandoned: ending the list keeps plume
+  // consistent, and it is never submitted.
+  if (s.command_list_open && s.command_list) {
+    s.command_list->end();
+    s.command_list_open = false;
+  }
+
+  // The drain proper. Same wait the resize path uses, over every slot with work
+  // outstanding, so nothing is still executing when the process dies.
+  if (s.queue) {
+    for (u32 i = 0; i < kNumFrames; ++i) {
+      if (!s.command_list_submitted[i] || !s.fences[i])
+        continue;
+      s.queue->waitForCommandFence(s.fences[i].get());
+      s.command_list_submitted[i] = false;
+    }
+  }
+
+  // Released while the device is still alive, so the surface goes back to the
+  // compositor before the process dies. Everything else is left for process
+  // teardown on purpose. See the Shutdown() contract.
+  s.framebuffers.clear();
+  s.render_semaphores.clear();
+  for (u32 i = 0; i < kNumFrames; ++i)
+    s.acquire_semaphores[i].reset();
+  s.swap_chain.reset();
+}
+
+// Substituted for content textures reblue cannot resolve, so the draw renders
+// with its vertex color instead of sampling an unbound slot.
+namespace {
+GuestTexture *g_debug_texture = nullptr;
+} // namespace
+
+GuestTexture *GetOrCreateDebugTexture() {
+  auto &s = state();
+  std::lock_guard lock(s.mutex);
+  if (g_debug_texture)
+    return g_debug_texture;
+  if (!s.ready)
+    return nullptr;
+  BeginCommandList(s);
+  if (!s.command_list_open)
+    return nullptr;
+
+  auto *t = new GuestTexture(ResourceType::RenderTarget);
+  t->width = 4;
+  t->height = 4;
+  t->format = plume::RenderFormat::R8G8B8A8_UNORM;
+  t->mipLevels = 1;
+  t->viewDimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+
+  plume::RenderTextureDesc desc;
+  desc.dimension = plume::RenderTextureDimension::TEXTURE_2D;
+  desc.width = t->width;
+  desc.height = t->height;
+  desc.depth = 1;
+  desc.mipLevels = 1;
+  desc.arraySize = 1;
+  desc.format = t->format;
+  desc.flags = plume::RenderTextureFlag::RENDER_TARGET;
+  desc.multisampling.sampleCount = plume::RenderSampleCount::COUNT_1;
+  desc.committed = true; // avoid placed-resource uninit GBV debug fill
+  t->textureHolder = CreateHostTexture(s.device.get(), desc, "debug-fallback");
+  if (!t->textureHolder) {
+    BD_ERROR(
+        "GetOrCreateDebugTexture: createTexture for fallback texture failed");
+    delete t;
+    return nullptr;
+  }
+  t->texture = t->textureHolder.get();
+
+  plume::RenderTextureViewDesc view_desc;
+  view_desc.format = t->format;
+  view_desc.dimension = plume::RenderTextureViewDimension::TEXTURE_2D;
+  view_desc.mipLevels = 1;
+  t->textureView = t->texture->createTextureView(view_desc);
+
+  const u32 slot = AllocateSlot(s);
+  if (slot == kInvalidDescriptorIndex) {
+    BD_ERROR("GetOrCreateDebugTexture: bindless heap full, fallback texture "
+             "dropped");
+    delete t;
+    return nullptr;
+  }
+  s.texture_descriptor_set->setTexture(slot, t->texture,
+                                       plume::RenderTextureLayout::SHADER_READ,
+                                       t->textureView.get());
+  t->descriptorIndex = slot;
+
+  plume::RenderTextureBarrier to_rt(t->texture,
+                                    plume::RenderTextureLayout::COLOR_WRITE);
+  s.command_list->barriers(plume::RenderBarrierStage::GRAPHICS, &to_rt, 1);
+  if (plume::RenderFramebuffer *fb = GetFramebuffer(s, t, nullptr)) {
+    s.command_list->setFramebuffer(fb);
+    s.command_list->clearColor(0, plume::RenderColor(1.0f, 1.0f, 1.0f, 1.0f));
+    s.command_list->setFramebuffer(nullptr);
+    // The draw framebuffer was just replaced: the next draw must bind it again (a texture made
+    // mid-frame, e.g. an SvR resolve target first used between draws, otherwise leaves the list
+    // with no framebuffer).
+    s.draw_framebuffer_bound = false;
+  }
+  plume::RenderTextureBarrier to_read(t->texture,
+                                      plume::RenderTextureLayout::SHADER_READ);
+  s.command_list->barriers(plume::RenderBarrierStage::GRAPHICS, &to_read, 1);
+  t->layout = plume::RenderTextureLayout::SHADER_READ;
+
+  g_debug_texture = t;
+  return g_debug_texture;
+}
+
+namespace {
+// Quad list expansion index buffer capacity, matching Video::QuadlistMaxQuads.
+constexpr u32 kQuadlistMaxQuads = 16384;
+} // namespace
+
+// Quad q's four vertices {4q..4q+3} become {4q+0,4q+1,4q+2, 4q+0,4q+2,4q+3}.
+// Fixed capacity, built once: rebuilding mid-frame would free a buffer the
+// open command list still references.
+const plume::RenderIndexBufferView *Video::QuadlistExpansionIBView() {
+  static std::unique_ptr<plume::RenderBuffer> s_buffer;
+  static plume::RenderIndexBufferView s_view{};
+  static std::once_flag s_once;
+  std::call_once(s_once, []() {
+    auto *device = HostDevice();
+    if (!device)
+      return;
+    constexpr u32 kBytes = kQuadlistMaxQuads * 6 * sizeof(u32);
+    auto desc = plume::RenderBufferDesc::IndexBuffer(
+        kBytes, GeometryHeapType(device, GeometryClass::Static));
+    s_buffer = CreateHostBuffer(device, desc, "quadlist-ib");
+    if (!s_buffer)
+      return;
+    auto *mapped = static_cast<u32 *>(s_buffer->map());
+    if (!mapped) {
+      BD_ERROR("QuadlistExpansionIBView: map() null (resource null-backed?), "
+               "quad-list draws will be unindexed");
+      s_buffer.reset();
+      return;
+    }
+    for (u32 q = 0; q < kQuadlistMaxQuads; ++q) {
+      const u32 v = q * 4;
+      u32 *o = mapped + q * 6;
+      o[0] = v + 0;
+      o[1] = v + 1;
+      o[2] = v + 2;
+      o[3] = v + 0;
+      o[4] = v + 2;
+      o[5] = v + 3;
+    }
+    s_buffer->unmap();
+    s_view.buffer = s_buffer->at(0);
+    s_view.size = kBytes;
+    s_view.format = plume::RenderFormat::R32_UINT;
+  });
+  return s_buffer ? &s_view : nullptr;
+}
+
+u32 Video::QuadlistMaxQuads() { return kQuadlistMaxQuads; }
+
+std::unique_ptr<plume::RenderBuffer>
+CreateHostBuffer(plume::RenderDevice *device,
+                 const plume::RenderBufferDesc &desc, const char *tag) {
+  if (!device) {
+    BD_ERROR("CreateHostBuffer({}): no host device", tag ? tag : "?");
+    return nullptr;
+  }
+  auto buffer = device->createBuffer(desc);
+  // plume returns a non-null wrapper even when the allocation failed, so probe
+  // the backend handle. GPU_UPLOAD makes that reachable: DEVICE_LOCAL and
+  // HOST_VISIBLE are requiredFlags, so unlike UPLOAD it has no fallback heap.
+  if (!buffer
+#if defined(REBLUE_D3D11)
+      || (!static_cast<plume::D3D11Buffer *>(buffer.get())->d3d &&
+          !static_cast<plume::D3D11Buffer *>(buffer.get())->cpu)
+#elif defined(REBLUE_D3D12)
+      || static_cast<plume::D3D12Buffer *>(buffer.get())->d3d == nullptr
+#else
+      || static_cast<plume::VulkanBuffer *>(buffer.get())->vk == VK_NULL_HANDLE
+#endif
+  ) {
+    BD_ERROR(
+        "CreateHostBuffer({}) failed: backend resource null (size={} bytes)",
+        tag ? tag : "?", desc.size);
+    // A whole-device failure (driver reset/TDR/sleep) nulls every create, so
+    // turn that into an explicit device-lost dialog instead of a silent
+    // cascade.
+    CheckDeviceRemoved(tag ? tag : "buffer");
+    return nullptr;
+  }
+  return buffer;
+}
+
+std::unique_ptr<plume::RenderTexture>
+CreateHostTexture(plume::RenderDevice *device,
+                  const plume::RenderTextureDesc &desc, const char *tag) {
+  if (!device) {
+    BD_ERROR("CreateHostTexture({}): no host device", tag ? tag : "?");
+    return nullptr;
+  }
+  auto texture = device->createTexture(desc);
+  if (!texture
+#if defined(REBLUE_D3D11)
+      || static_cast<plume::D3D11Texture *>(texture.get())->d3d == nullptr
+#elif defined(REBLUE_D3D12)
+      || static_cast<plume::D3D12Texture *>(texture.get())->d3d == nullptr
+#else
+      ||
+      static_cast<plume::VulkanTexture *>(texture.get())->vk == VK_NULL_HANDLE
+#endif
+  ) {
+    BD_ERROR(
+        "CreateHostTexture({}) failed: backend resource null ({}x{} fmt={})",
+        tag ? tag : "?", desc.width, desc.height,
+        static_cast<u32>(desc.format));
+    CheckDeviceRemoved(tag ? tag : "texture");
+    return nullptr;
+  }
+  return texture;
+}
+
+std::unique_ptr<plume::RenderPipeline>
+CreateHostGraphicsPipeline(plume::RenderDevice *device,
+                           const plume::RenderGraphicsPipelineDesc &desc,
+                           const char *tag) {
+  if (!device) {
+    BD_ERROR("CreateHostGraphicsPipeline({}): no host device", tag ? tag : "?");
+    return nullptr;
+  }
+  auto pipeline = device->createGraphicsPipeline(desc);
+  // Both backends fail soft: a failed
+  // vkCreateGraphicsPipelines/CreatePipelineState still hands back a live
+  // wrapper holding a null pipeline, which only faults later at bind time.
+  if (!pipeline
+#if defined(REBLUE_D3D11)
+      || !static_cast<plume::D3D11GraphicsPipeline *>(pipeline.get())->valid
+#elif defined(REBLUE_D3D12)
+      || static_cast<plume::D3D12GraphicsPipeline *>(pipeline.get())->d3d ==
+             nullptr
+#else
+      || static_cast<plume::VulkanGraphicsPipeline *>(pipeline.get())->vk ==
+             VK_NULL_HANDLE
+#endif
+  ) {
+    // A pipeline the driver cannot build is retried on every draw that needs it: log the first
+    // ones and then a count, so a broken driver or shader set cannot flood the log (the 4 MB log
+    // then kept only the last seconds and lost the start-up lines that name the GPU).
+    static std::atomic<u32> s_failed{0};
+    const u32 n = s_failed.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 20 || (n & (n - 1)) == 0)
+      BD_ERROR("CreateHostGraphicsPipeline({}) failed: backend pipeline null ({} failed so far)",
+               tag ? tag : "?", n);
+    CheckDeviceRemoved(tag ? tag : "pipeline");
+    return nullptr;
+  }
+  return pipeline;
+}
+
+plume::RenderHeapType GeometryHeapType(plume::RenderDevice *device,
+                                       GeometryClass cls) {
+  // plume reports gpuUploadHeap as plain UMA on Vulkan, so this branch is
+  // APU-only there. On D3D12 it also covers ReBAR discrete.
+  const bool caps_ok =
+      device != nullptr && device->getCapabilities().gpuUploadHeap;
+  const bool gpu_upload_ok = caps_ok && Settings::Get().GeometryGPUUpload();
+  return gpu_upload_ok && cls == GeometryClass::Static
+             ? plume::RenderHeapType::GPU_UPLOAD
+             : plume::RenderHeapType::UPLOAD;
+}
+
+void Video::SetOverlayDrawHook(OverlayDrawHook hook) {
+  g_overlay_draw_hook = std::move(hook);
+}
+
+plume::RenderDevice *Video::HostDevice() { return state().device.get(); }
+
+plume::RenderFormat Video::DepthStencilFormat() {
+  return state().depth_stencil_format;
+}
+
+plume::RenderFormat Video::SceneColorFormat() {
+  return state().scene_color_format;
+}
+
+#if !defined(REBLUE_D3D12)
+} // namespace bd::gpu
+namespace plume {
+VkFormat toVk(RenderFormat format); // plume_vulkan.cpp
+}
+namespace bd::gpu {
+#endif
+
+bool Video::UncompressedTarget(plume::RenderFormat format) {
+  if (!REXCVAR_GET(svr_rt_no_compression))
+    return false;
+#if defined(REBLUE_D3D12)
+  return false;
+#else
+  auto *dev = static_cast<plume::VulkanDevice *>(state().device.get());
+  if (!dev || dev->physicalDevice == VK_NULL_HANDLE)
+    return false;
+  VkFormatProperties props{};
+  vkGetPhysicalDeviceFormatProperties(dev->physicalDevice, plume::toVk(format), &props);
+  return (props.optimalTilingFeatures & VK_FORMAT_FEATURE_STORAGE_IMAGE_BIT) != 0;
+#endif
+}
+
+Video::VideoMemory Video::MemoryUsage() {
+  VideoMemory m;
+  auto *device = state().device.get();
+  if (!device)
+    return m;
+#if defined(REBLUE_D3D11)
+  (void)device;  // (D3D11 doesn't tell its memory budget)
+#elif defined(REBLUE_D3D12)
+  auto *dev = static_cast<plume::D3D12Device *>(device);
+  IDXGIAdapter3 *adapter = nullptr;
+  if (!dev->adapter ||
+      dev->adapter->QueryInterface(IID_PPV_ARGS(&adapter)) < 0)
+    return m;
+  DXGI_QUERY_VIDEO_MEMORY_INFO info = {};
+  if (adapter->QueryVideoMemoryInfo(0, DXGI_MEMORY_SEGMENT_GROUP_LOCAL,
+                                    &info) >= 0) {
+    m.used = info.CurrentUsage;
+    m.budget = info.Budget;
+  }
+  adapter->Release();
+#else
+  auto *dev = static_cast<plume::VulkanDevice *>(device);
+  if (!dev->allocator)
+    return m;
+  const VkPhysicalDeviceMemoryProperties *props = nullptr;
+  vmaGetMemoryProperties(dev->allocator, &props);
+  VmaBudget budgets[VK_MAX_MEMORY_HEAPS] = {};
+  vmaGetHeapBudgets(dev->allocator, budgets);
+  for (u32 i = 0; i < props->memoryHeapCount; ++i) {
+    if (props->memoryHeaps[i].flags & VK_MEMORY_HEAP_DEVICE_LOCAL_BIT) {
+      m.used += budgets[i].usage;
+      m.budget += budgets[i].budget;
+    }
+  }
+#endif
+  return m;
+}
+
+u32 Video::OutputWidth() {
+  auto &s = state();
+  return s.swap_chain ? s.swap_chain->getWidth() : 0;
+}
+
+u32 Video::OutputHeight() {
+  auto &s = state();
+  return s.swap_chain ? s.swap_chain->getHeight() : 0;
+}
+
+std::string Video::GetDeviceName() {
+  auto &s = state();
+  return s.device ? s.device->getDescription().name : std::string("unknown");
+}
+
+const char *Video::BackendName() {
+#if defined(REBLUE_D3D11)
+  return "D3D11";
+#elif defined(REBLUE_D3D12)
+  return "D3D12";
+#else
+  return "Vulkan";
+#endif
+}
+
+const std::string &Video::GetBackendInfo() { return state().backend_info; }
+
+plume::RenderPipelineLayout *Video::MainPipelineLayout() {
+  return state().pipeline_layout.get();
+}
+
+u32 CurrentRenderPassId() {
+  // g_currentRenderPassId (guest global, big-endian). Always-mapped XEX data,
+  // but guard the translate anyway.
+#if defined(SVR_NATIVE_RENDERER)
+  return 0;  // Blue Dragon global; SvR has no equivalent (only labels logs)
+#else
+  constexpr u32 kCurrentRenderPassIdVa = 0x82777474;
+  return bd::mem::load<u32>(kCurrentRenderPassIdVa);
+#endif
+}
+
+u32 ComputeTexturePitch(const GuestTexture *tex) {
+  // X360 texture pitch alignment is 0x100. RenderFormatSize is the per-texel
+  // (uncompressed) byte size, and UNKNOWN -> 0, which the callers treat as
+  // "skip this texture".
+  constexpr u32 kPitchAlignment = 0x100u;
+  const u32 texel = plume::RenderFormatSize(tex->format);
+  return (tex->width * texel + kPitchAlignment - 1u) & ~(kPitchAlignment - 1u);
+}
+
+} // namespace bd::gpu

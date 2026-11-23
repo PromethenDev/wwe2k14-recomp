@@ -1,7 +1,7 @@
 From d32ffc34e157298db3171264a98e7d982cb4b4ac Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 13:42:58 -0700
-Subject: [PATCH 34/97] vulkan: prefer a discrete GPU on auto-select and log
+Subject: [PATCH 034/149] vulkan: prefer a discrete GPU on auto-select and log
  the chosen device
 
 With vulkan_device=-1, discrete GPUs now sort ahead of integrated ones
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 59 insertions(+), 17 deletions(-)
 
 diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
-index 9eeb902..191adb6 100644
+index 9eeb9025..191adb6e 100644
 --- a/src/ui/vulkan/vulkan_provider.cpp
 +++ b/src/ui/vulkan/vulkan_provider.cpp
 @@ -44,6 +44,26 @@ namespace rex {

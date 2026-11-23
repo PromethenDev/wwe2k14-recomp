@@ -1,7 +1,7 @@
 From 9b15c7122dce913b0c7aa227238a9fd8df166d61 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 19:59:06 -0700
-Subject: [PATCH 52/97] vulkan render targets: skip Update for a draw whose
+Subject: [PATCH 052/149] vulkan render targets: skip Update for a draw whose
  inputs equal the previous draw's
 
 RenderTargetCache::Update + the Vulkan host-render-target part cost ~135 ns per draw (live stage timing), and
@@ -26,7 +26,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 72 insertions(+)
 
 diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
-index 9c5e5e6..570ab76 100644
+index 9c5e5e62..570ab765 100644
 --- a/include/rex/graphics/pipeline/render_target/cache.h
 +++ b/include/rex/graphics/pipeline/render_target/cache.h
 @@ -181,6 +181,12 @@ class RenderTargetCache {
@@ -43,7 +43,7 @@ index 9c5e5e6..570ab76 100644
                      TraceWriter* trace_writer, uint32_t draw_resolution_scale_x,
                      uint32_t draw_resolution_scale_y)
 diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
-index 43ef7a2..8860f87 100644
+index 43ef7a20..8860f87c 100644
 --- a/include/rex/graphics/vulkan/render_target_cache.h
 +++ b/include/rex/graphics/vulkan/render_target_cache.h
 @@ -803,6 +803,17 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
@@ -65,7 +65,7 @@ index 43ef7a2..8860f87 100644
        uint32_t render_target_count, RenderTarget* const* render_targets,
        const std::vector<Transfer>* render_target_transfers,
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index c467fc5..cf0477c 100644
+index c467fc52..cf0477c9 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
 @@ -363,6 +363,7 @@ void RenderTargetCache::InitializeCommon() {
@@ -93,7 +93,7 @@ index c467fc5..cf0477c 100644
    if (REXCVAR_GET(debug_rt_cache_ownership)) {
      debug_rt_cache_draw_index_ = 0;
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 50d3509..ec53003 100644
+index 50d35090..ec53003e 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -41,6 +41,11 @@ REXCVAR_DEFINE_STRING(render_target_path_vulkan, "", "GPU/Vulkan",

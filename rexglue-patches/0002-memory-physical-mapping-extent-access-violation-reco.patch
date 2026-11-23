@@ -1,7 +1,7 @@
 From 163e46d1fe7e5bea93e711804c2d362d21f4fa55 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 12:48:58 -0700
-Subject: [PATCH 02/97] memory: physical mapping extent, access-violation
+Subject: [PATCH 002/149] memory: physical mapping extent, access-violation
  recovery, MMIO handler fixes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -12,7 +12,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 441 insertions(+), 56 deletions(-)
 
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
-index e9809a6..149093b 100644
+index e9809a64..149093b7 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
 @@ -21,11 +21,32 @@
@@ -121,7 +121,7 @@ index e9809a6..149093b 100644
  
    // NTSTATUS
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
-index ce4f32a..cf03f1f 100644
+index ce4f32a6..cf03f1f3 100644
 --- a/src/system/mmio_handler.cpp
 +++ b/src/system/mmio_handler.cpp
 @@ -11,6 +11,8 @@
@@ -509,7 +509,7 @@ index ce4f32a..cf03f1f 100644
  
  #if REX_ARCH_ARM64
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index aa0b088..dceec3c 100644
+index aa0b088a..dceec3ce 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -133,8 +133,12 @@ bool Memory::Initialize() {

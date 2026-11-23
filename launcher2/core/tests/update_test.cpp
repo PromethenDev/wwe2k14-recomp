@@ -84,7 +84,7 @@ const char* kValidRelease =
     "}\n";
 
 void TestJsonParse() {
-  auto info = ParseLatestReleaseJson(kValidRelease, "1.3.0");
+  auto info = update_internal::ParseLatestReleaseJsonForPlatform(kValidRelease, "1.3.0", true);
   assert(info.has_value());
   assert(info->available);
   assert(info->tag == "v1.4.0");
@@ -97,9 +97,9 @@ void TestJsonParse() {
   assert(info->notes.find("\xE2\x9C\x94") != std::string::npos);  // \u2714 -> UTF-8 check mark
 
   // The same release is not offered when the launcher is already on it (or newer).
-  auto same = ParseLatestReleaseJson(kValidRelease, "1.4.0");
+  auto same = update_internal::ParseLatestReleaseJsonForPlatform(kValidRelease, "1.4.0", true);
   assert(same.has_value() && !same->available);
-  auto older = ParseLatestReleaseJson(kValidRelease, "1.5.0");
+  auto older = update_internal::ParseLatestReleaseJsonForPlatform(kValidRelease, "1.5.0", true);
   assert(older.has_value() && !older->available);
 
   // Missing digest: parsed, but never offered because the download could not be verified.
@@ -107,7 +107,7 @@ void TestJsonParse() {
       "{\"tag_name\":\"v1.4.0\",\"draft\":false,\"prerelease\":false,\"assets\":[{"
       "\"name\":\"WWE2K14-Recomp-v1.1.0.zip\",\"size\":5,"
       "\"browser_download_url\":\"https://github.com/x/WWE2K14-Recomp-v1.1.0.zip\"}]}";
-  auto missing = ParseLatestReleaseJson(kNoDigest, "1.3.0");
+  auto missing = update_internal::ParseLatestReleaseJsonForPlatform(kNoDigest, "1.3.0", true);
   assert(missing.has_value());
   assert(!missing->available);
   assert(missing->sha256.empty());
@@ -116,13 +116,57 @@ void TestJsonParse() {
   std::string prerelease = kValidRelease;
   prerelease.replace(prerelease.find("\"prerelease\": false"), std::string("\"prerelease\": false").size(),
                      "\"prerelease\": true");
-  auto pre = ParseLatestReleaseJson(prerelease, "1.3.0");
+  auto pre = update_internal::ParseLatestReleaseJsonForPlatform(prerelease, "1.3.0", true);
   assert(pre.has_value() && !pre->available);
 
   // Malformed and tag-less documents are rejected outright.
-  assert(!ParseLatestReleaseJson("{not json", "1.3.0").has_value());
-  assert(!ParseLatestReleaseJson("{\"draft\": false}", "1.3.0").has_value());
+  assert(!update_internal::ParseLatestReleaseJsonForPlatform("{not json", "1.3.0", true).has_value());
+  assert(!update_internal::ParseLatestReleaseJsonForPlatform("{\"draft\": false}", "1.3.0", true).has_value());
   std::cout << "PASS release JSON parse (digest, missing digest, drafts, malformed)\n";
+}
+
+void TestPlatformReleaseAssets() {
+  const char* kSplitRelease =
+      "{\"tag_name\":\"v1.4.7\",\"draft\":false,\"prerelease\":false,\"assets\":["
+      "{\"name\":\"WWE2K14-Recomp-v1.4.7-x64.zip\",\"size\":100,"
+      "\"browser_download_url\":\"https://github.com/example/windows.zip\","
+      "\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"},"
+      "{\"name\":\"Linux-WWE2K14-Recomp-v1.4.7-x64.zip\",\"size\":200,"
+      "\"browser_download_url\":\"https://github.com/example/linux.zip\","
+      "\"digest\":\"sha256:1111111111111111111111111111111111111111111111111111111111111111\"},"
+      "{\"name\":\"ffmpeg-source-abc.zip\",\"size\":300,"
+      "\"browser_download_url\":\"https://github.com/example/source.zip\","
+      "\"digest\":\"sha256:2222222222222222222222222222222222222222222222222222222222222222\"}]}";
+  const auto linux = update_internal::ParseLatestReleaseJsonForPlatform(kSplitRelease, "1.4.6", false);
+  assert(linux.has_value() && linux->available);
+  assert(linux->name == "Linux-WWE2K14-Recomp-v1.4.7-x64.zip");
+  assert(linux->url == "https://github.com/example/linux.zip");
+  assert(linux->size == 200);
+
+  const auto windows = update_internal::ParseLatestReleaseJsonForPlatform(kSplitRelease, "1.4.6", true);
+  assert(windows.has_value() && windows->available);
+  assert(windows->name == "WWE2K14-Recomp-v1.4.7-x64.zip");
+  assert(windows->url == "https://github.com/example/windows.zip");
+  assert(windows->size == 100);
+
+  const auto native = ParseLatestReleaseJson(kSplitRelease, "1.4.6");
+  assert(native.has_value() && native->available);
+#ifdef _WIN32
+  assert(native->name == windows->name);
+#else
+  assert(native->name == linux->name);
+#endif
+
+  const char* kWindowsOnlyRelease =
+      "{\"tag_name\":\"v1.4.7\",\"draft\":false,\"prerelease\":false,\"assets\":["
+      "{\"name\":\"WWE2K14-Recomp-v1.4.7-x64.zip\",\"size\":100,"
+      "\"browser_download_url\":\"https://github.com/example/windows.zip\","
+      "\"digest\":\"sha256:0000000000000000000000000000000000000000000000000000000000000000\"}]}";
+  const auto unavailable =
+      update_internal::ParseLatestReleaseJsonForPlatform(kWindowsOnlyRelease, "1.4.6", false);
+  assert(unavailable.has_value() && !unavailable->available);
+  assert(unavailable->name.empty());
+  std::cout << "PASS platform release assets (Linux, Windows, no cross-platform fallback)\n";
 }
 
 void TestNeverTouch() {
@@ -369,6 +413,7 @@ int main() {
   assert(!error);
   TestVersionCompare();
   TestJsonParse();
+  TestPlatformReleaseAssets();
   TestNeverTouch();
   TestUpdateSettings(output);
   TestApply(output);

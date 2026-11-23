@@ -1,7 +1,7 @@
 From 5858f4ba40248c5c8fef496fa376d476429e2daf Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 12:05:40 -0700
-Subject: [PATCH 45/97] vulkan: opt-in pixel-rate shading for float24 depth
+Subject: [PATCH 045/149] vulkan: opt-in pixel-rate shading for float24 depth
  conversion
 
 With depth_float24_convert_in_pixel_shader on and 4xMSAA render targets,
@@ -28,7 +28,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 30 insertions(+), 8 deletions(-)
 
 diff --git a/include/rex/graphics/pipeline/shader/spirv_translator.h b/include/rex/graphics/pipeline/shader/spirv_translator.h
-index c51ea54..df99bfd 100644
+index c51ea546..df99bfdb 100644
 --- a/include/rex/graphics/pipeline/shader/spirv_translator.h
 +++ b/include/rex/graphics/pipeline/shader/spirv_translator.h
 @@ -88,6 +88,9 @@ class SpirvShaderTranslator : public ShaderTranslator {
@@ -62,7 +62,7 @@ index c51ea54..df99bfd 100644
  
    uint32_t GetModificationInterpolatorMask() const {
 diff --git a/include/rex/graphics/vulkan/pipeline_cache.h b/include/rex/graphics/vulkan/pipeline_cache.h
-index 7b938b9..1e1cbf1 100644
+index 7b938b97..1e1cbf1e 100644
 --- a/include/rex/graphics/vulkan/pipeline_cache.h
 +++ b/include/rex/graphics/vulkan/pipeline_cache.h
 @@ -196,12 +196,13 @@ class VulkanPipelineCache {
@@ -81,7 +81,7 @@ index 7b938b9..1e1cbf1 100644
        Reset();
      }
 diff --git a/src/graphics/pipeline/shader/spirv_translator.cpp b/src/graphics/pipeline/shader/spirv_translator.cpp
-index c709705..223b7c9 100644
+index c7097056..223b7c9c 100644
 --- a/src/graphics/pipeline/shader/spirv_translator.cpp
 +++ b/src/graphics/pipeline/shader/spirv_translator.cpp
 @@ -90,7 +90,7 @@ uint64_t SpirvShaderTranslator::GetDefaultPixelShaderModification(
@@ -112,7 +112,7 @@ index c709705..223b7c9 100644
        }
      }
 diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
-index 765c141..43144ba 100644
+index 765c1417..43144bad 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 +++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 @@ -1389,6 +1389,8 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
@@ -125,7 +125,7 @@ index 765c141..43144ba 100644
              type_float_, ext_inst_glsl_std_450_, GLSLstd450NClamp,
              builder_->createNoContractionBinOp(spv::OpFMul, type_float_, depth,
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 92eb966..e2fdd64 100644
+index 92eb9663..e2fdd644 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
 @@ -60,6 +60,10 @@ REXCVAR_DEFINE_BOOL(vulkan_tessellation_wireframe, false, "GPU/Vulkan",

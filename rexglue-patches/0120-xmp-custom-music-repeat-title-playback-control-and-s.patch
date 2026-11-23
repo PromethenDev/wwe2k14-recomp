@@ -1,0 +1,1023 @@
+From fda4e226025e9bcf9d5527c7d9f8ef4067c34161 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 00:02:03 -0700
+Subject: [PATCH 120/149] xmp: custom music repeat, title playback control and
+ stopped state (WWE2K14_XMP_FIX=1)
+
+WWE 2K14 #10: Jukebox custom songs repeat per the XMP playback behaviour, pause while the title holds
+playback control, report stopped state; bounded XMP message log; zero-frame guard. Host test:
+custom_music_player_test.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/audio/custom_music_player.h      |  22 +-
+ include/rex/kernel/xam/apps/xmp_app.h        |   8 +
+ src/audio/custom_music_player.cpp            |  60 +++-
+ src/kernel/xam/apps/xmp_app.cpp              | 313 +++++++++++++++++--
+ tests/unit/CMakeLists.txt                    |  21 ++
+ tests/unit/core/custom_music_player_test.cpp | 233 ++++++++++++++
+ 6 files changed, 622 insertions(+), 35 deletions(-)
+ create mode 100644 tests/unit/core/custom_music_player_test.cpp
+
+diff --git a/include/rex/audio/custom_music_player.h b/include/rex/audio/custom_music_player.h
+index 5e4b0e5c..5d082950 100644
+--- a/include/rex/audio/custom_music_player.h
++++ b/include/rex/audio/custom_music_player.h
+@@ -36,6 +36,17 @@ struct CustomMusicTrack {
+ std::unique_ptr<CustomMusicTrack> DecodeCustomMusicFile(const std::filesystem::path& path,
+                                                         uint32_t target_rate, std::string* error);
+ 
++// XMPSetPlaybackBehavior repeat word (0x70008, third word) values that restart the single custom
++// selection at end of file. EVIDENCE: the 2K14 title sends repeat=1 after a custom play
++// (generated/wwe2k14_recomp.70.cpp:24776-24786). INFERENCE (unproven): 1 = repeat-one, 2 =
++// repeat-all (no guest site sends 2); the SDK enum names only 0 (kUnknown). Both loop because a
++// custom selection is a single song. Settle with the [xmp-fix] repeat log lines of one owner run.
++constexpr uint32_t kCustomRepeatOneCandidate = 1;
++constexpr uint32_t kCustomRepeatAllCandidate = 2;
++constexpr bool CustomRepeatModeLoops(uint32_t repeat_mode) {
++  return repeat_mode == kCustomRepeatOneCandidate || repeat_mode == kCustomRepeatAllCandidate;
++}
++
+   // Plays at most one custom song at a time, mixed on top of guest audio.
+   //
+   // Threading: the public methods are called from the XMP app (guest thread) and
+@@ -54,10 +65,15 @@ class CustomMusicPlayer {
+   // the log and surfaces as the state going back to idle.
+   bool Play(const std::filesystem::path& path, const std::string& name);
+   void Stop();
+-  void Pause();
++  void Pause(bool persist_while_loading = false);
+   void Continue();
++  void SetRepeatMode(uint32_t repeat_mode) {
++    repeat_mode_.store(repeat_mode, std::memory_order_relaxed);
++  }
++  void SetTitleHasPlaybackControl(bool has_control);
+ 
+   bool IsPlaying() const { return state_.load(std::memory_order_relaxed) == kPlaying; }
++  bool IsExplicitlyPaused() const { return explicitly_paused_.load(std::memory_order_relaxed); }
+   bool IsPaused() const { return state_.load(std::memory_order_relaxed) == kPaused; }
+   // True while decoded samples are being published/played (or loading). Lets
+   // the caller tell "Play() accepted" from "Play() rejected because shutdown".
+@@ -115,8 +131,12 @@ class CustomMusicPlayer {
+   // Decoded samples (owned by the worker thread object, read under mutex_).
+   std::shared_ptr<CustomMusicTrack> track_;
+   size_t cursor_ = 0;  // in track samples
++  uint32_t loop_log_count_ = 0;  // guarded by mutex_
+ 
+   std::atomic<float> volume_{1.0f};
++  std::atomic<uint32_t> repeat_mode_{0};
++  std::atomic<bool> title_has_playback_control_{false};
++  std::atomic<bool> explicitly_paused_{false};
+   std::atomic<uint32_t> sample_rate_{0};  // source file rate (status/log only)
+   // Host device rate the track is resampled to; learned from MixFrames.
+   std::atomic<uint32_t> output_rate_{48000};
+diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
+index f9577d40..f8ec7e5a 100644
+--- a/include/rex/kernel/xam/apps/xmp_app.h
++++ b/include/rex/kernel/xam/apps/xmp_app.h
+@@ -127,7 +127,14 @@ class XmpApp : public system::xam::App {
+ 
+   State state_;
+   PlaybackClient playback_client_;
++  uint32_t playback_controller_;
+   std::atomic<bool> playback_controller_set_{false};
++  // Guarded by state_mutex_ together with state_, active_custom_song_, explicitly_paused_,
++  // paused_by_controller_, repeat_mode_ and volume_. Lock order: state_mutex_ -> player mutex.
++  // The audio callback (CustomMusicPlayer::MixFrames) only takes the player mutex, never this one.
++  bool title_has_playback_control_;
++  bool explicitly_paused_ = false;
++  bool paused_by_controller_ = false;
+   PlaybackMode playback_mode_;
+   RepeatMode repeat_mode_;
+   uint32_t unknown_flags_;
+@@ -138,6 +145,7 @@ class XmpApp : public system::xam::App {
+   // game's own entrance editor sends it for the selected folder song.
+   ActiveCustomSong active_custom_song_;
+ 
++  mutable std::recursive_mutex state_mutex_;
+   rex::thread::global_critical_region global_critical_region_;
+   std::unordered_map<uint32_t, Playlist*> playlists_;
+   uint32_t next_playlist_handle_;
+diff --git a/src/audio/custom_music_player.cpp b/src/audio/custom_music_player.cpp
+index 2fd6a31c..7e517b9e 100644
+--- a/src/audio/custom_music_player.cpp
++++ b/src/audio/custom_music_player.cpp
+@@ -281,6 +281,10 @@ std::unique_ptr<CustomMusicTrack> DecodeCustomMusicFile(const std::filesystem::p
+   track->channels = channels;
+   ResampleToStereo(pcm, channels, rate, target_rate, &track->samples);
+   const uint64_t frames = track->samples.size() / 2;
++  if (frames == 0) {  // a very short file can resample to nothing; the mixer needs at least one frame
++    *error = "decoded zero frames";
++    return nullptr;
++  }
+   track->duration_ms = frames * 1000 / target_rate;
+ 
+   // Name the backend instead of the container for the log.
+@@ -383,7 +387,11 @@ void CustomMusicPlayer::WorkerMain() {
+                   name, rex::path_to_utf8(path), track->decoder, track->sample_rate, track->duration_ms);
+       track_ = std::move(track);
+       cursor_ = 0;
+-      state_.store(kPlaying, std::memory_order_relaxed);
++      state_.store(explicitly_paused_.load(std::memory_order_relaxed) ||
++                           title_has_playback_control_.load(std::memory_order_relaxed)
++                       ? kPaused
++                       : kPlaying,
++                   std::memory_order_relaxed);
+     }
+   }
+ }
+@@ -397,6 +405,7 @@ bool CustomMusicPlayer::Play(const std::filesystem::path& path, const std::strin
+     request_path_ = path;
+     request_name_ = name;
+     request_pending_ = true;
++    explicitly_paused_.store(false, std::memory_order_relaxed);
+     ++request_serial_;
+     if (worker_running_) {
+       // Already running; the loop will pick the request up.
+@@ -418,12 +427,16 @@ void CustomMusicPlayer::Stop() {
+   ++request_serial_;
+   track_.reset();
+   cursor_ = 0;
++  explicitly_paused_.store(false, std::memory_order_relaxed);
+   state_.store(kIdle, std::memory_order_relaxed);
+   request_pending_ = false;
+ }
+ 
+-void CustomMusicPlayer::Pause() {
++void CustomMusicPlayer::Pause(bool persist_while_loading) {
+   std::lock_guard<std::mutex> guard(mutex_);
++  if (persist_while_loading) {
++    explicitly_paused_.store(true, std::memory_order_relaxed);
++  }
+   if (state_.load(std::memory_order_relaxed) == kPlaying) {
+     REXLOG_INFO("custom music: pause '{}'", name_);
+     state_.store(kPaused, std::memory_order_relaxed);
+@@ -432,12 +445,28 @@ void CustomMusicPlayer::Pause() {
+ 
+ void CustomMusicPlayer::Continue() {
+   std::lock_guard<std::mutex> guard(mutex_);
+-  if (state_.load(std::memory_order_relaxed) == kPaused) {
++  explicitly_paused_.store(false, std::memory_order_relaxed);
++  if (state_.load(std::memory_order_relaxed) == kPaused &&
++      !title_has_playback_control_.load(std::memory_order_relaxed)) {
+     REXLOG_INFO("custom music: continue '{}'", name_);
+     state_.store(kPlaying, std::memory_order_relaxed);
+   }
+ }
+ 
++void CustomMusicPlayer::SetTitleHasPlaybackControl(bool has_control) {
++  std::lock_guard<std::mutex> guard(mutex_);
++  title_has_playback_control_.store(has_control, std::memory_order_relaxed);
++  const uint32_t state = state_.load(std::memory_order_relaxed);
++  if (has_control && state == kPlaying) {
++    REXLOG_INFO("custom music: pause for title playback control");
++    state_.store(kPaused, std::memory_order_relaxed);
++  } else if (!has_control && state == kPaused &&
++             !explicitly_paused_.load(std::memory_order_relaxed)) {
++    REXLOG_INFO("custom music: resume after title playback control");
++    state_.store(kPlaying, std::memory_order_relaxed);
++  }
++}
++
+ void CustomMusicPlayer::MixFrames(float* output, uint32_t frames, uint32_t output_rate,
+                                   uint32_t output_channels) {
+   if (frames == 0 || !output || output_channels < 2) {
+@@ -447,7 +476,7 @@ void CustomMusicPlayer::MixFrames(float* output, uint32_t frames, uint32_t outpu
+     output_rate_.store(output_rate, std::memory_order_relaxed);
+   }
+   const uint32_t state = state_.load(std::memory_order_relaxed);
+-  if (state != kPlaying) {
++  if (state != kPlaying || title_has_playback_control_.load(std::memory_order_relaxed)) {
+     return;
+   }
+   if (sample_rate_.load(std::memory_order_relaxed) == 0) {
+@@ -459,16 +488,31 @@ void CustomMusicPlayer::MixFrames(float* output, uint32_t frames, uint32_t outpu
+   }
+ 
+   std::lock_guard<std::mutex> guard(mutex_);
+-  if (!track_ || state_.load(std::memory_order_relaxed) != kPlaying) {
++  if (!track_ || state_.load(std::memory_order_relaxed) != kPlaying ||
++      title_has_playback_control_.load(std::memory_order_relaxed)) {
+     return;
+   }
+   const std::vector<float>& samples = track_->samples;
+   const size_t total_frames = samples.size() / 2;
++  if (total_frames == 0) {
++    state_.store(kFinished, std::memory_order_relaxed);
++    return;
++  }
+   for (uint32_t frame = 0; frame < frames; ++frame) {
+     if (cursor_ >= total_frames) {
+-      state_.store(kFinished, std::memory_order_relaxed);
+-      REXLOG_INFO("custom music: '{}' finished", name_);
+-      break;
++      const uint32_t repeat_mode = repeat_mode_.load(std::memory_order_relaxed);
++      // A custom XMP selection is a single song; see CustomRepeatModeLoops for the evidence.
++      if (CustomRepeatModeLoops(repeat_mode)) {
++        cursor_ = 0;
++        if (++loop_log_count_ <= 32) {
++          REXLOG_INFO("custom music: '{}' end of file, restarting (repeat_mode={})", name_,
++                      repeat_mode);
++        }
++      } else {
++        state_.store(kFinished, std::memory_order_relaxed);
++        REXLOG_INFO("custom music: '{}' finished (repeat_mode={})", name_, repeat_mode);
++        break;
++      }
+     }
+     float* out = output + static_cast<size_t>(frame) * output_channels;
+     out[0] += samples[cursor_ * 2 + 0] * volume;
+diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
+index 3f081425..1962c9f2 100644
+--- a/src/kernel/xam/apps/xmp_app.cpp
++++ b/src/kernel/xam/apps/xmp_app.cpp
+@@ -27,6 +27,10 @@
+ #include <chrono>
+ #include <cstdlib>
+ #include <cstring>
++#include <iomanip>
++#include <map>
++#include <mutex>
++#include <sstream>
+ #include <system_error>
+ 
+ REXCVAR_DEFINE_STRING(xmp_music_dir, "", "XMP",
+@@ -44,6 +48,16 @@ namespace {
+ 
+ constexpr uint32_t kWwe2k14TitleId = 0x545408B2;
+ 
++// New custom-XMP behavior is opt-in under the workspace's default-off switch.
++// WWE2K14_XMP_FIX=0 explicitly disables the bundled behavior and diagnostics.
++bool XmpFixEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("WWE2K14_XMP_FIX");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
+ std::string LowerAscii(std::string value) {
+   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char character) {
+     return static_cast<char>(std::tolower(character));
+@@ -82,12 +96,108 @@ bool XmpStateProbeNotifyLog() {
+   return count <= 64 || count % 100 == 0;
+ }
+ 
++// Control-ownership mapping for 0x7001A (XMPSetPlaybackController {client, controller, word2}).
++//
++// PROVEN (generated code): the title polls 0x7001B through sub_82E1E2A0
++// (generated/wwe2k14_recomp.98.cpp:28442-28490), which outputs 1 only when BOTH returned words are
++// zero. Its caller (wwe2k14_recomp.104.cpp:64484-64515) sets bit 0x8 on a music object when that
++// output is 0 and then calls sub_82EED138 (an indirect vtable call with a float argument). The
++// title acquires with (controller=0, word2=1) in sub_82E1DBD8 (98.cpp:27455-27480) and releases
++// with (0,0) or (4,0) in sub_82E1DCB0 (98.cpp:27580-27625).
++// NOT PROVEN: what word2 means. The SDK enum (xmp_app.h) names 0=kSystem, 1=kTitle, but those
++// names are a guess carried over from Xenia. kPoll (default) follows the poll: "title has
++// playback control" == (controller==0 && word2==0), the Xbox 360 XMPTitleHasPlaybackControl
++// meaning, under which the game's own music is audible and the custom song must be silent.
++// kEnum follows the SDK enum names: title owns playback when word2 == kTitle(1).
++// WWE2K14_XMP_CONTROL_MAP=enum selects kEnum for A/B diagnosis; the [xmp-fix] controller lines
++// log both interpretations on every transition so one owner run decides.
++bool XmpControlMapEnum() {
++  static const bool enum_map = [] {
++    const char* value = std::getenv("WWE2K14_XMP_CONTROL_MAP");
++    return value && std::strcmp(value, "enum") == 0;
++  }();
++  return enum_map;
++}
++
++bool TitleHasPlaybackControlFor(uint32_t controller, uint32_t word2) {
++  if (XmpControlMapEnum()) {
++    return word2 == static_cast<uint32_t>(XmpApp::PlaybackClient::kTitle);
++  }
++  return controller == 0 && word2 == 0;
++}
++
++// Bounded [xmp-fix] event lines (repeat value, controller transitions, play/pause/continue/stop):
++// the first 256, then one in 50.
++bool XmpFixEventLog() {
++  if (!XmpFixEnabled()) {
++    return false;
++  }
++  static std::atomic<uint64_t> count{0};
++  const uint64_t n = count.fetch_add(1, std::memory_order_relaxed) + 1;
++  return n <= 256 || n % 50 == 0;
++}
++
++void LogXmpMessage(uint32_t message, uint32_t buffer_length, const uint8_t* buffer) {
++  struct DiagnosticState {
++    std::mutex mutex;
++    uint64_t total = 0;
++    std::chrono::steady_clock::time_point last_summary = std::chrono::steady_clock::now();
++    // At most kMaxTrackedIds distinct ids are tracked (the rest share one overflow counter) so the
++    // map and the summary line stay bounded whatever the guest sends.
++    size_t max_tracked_ids = 64;
++    std::map<uint32_t, uint64_t> per_message;
++    uint64_t overflow = 0;
++  };
++  static DiagnosticState diagnostic;
++
++  std::lock_guard<std::mutex> guard(diagnostic.mutex);
++  ++diagnostic.total;
++  if (diagnostic.per_message.count(message) || diagnostic.per_message.size() < diagnostic.max_tracked_ids) {
++    ++diagnostic.per_message[message];
++  } else {
++    ++diagnostic.overflow;
++  }
++  if (diagnostic.total <= 200) {
++    const uint32_t word_count = std::min<uint32_t>(buffer_length / sizeof(uint32_t), 4);
++    std::ostringstream words;
++    words << std::hex << std::uppercase << std::setfill('0');
++    for (uint32_t i = 0; i < word_count; ++i) {
++      if (i) {
++        words << ',';
++      }
++      words << "0x" << std::setw(8)
++            << memory::load_and_swap<uint32_t>(buffer + i * sizeof(uint32_t));
++    }
++    REXKRNL_INFO("[xmp-message] app=0xFA id=0x{:08X} len={} words=[{}] total={}", message,
++                 buffer_length, words.str(), diagnostic.total);
++    return;
++  }
++
++  const auto now = std::chrono::steady_clock::now();
++  if (now - diagnostic.last_summary < std::chrono::seconds(60)) {
++    return;
++  }
++  std::ostringstream counts;
++  counts << std::hex << std::uppercase << std::setfill('0');
++  for (const auto& [id, count] : diagnostic.per_message) {
++    if (counts.tellp() > 0) {
++      counts << ',';
++    }
++    counts << "0x" << std::setw(8) << id << '=' << std::dec << count << std::hex;
++  }
++  REXKRNL_INFO("[xmp-message-counts] total={} per_id={} other_ids={}", diagnostic.total,
++               counts.str(), diagnostic.overflow);
++  diagnostic.last_summary = now;
++}
++
+ }  // namespace
+ 
+ XmpApp::XmpApp(KernelState* kernel_state)
+     : App(kernel_state, 0xFA),
+       state_(State::kIdle),
+       playback_client_(PlaybackClient::kTitle),
++      playback_controller_(0),
++      title_has_playback_control_(false),
+       playback_mode_(PlaybackMode::kUnknown),
+       repeat_mode_(RepeatMode::kUnknown),
+       unknown_flags_(0),
+@@ -105,12 +215,18 @@ X_HRESULT XmpApp::XMPGetStatus(uint32_t state_ptr) {
+   }
+ 
+   REXKRNL_TRACE("XMPGetStatus({:08X})", state_ptr);
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+   // A custom song can end (or fail to decode) without any guest message; make
+   // the reported state truthful instead of stuck at kPlaying.
+   if (active_custom_song_.song && !Player().IsActive()) {
+     REXKRNL_INFO("XMP custom song '{}' ended", rex::string::to_utf8(active_custom_song_.song->name));
+     active_custom_song_ = {};
+     state_ = State::kIdle;
++    explicitly_paused_ = false;
++    paused_by_controller_ = false;
++    if (XmpFixEnabled()) {
++      OnStateChanged();
++    }
+   }
+   memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(state_ptr),
+                                    static_cast<uint32_t>(state_));
+@@ -212,6 +328,7 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
+ 
+   // Start playlist?
+   REXKRNL_WARN("Playlist playback not supported");
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+   active_playlist_ = playlist;
+   active_song_index_ = 0;
+   state_ = State::kPlaying;
+@@ -225,9 +342,30 @@ X_HRESULT XmpApp::XMPPlayTitlePlaylist(uint32_t playlist_handle, uint32_t song_h
+ 
+ X_HRESULT XmpApp::XMPContinue() {
+   REXKRNL_DEBUG("XMPContinue()");
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+   if (state_ == State::kPaused) {
+-    state_ = State::kPlaying;
+-    Player().Continue();
++    explicitly_paused_ = false;
++    if (!XmpFixEnabled()) {
++      state_ = State::kPlaying;
++      Player().Continue();
++    } else {
++      // Always clear the player's explicit-pause latch (a held latch left the player silent after
++      // control was released). The player itself keeps the sound muted while the title has
++      // control; the reported state follows the same rule.
++      Player().Continue();
++      if (title_has_playback_control_ && active_custom_song_.song) {
++        paused_by_controller_ = true;
++        state_ = State::kPaused;
++      } else {
++        paused_by_controller_ = false;
++        state_ = State::kPlaying;
++      }
++      if (XmpFixEventLog()) {
++        REXKRNL_INFO("[xmp-fix] continue title_control={} -> state={} player_paused={}",
++                     title_has_playback_control_, static_cast<uint32_t>(state_),
++                     Player().IsPaused());
++      }
++    }
+   }
+   OnStateChanged();
+   return X_E_SUCCESS;
+@@ -236,9 +374,17 @@ X_HRESULT XmpApp::XMPContinue() {
+ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
+   assert_zero(unk);
+   REXKRNL_DEBUG("XMPStop({:08X})", unk);
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
++  if (XmpFixEventLog()) {
++    REXKRNL_INFO("[xmp-fix] stop state={} custom_active={} title_control={}",
++                 static_cast<uint32_t>(state_), active_custom_song_.song != nullptr,
++                 title_has_playback_control_);
++  }
+   active_playlist_ = nullptr;  // ?
+   active_song_index_ = 0;
+   active_custom_song_ = {};
++  explicitly_paused_ = false;
++  paused_by_controller_ = false;
+   Player().Stop();
+   state_ = State::kIdle;
+   OnStateChanged();
+@@ -247,9 +393,18 @@ X_HRESULT XmpApp::XMPStop(uint32_t unk) {
+ 
+ X_HRESULT XmpApp::XMPPause() {
+   REXKRNL_DEBUG("XMPPause()");
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
++  if (XmpFixEventLog()) {
++    REXKRNL_INFO("[xmp-fix] pause state={} title_control={}", static_cast<uint32_t>(state_),
++                 title_has_playback_control_);
++  }
+   if (state_ == State::kPlaying) {
++    explicitly_paused_ = true;
+     state_ = State::kPaused;
+-    Player().Pause();
++    Player().Pause(XmpFixEnabled());
++  } else if (state_ == State::kPaused && active_custom_song_.song) {
++    explicitly_paused_ = true;
++    Player().Pause(XmpFixEnabled());
+   }
+   OnStateChanged();
+   return X_E_SUCCESS;
+@@ -259,23 +414,38 @@ X_HRESULT XmpApp::XMPPlayCustomSong(const CustomMusicSong* song) {
+   if (!song) {
+     return X_E_NOTFOUND;
+   }
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+   active_playlist_ = nullptr;
+   active_song_index_ = 0;
++  explicitly_paused_ = false;
++  paused_by_controller_ = XmpFixEnabled() && title_has_playback_control_;
+   active_custom_song_.song = song;
+   active_custom_song_.start_ms = static_cast<uint64_t>(
+       std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now()
+                                                                 .time_since_epoch())
+           .count());
+   Player().SetVolume(volume_);
++  if (XmpFixEnabled()) {
++    Player().SetRepeatMode(static_cast<uint32_t>(repeat_mode_));
++    Player().SetTitleHasPlaybackControl(title_has_playback_control_);
++    if (XmpFixEventLog()) {
++      REXKRNL_INFO("[xmp-fix] custom play '{}' repeat_mode={} loops={} title_control={}",
++                   rex::string::to_utf8(song->name), static_cast<uint32_t>(repeat_mode_),
++                   rex::audio::CustomRepeatModeLoops(static_cast<uint32_t>(repeat_mode_)),
++                   title_has_playback_control_);
++    }
++  }
+   if (!Player().Play(song->path, rex::string::to_utf8(song->name))) {
+     REXKRNL_ERROR("XMP custom play failed to start for '{}' ({})", rex::string::to_utf8(song->name),
+                   rex::path_to_utf8(song->path));
+     active_custom_song_ = {};
++    explicitly_paused_ = false;
++    paused_by_controller_ = false;
+     state_ = State::kIdle;
+     OnStateChanged();
+     return X_E_FAIL;
+   }
+-  state_ = State::kPlaying;
++  state_ = paused_by_controller_ ? State::kPaused : State::kPlaying;
+   OnStateChanged();
+   if (XmpStateProbeNotifyLog()) {
+     REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=1 (custom play)");
+@@ -286,6 +456,7 @@ X_HRESULT XmpApp::XMPPlayCustomSong(const CustomMusicSong* song) {
+ 
+ X_HRESULT XmpApp::XMPNext() {
+   REXKRNL_DEBUG("XMPNext()");
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+   if (!active_playlist_) {
+     return X_E_NOTFOUND;
+   }
+@@ -297,6 +468,7 @@ X_HRESULT XmpApp::XMPNext() {
+ 
+ X_HRESULT XmpApp::XMPPrevious() {
+   REXKRNL_DEBUG("XMPPrevious()");
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+   if (!active_playlist_) {
+     return X_E_NOTFOUND;
+   }
+@@ -311,6 +483,7 @@ X_HRESULT XmpApp::XMPPrevious() {
+ }
+ 
+ void XmpApp::OnStateChanged() {
++  std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+   if (XmpStateProbeNotifyLog()) {
+     REXKRNL_INFO("[xmp-state-probe] notify 0x0a000001 param={}",
+                  static_cast<uint32_t>(state_));
+@@ -420,6 +593,9 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+   }
+ 
+   auto buffer = memory_->TranslateVirtual(buffer_ptr);
++  if (XmpFixEnabled()) {
++    LogXmpMessage(message, buffer_length, buffer);
++  }
+   switch (message) {
+     case 0x00070025: {
+       assert_true(!buffer_length || buffer_length == 12);
+@@ -512,9 +688,24 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       assert_true(args->xmp_client == 0x00000002 || args->xmp_client == 0x00000000);
+       REXKRNL_DEBUG("XMPSetPlaybackBehavior({:08X}, {:08X}, {:08X})", uint32_t(args->playback_mode),
+                     uint32_t(args->repeat_mode), uint32_t(args->flags));
+-      playback_mode_ = static_cast<PlaybackMode>(uint32_t(args->playback_mode));
+-      repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
+-      unknown_flags_ = args->flags;
++      {
++        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
++        playback_mode_ = static_cast<PlaybackMode>(uint32_t(args->playback_mode));
++        repeat_mode_ = static_cast<RepeatMode>(uint32_t(args->repeat_mode));
++        unknown_flags_ = args->flags;
++        if (XmpFixEnabled()) {
++          Player().SetRepeatMode(static_cast<uint32_t>(repeat_mode_));
++          if (XmpFixEventLog()) {
++            REXKRNL_INFO(
++                "[xmp-fix] repeat set client={} playback_mode={} repeat_mode={} flags={} loops={} "
++                "state={} custom_active={}",
++                uint32_t(args->xmp_client), uint32_t(args->playback_mode),
++                uint32_t(args->repeat_mode), uint32_t(args->flags),
++                rex::audio::CustomRepeatModeLoops(uint32_t(args->repeat_mode)),
++                static_cast<uint32_t>(state_), active_custom_song_.song != nullptr);
++          }
++        }
++      }
+       if (XmpStateProbeNotifyLog()) {
+         REXKRNL_INFO("[xmp-state-probe] notify 0x0a000002 param=0 (playback behavior set)");
+       }
+@@ -538,12 +729,17 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+ 
+       assert_true(args->xmp_client == 0x00000002);
+       REXKRNL_DEBUG("XMPGetVolume({:08X})", uint32_t(args->volume_ptr));
+-      memory::store_and_swap<float>(memory_->TranslateVirtual(args->volume_ptr), volume_);
++      float volume_snapshot;
++      {
++        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
++        volume_snapshot = volume_;
++      }
++      memory::store_and_swap<float>(memory_->TranslateVirtual(args->volume_ptr), volume_snapshot);
+       if (XmpStateProbeEnabled()) {
+         static std::atomic<uint64_t> get_volume_probe_count{0};
+         const auto count = get_volume_probe_count.fetch_add(1, std::memory_order_relaxed) + 1;
+         if (count <= 3 || count % 1000 == 0) {
+-          REXKRNL_INFO("[xmp-state-probe] XMPGetVolume value={:g}", volume_);
++          REXKRNL_INFO("[xmp-state-probe] XMPGetVolume value={:g}", volume_snapshot);
+         }
+       }
+       return X_E_SUCCESS;
+@@ -558,8 +754,11 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+ 
+       assert_true(args->xmp_client == 0x00000002);
+       REXKRNL_INFO("XMPSetVolume({:g})", float(args->value));
+-      volume_ = args->value;
+-      Player().SetVolume(volume_);
++      {
++        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
++        volume_ = args->value;
++        Player().SetVolume(volume_);
++      }
+       return X_E_SUCCESS;
+     }
+     case 0x0007000D: {
+@@ -605,6 +804,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       auto info = memory_->TranslateVirtual(args->info_ptr);
+       assert_true(args->xmp_client == 0x00000002);
+       assert_zero(args->unk_ptr);
++      std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+       // Layout (guest caller sub_82CBBA00, generated/wwe13_recomp.89.cpp:47214):
+       // {client, 0, info_ptr}. The playlist path below writes the handle at
+       // +0 and the string fields at +4+572; mirror that for the custom song.
+@@ -656,13 +856,68 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       }* args = memory_->TranslateVirtual<decltype(args)>(buffer_ptr);
+       static_assert_size(decltype(*args), 12);
+ 
+-      assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
+-                  (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
++      // The title also constructs controller=4 in its generated 2K14 path
++      // (generated/wwe2k14_recomp.98.cpp:27592-27597, 27617-27625).
++      if (XmpFixEnabled()) {
++        assert_true((args->xmp_client == 0x00000002 &&
++                     (args->controller == 0x00000000 || args->controller == 0x00000004)) ||
++                    (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
++      } else {
++        assert_true((args->xmp_client == 0x00000002 && args->controller == 0x00000000) ||
++                    (args->xmp_client == 0x00000000 && args->controller == 0x00000001));
++      }
+       REXKRNL_DEBUG("XMPSetPlaybackController({:08X}, {:08X})", uint32_t(args->controller),
+                     uint32_t(args->playback_client));
+ 
+-      playback_client_ = PlaybackClient(uint32_t(args->playback_client));
+-      playback_controller_set_.store(true, std::memory_order_release);
++      {
++        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
++        const bool was_title_has_playback_control = title_has_playback_control_;
++        const State state_before = state_;
++        playback_controller_ = static_cast<uint32_t>(args->controller);
++        playback_client_ = PlaybackClient(uint32_t(args->playback_client));
++        title_has_playback_control_ = TitleHasPlaybackControlFor(
++            playback_controller_, static_cast<uint32_t>(args->playback_client));
++        playback_controller_set_.store(true, std::memory_order_release);
++        const char* action = "none";
++        if (XmpFixEnabled()) {
++          Player().SetTitleHasPlaybackControl(title_has_playback_control_);
++          if (active_custom_song_.song) {
++            if (title_has_playback_control_ && !was_title_has_playback_control &&
++                state_ == State::kPlaying && Player().IsActive()) {
++              paused_by_controller_ = true;
++              state_ = State::kPaused;
++              action = "pause_for_control";
++              OnStateChanged();
++            } else if (!title_has_playback_control_ && was_title_has_playback_control &&
++                       paused_by_controller_) {
++              paused_by_controller_ = false;
++              action = "release";
++              if (!explicitly_paused_ && Player().IsActive()) {
++                state_ = State::kPlaying;
++                action = "resume_after_control";
++                OnStateChanged();
++              }
++            }
++          }
++          if (XmpFixEventLog()) {
++            // Both interpretations are logged so one run settles the mapping: poll_both_zero is
++            // what the title's own poll uses; enum_title is word2 == SDK kTitle(1).
++            REXKRNL_INFO(
++                "[xmp-fix] controller set client={} controller={} word2={} poll_both_zero={} "
++                "enum_title={} map={} title_control {}->{} state {}->{} custom_active={} "
++                "player_paused={} action={}",
++                uint32_t(args->xmp_client), uint32_t(args->controller),
++                uint32_t(args->playback_client),
++                uint32_t(args->controller) == 0 && uint32_t(args->playback_client) == 0,
++                uint32_t(args->playback_client) ==
++                    static_cast<uint32_t>(PlaybackClient::kTitle),
++                XmpControlMapEnum() ? "enum" : "poll", was_title_has_playback_control,
++                title_has_playback_control_, static_cast<uint32_t>(state_before),
++                static_cast<uint32_t>(state_), active_custom_song_.song != nullptr,
++                Player().IsPaused(), action);
++          }
++        }
++      }
+       if (XmpStateProbeEnabled()) {
+         REXKRNL_INFO("[xmp-state-probe] XMPSetPlaybackController controller={} client={}",
+                      uint32_t(args->controller), uint32_t(args->playback_client));
+@@ -687,21 +942,26 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       assert_true(args->xmp_client == 0x00000002);
+       REXKRNL_DEBUG("XMPGetPlaybackController({:08X}, {:08X}, {:08X})", uint32_t(args->xmp_client),
+                     uint32_t(args->controller_ptr), uint32_t(args->locked_ptr));
+-      // Report the playback state stored by XMPSetPlaybackController instead of
+-      // a hardcoded idle (0, 0): the Wwise poll wrappers (WWE '13 sub_82CBBD20 /
+-      // 2K14 sub_82E1E2A0) treat title playback as active only while both words
+-      // are zero. The controller word is not tracked by this app and the title's
+-      // own setter calls always pass controller == 0, so it stays 0. WWE 2K14
+-      // starts with the stock idle answer until its title explicitly sets a
+-      // playback client; REX_XMP_REPORT_IDLE remains available for an opt-in
+-      // forced-idle A/B for any title.
++      // The 2K14 Wwise poll wrapper (generated/wwe2k14_recomp.98.cpp:
++      // 28442-28490) treats title playback as active only while both words are
++      // zero. Return the actual controller word and the stored client word so
++      // the title can observe its SetPlaybackController state. Before the title
++      // sets either, preserve 2K14's initial idle answer. REX_XMP_REPORT_IDLE
++      // remains available for an opt-in forced-idle A/B for any title.
+       const bool title_default_idle =
+           !playback_controller_set_.load(std::memory_order_acquire) &&
+           kernel_state_->title_id() == kWwe2k14TitleId;
+       const bool report_idle = XmpReportIdlePlaybackController() || title_default_idle;
+-      const uint32_t client = static_cast<uint32_t>(playback_client_);
++      uint32_t client;
++      uint32_t controller_word;
++      {
++        std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
++        client = static_cast<uint32_t>(playback_client_);
++        controller_word = XmpFixEnabled() ? playback_controller_ : 0;
++      }
+       const uint32_t locked = report_idle ? 0 : client;
+-      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr), 0);
++      memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->controller_ptr),
++                                       controller_word);
+       memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->locked_ptr),
+                                        locked);
+       if (XmpStateProbeEnabled()) {
+@@ -709,7 +969,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+             get_playback_controller_log_count_.load(std::memory_order_relaxed);
+         REXKRNL_INFO(
+             "[xmp-state-probe] XMPGetPlaybackController count={} controller={} locked={} client={} report_idle={}",
+-            count, 0, locked, client, report_idle);
++            count, controller_word, locked, client, report_idle);
+       }
+ 
+       if (!XThread::GetCurrentThread()->main_thread()) {
+@@ -734,6 +994,7 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
+       REXKRNL_DEBUG("XMPGetPlaybackBehavior({:08X}, {:08X}, {:08X})",
+                     uint32_t(args->playback_mode_ptr), uint32_t(args->repeat_mode_ptr),
+                     uint32_t(args->unk3_ptr));
++      std::lock_guard<std::recursive_mutex> state_lock(state_mutex_);
+       if (args->playback_mode_ptr) {
+         memory::store_and_swap<uint32_t>(memory_->TranslateVirtual(args->playback_mode_ptr),
+                                          static_cast<uint32_t>(playback_mode_));
+diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
+index 79dc7309..09772fe5 100644
+--- a/tests/unit/CMakeLists.txt
++++ b/tests/unit/CMakeLists.txt
+@@ -16,6 +16,7 @@ add_executable(unit_tests
+     core/chrono_test.cpp
+     core/content_probe_test.cpp
+     core/threading_test.cpp
++    core/custom_music_player_test.cpp
+     codegen/config_test.cpp
+     codegen/template_registry_test.cpp
+     codegen/jump_table_bias_test.cpp
+@@ -44,9 +45,29 @@ target_link_libraries(unit_tests PRIVATE
+     Catch2::Catch2WithMain
+ )
+ 
++# Run in a separate process because Runtime owns the process-wide guest Memory
++# singleton and this driver exercises Runtime shutdown.
++add_executable(thread_stack_reclamation_test
++    system/thread_stack_reclamation_driver.cpp
++)
++target_include_directories(thread_stack_reclamation_test PRIVATE
++    ${PROJECT_SOURCE_DIR}/include
++    ${PROJECT_SOURCE_DIR}/src
++)
++set(thread_stack_reclamation_link_libs ${unit_tests_link_libs})
++if(WIN32)
++    list(APPEND thread_stack_reclamation_link_libs rexsystem)
++endif()
++target_link_libraries(thread_stack_reclamation_test PRIVATE
++    ${thread_stack_reclamation_link_libs}
++)
++
+ set_target_properties(unit_tests PROPERTIES
+     RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/bin
+ )
++set_target_properties(thread_stack_reclamation_test PROPERTIES
++    RUNTIME_OUTPUT_DIRECTORY ${CMAKE_BINARY_DIR}/tests/bin
++)
+ 
+ # Discover tests
+ include(Catch)
+diff --git a/tests/unit/core/custom_music_player_test.cpp b/tests/unit/core/custom_music_player_test.cpp
+new file mode 100644
+index 00000000..15876b03
+--- /dev/null
++++ b/tests/unit/core/custom_music_player_test.cpp
+@@ -0,0 +1,233 @@
++/**
++ * @file custom_music_player_test.cpp
++ * @brief Host-side tests for decoded custom XMP music behavior.
++ */
++
++#include <array>
++#include <chrono>
++#include <cstdint>
++#include <filesystem>
++#include <fstream>
++#include <stdexcept>
++#include <string>
++#include <thread>
++#include <vector>
++
++#include <catch2/catch_approx.hpp>
++#include <catch2/catch_test_macros.hpp>
++
++#include <rex/audio/custom_music_player.h>
++
++namespace {
++
++void WriteU16(std::ofstream& stream, uint16_t value) {
++  const std::array<char, 2> bytes = {static_cast<char>(value & 0xFF),
++                                     static_cast<char>((value >> 8) & 0xFF)};
++  stream.write(bytes.data(), bytes.size());
++}
++
++void WriteU32(std::ofstream& stream, uint32_t value) {
++  const std::array<char, 4> bytes = {static_cast<char>(value & 0xFF),
++                                     static_cast<char>((value >> 8) & 0xFF),
++                                     static_cast<char>((value >> 16) & 0xFF),
++                                     static_cast<char>((value >> 24) & 0xFF)};
++  stream.write(bytes.data(), bytes.size());
++}
++
++struct TempWave {
++  std::filesystem::path path;
++
++  ~TempWave() {
++    std::error_code error;
++    std::filesystem::remove(path, error);
++  }
++};
++
++TempWave MakeShortWave() {
++  constexpr uint32_t kRate = 48000;
++  constexpr std::array<int16_t, 4> kSamples = {8192, 16384, 24576, 32767};
++  constexpr uint32_t kDataBytes = kSamples.size() * sizeof(int16_t);
++  const auto unique = std::chrono::steady_clock::now().time_since_epoch().count();
++  TempWave wave{std::filesystem::temp_directory_path() /
++                ("rex_xmp_music_test_" + std::to_string(unique) + ".wav")};
++
++  std::ofstream stream(wave.path, std::ios::binary | std::ios::trunc);
++  if (!stream) {
++    throw std::runtime_error("could not create test WAV");
++  }
++  stream.write("RIFF", 4);
++  WriteU32(stream, 36 + kDataBytes);
++  stream.write("WAVEfmt ", 8);
++  WriteU32(stream, 16);
++  WriteU16(stream, 1);  // PCM
++  WriteU16(stream, 1);  // mono
++  WriteU32(stream, kRate);
++  WriteU32(stream, kRate * sizeof(int16_t));
++  WriteU16(stream, sizeof(int16_t));
++  WriteU16(stream, 16);
++  stream.write("data", 4);
++  WriteU32(stream, kDataBytes);
++  for (const int16_t sample : kSamples) {
++    WriteU16(stream, static_cast<uint16_t>(sample));
++  }
++  stream.close();
++  if (!stream) {
++    throw std::runtime_error("could not finish test WAV");
++  }
++  return wave;
++}
++
++bool WaitForPlaying(rex::audio::CustomMusicPlayer& player) {
++  for (uint32_t attempt = 0; attempt < 2000; ++attempt) {
++    if (player.IsPlaying()) {
++      return true;
++    }
++    std::this_thread::sleep_for(std::chrono::milliseconds(1));
++  }
++  return false;
++}
++
++void StartTrack(rex::audio::CustomMusicPlayer& player, const std::filesystem::path& path,
++               uint32_t repeat_mode) {
++  player.Stop();
++  player.SetTitleHasPlaybackControl(false);
++  player.SetRepeatMode(repeat_mode);
++  REQUIRE(player.Play(path, "unit test"));
++  REQUIRE(WaitForPlaying(player));
++}
++
++}  // namespace
++
++TEST_CASE("custom XMP music decodes WAV and follows repeat/pause/stop state", "[custom_music]") {
++  using rex::audio::CustomMusicPlayer;
++
++  TempWave wave = MakeShortWave();
++  std::string error;
++  auto decoded = rex::audio::DecodeCustomMusicFile(wave.path, 48000, &error);
++  REQUIRE(decoded);
++  CHECK(decoded->decoder == "dr_wav");
++  REQUIRE(decoded->samples.size() == 8);
++  CHECK(decoded->samples[0] == Catch::Approx(0.25f).margin(0.0001f));
++  CHECK(decoded->samples[1] == 0.0f);
++
++  auto& player = CustomMusicPlayer::instance();
++  player.SetVolume(1.0f);
++
++  SECTION("repeat-one and repeat-playlist restart the selected custom track") {
++    for (const uint32_t repeat_mode : {1u, 2u}) {
++      StartTrack(player, wave.path, repeat_mode);
++      std::array<float, 12> output{};
++      player.MixFrames(output.data(), 6, 48000, 2);
++      CHECK(output[0] == Catch::Approx(0.25f).margin(0.0001f));
++      CHECK(output[2] == Catch::Approx(0.5f).margin(0.0001f));
++      CHECK(output[4] == Catch::Approx(0.75f).margin(0.0001f));
++      CHECK(output[6] == Catch::Approx(32767.0f / 32768.0f).margin(0.0001f));
++      CHECK(output[8] == Catch::Approx(0.25f).margin(0.0001f));
++      CHECK(output[10] == Catch::Approx(0.5f).margin(0.0001f));
++      CHECK(player.IsActive());
++    }
++    player.Stop();
++  }
++
++  SECTION("no-repeat stops at EOF and becomes inactive") {
++    StartTrack(player, wave.path, 0);
++    std::array<float, 12> output{};
++    player.MixFrames(output.data(), 6, 48000, 2);
++    CHECK(output[0] == Catch::Approx(0.25f).margin(0.0001f));
++    CHECK(output[6] == Catch::Approx(32767.0f / 32768.0f).margin(0.0001f));
++    CHECK(output[8] == 0.0f);
++    CHECK(output[10] == 0.0f);
++    CHECK_FALSE(player.IsActive());
++    CHECK_FALSE(player.IsPlaying());
++    std::array<float, 2> stopped_output{};
++    player.MixFrames(stopped_output.data(), 1, 48000, 2);
++    CHECK(stopped_output[0] == 0.0f);
++    CHECK(stopped_output[1] == 0.0f);
++  }
++
++  SECTION("pause and title control silence without advancing; stop silences") {
++    StartTrack(player, wave.path, 1);
++    std::array<float, 2> output{};
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == Catch::Approx(0.25f).margin(0.0001f));
++
++    player.Pause(true);
++    output.fill(0.0f);
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == 0.0f);
++    player.Continue();
++    output.fill(0.0f);
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == Catch::Approx(0.5f).margin(0.0001f));
++
++    player.SetTitleHasPlaybackControl(true);
++    output.fill(0.0f);
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == 0.0f);
++    player.SetTitleHasPlaybackControl(false);
++    output.fill(0.0f);
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == Catch::Approx(0.75f).margin(0.0001f));
++
++    player.Stop();
++    output.fill(0.0f);
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == 0.0f);
++    CHECK_FALSE(player.IsActive());
++  }
++  SECTION("repeat mapping constants: only the named candidates loop") {
++    CHECK_FALSE(rex::audio::CustomRepeatModeLoops(0));
++    CHECK(rex::audio::CustomRepeatModeLoops(rex::audio::kCustomRepeatOneCandidate));
++    CHECK(rex::audio::CustomRepeatModeLoops(rex::audio::kCustomRepeatAllCandidate));
++    CHECK_FALSE(rex::audio::CustomRepeatModeLoops(3));
++    StartTrack(player, wave.path, 3);
++    std::array<float, 12> output{};
++    player.MixFrames(output.data(), 6, 48000, 2);
++    CHECK(output[8] == 0.0f);
++    CHECK_FALSE(player.IsActive());
++  }
++
++  SECTION("explicit stop after a loop ends playback even with repeat on") {
++    StartTrack(player, wave.path, 1);
++    std::array<float, 12> output{};
++    player.MixFrames(output.data(), 6, 48000, 2);
++    CHECK(output[8] == Catch::Approx(0.25f).margin(0.0001f));  // looped once
++    player.Stop();
++    output.fill(0.0f);
++    player.MixFrames(output.data(), 2, 48000, 2);
++    CHECK(output[0] == 0.0f);
++    CHECK_FALSE(player.IsActive());
++  }
++
++  SECTION("pause under title control, then release control: stays silent until continue") {
++    StartTrack(player, wave.path, 1);
++    player.SetTitleHasPlaybackControl(true);
++    player.Pause(true);  // XMPPause while the title has control
++    player.SetTitleHasPlaybackControl(false);
++    std::array<float, 2> output{};
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == 0.0f);  // explicit pause survives the release
++    CHECK(player.IsPaused());
++    player.Continue();
++    output.fill(0.0f);
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == Catch::Approx(0.25f).margin(0.0001f));
++    player.Stop();
++  }
++
++  SECTION("pause then continue under title control: release resumes (no stuck latch)") {
++    StartTrack(player, wave.path, 1);
++    player.SetTitleHasPlaybackControl(true);
++    player.Pause(true);
++    player.Continue();  // XMPContinue always reaches the player now
++    CHECK_FALSE(player.IsExplicitlyPaused());
++    std::array<float, 2> output{};
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == 0.0f);  // still silent: the title has control
++    player.SetTitleHasPlaybackControl(false);
++    CHECK(player.IsPlaying());
++    player.MixFrames(output.data(), 1, 48000, 2);
++    CHECK(output[0] == Catch::Approx(0.25f).margin(0.0001f));
++    player.Stop();
++  }
++}
+-- 
+2.43.0
+

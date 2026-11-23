@@ -1,0 +1,80 @@
+# WWE 2K15 import recipe (choices only, no game data): 2K15 source ID, WWE 2K14 target slot, display name, handle,
+# same-class WWE 2K14 donor, kind (new/alt), 2K14 original for alternates, entrance pack (3/4/5), options:
+#   donor-music = no 2K15 theme event, keep the donor theme; donor-titantron = donor film when 2K15 has none; titantron=NAME = 2K15 team film movies/titantron/NAME_0_0.bk2 when he has no own;
+#   keep-donor-entrance = parked entrance fault; allow-no-victory = no victory pair anywhere; gate-one = the slot needs
+#   the explicit gate-one allowance; victory15=ID = take that 2K15 celebration (Harper -> Rowan). Generated from tools/port/p15roster/people.tsv and the P15-FIN / P15-ALL builds.
+id15	slot	name	handle	donor	kind	orig14	entrance_pack	options	gender
+398	175	BRAY WYATT	@WWEBrayWyatt	353	new		4		M
+116	165	ROB VAN DAM	@TherealRVD	219	new		4		M
+282	282	TYSON KIDD	@TJWilson	219	new		4		M
+299	168	TAMINA	@TaminaSnuka	290	new		4		F
+397	174	CURTIS AXEL	@RealCurtisAxel	319	new		4		M
+400	178	ERICK ROWAN	@ERICKROWAN	319	new		4	titantron=tag_0007	M
+401	182	LUKE HARPER	@LukeHarperWWE	319	new		4	victory15=400,titantron=tag_0007	M
+409	186	STING '99	@Sting	319	new		4		M
+410	262	STING '91	@Sting	319	new		4		M
+420	263	XAVIER WOODS	@XavierWoodsPhD	219	new		4		M
+422	265	ADRIAN NEVILLE	@WWENeville	219	new		4		M
+424	281	RUSEV	@RusevBUL	319	new		4		M
+425	283	BO DALLAS	@TheBoDallas	219	new		4		M
+426	284	COREY GRAVES	@WWEGraves	219	new		4		M
+429	291	SAMI ZAYN	@SamiZayn	319	new		4		M
+189	300	LILIAN GARCIA	@LilianGarcia	290	new		4	donor-music,donor-titantron	M
+300	301	JOHN LAURINAITIS	@WWERawGM	319	new		4	donor-music,donor-titantron	M
+419	303	ZEB COLTER	@WWEZeb	219	new		4	donor-music,donor-titantron	M
+430	304	LANA	@LanaWWE	290	new		4		F
+338	293	DANIEL BRYAN '12	@WWEDanielBryan	219	alt	324	4		M
+352	376	CM PUNK '11-'12	@CMPunk	219	alt	131	4		M
+411	112	BATISTA '03	@DaveBautista	319	alt	160	4	keep-donor-entrance	M
+412	113	ALBERTO DEL RIO '11	@VivaDelRio	319	alt	322	4		M
+431	118	RANDY ORTON '04	@RandyOrton	319	alt	161	4		M
+108	108	BOOKER T ('15)	@BookerT	319	new		3		M
+277	277	GOLDUST ('15)	@Goldust	319	new		3		M
+332	330	JIMMY USO ('15)	@JimmyUso	219	new		3	titantron=tag_0001	M
+333	331	JEY USO ('15)	@JeyUso	219	new		3	titantron=tag_0001	M
+100	426	THE ROCK '15		100	new		3	gate-one	M
+101	427	STONE COLD STEVE AUSTIN '15		101	new		3	gate-one	M
+102	428	TRIPLE H '15		102	new		3	gate-one	M
+103	429	UNDERTAKER '15		103	new		3	gate-one	M
+104	430	CHRIS JERICHO '15		104	new		3	gate-one	M
+139	431	JOHN CENA '15		139	new		3	gate-one	M
+161	432	RANDY ORTON '15		161	new		3	gate-one	M
+131	433	CM PUNK '15		131	new		3	gate-one	M
+324	434	DANIEL BRYAN '15		324	new		3	gate-one	M
+368	435	ROMAN REIGNS '15		368	new		3	allow-no-victory,gate-one,titantron=tag_0008	M
+107	436	KANE '15		107	new		3	gate-one	M
+109	437	HULK HOGAN '15		109	new		3	gate-one	M
+123	439	REY MYSTERIO '15		123	new		3	gate-one	M
+125	440	BIG SHOW '15		125	new		3	gate-one	M
+130	441	RIC FLAIR '15		130	new		3	gate-one	M
+145	442	SHAWN MICHAELS '15		145	new		3	gate-one	M
+160	443	BATISTA '15		160	new		3	gate-one	M
+176	444	KOFI KINGSTON '15		176	new		3	gate-one	M
+179	446	MARK HENRY '15		179	new		3	gate-one	M
+201	447	SANTINO MARELLA '15		201	new		3	allow-no-victory,gate-one	M
+205	448	CODY RHODES '15		205	new		3	gate-one	M
+218	449	THE MIZ '15		218	new		3	gate-one	M
+254	464	ULTIMATE WARRIOR '15		254	new		3	gate-one	M
+267	465	JACK SWAGGER '15		267	new		3	gate-one	M
+272	466	R-TRUTH '15		272	new		3	gate-one	M
+275	467	DOLPH ZIGGLER '15		275	new		3	allow-no-victory,gate-one	M
+279	468	SHEAMUS '15		279	new		3	gate-one	M
+290	469	NATALYA '15		290	new		3	gate-one	F
+298	470	AJ LEE '15		298	new		3	gate-one	F
+322	471	ALBERTO DEL RIO '15		322	new		3	gate-one	M
+325	472	BAD NEWS BARRETT '15		325	new		3	gate-one	M
+327	473	JUSTIN GABRIEL '15		327	new		3	allow-no-victory,gate-one	M
+335	474	KEVIN NASH '15		335	new		3	gate-one	M
+343	475	BROCK LESNAR '15		343	new		3	gate-one	M
+347	476	CHRIS JERICHO (RETRO) '15		347	new		3	gate-one,donor-titantron	M
+348	477	KANE (RETRO) '15		348	new		3	gate-one,donor-titantron	M
+353	478	RYBACK '15		353	new		3	gate-one	M
+354	479	CAMERON '15		298	new		3	gate-one,titantron=tag_0002	F
+355	420	NAOMI '15		298	new		3	gate-one,titantron=tag_0002	F
+359	399	CESARO '15		359	new		3	gate-one	M
+360	397	DAMIEN SANDOW '15		360	new		3	gate-one	M
+363	299	HOLLYWOOD HULK HOGAN '15		109	new		3	gate-one	M
+367	257	DEAN AMBROSE '15		367	new		3	allow-no-victory,gate-one,titantron=tag_0008	M
+369	159	SETH ROLLINS '15		369	new		3	allow-no-victory,gate-one,titantron=tag_0008	M
+370	375	DARREN YOUNG '15		370	new		3	allow-no-victory,gate-one	M
+371	373	TITUS O'NEIL '15		371	new		3	gate-one	M

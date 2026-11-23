@@ -1,0 +1,60 @@
+From d97c3162012f135cd3cf1ae9876ba15eb205a2a7 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 13:30:17 -0700
+Subject: [PATCH 105/149] nr: DrawObserver::OnEdramSnapshot - a trace replay's
+ EDRAM snapshot is passed to the registered observer (no-op by default)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit ba4e907f08c4c320057f25d6174767b4b061532c)
+---
+ include/rex/graphics/draw_observer.h | 4 ++++
+ src/graphics/trace_player.cpp        | 4 ++++
+ 2 files changed, 8 insertions(+)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 738593e6..1d1a5dee 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -7,6 +7,7 @@
+ 
+ #pragma once
+ 
++#include <cstddef>
+ #include <cstdint>
+ 
+ namespace rex::memory {
+@@ -37,6 +38,9 @@ class DrawObserver {
+  public:
+   virtual ~DrawObserver() = default;
+   virtual void OnDraw(const ObservedDraw& draw) = 0;
++  // A trace replay restored the EDRAM from a snapshot (raw 2048 tiles x 5120 bytes, the guest
++  // layout), before the frame's first draw.
++  virtual void OnEdramSnapshot(const void* data, size_t size) { (void)data; (void)size; }
+ };
+ 
+ // Not thread-safe to change while the GPU thread runs; set before the title or replay starts.
+diff --git a/src/graphics/trace_player.cpp b/src/graphics/trace_player.cpp
+index f2edbdd1..c9db214d 100644
+--- a/src/graphics/trace_player.cpp
++++ b/src/graphics/trace_player.cpp
+@@ -20,6 +20,7 @@
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/trace_player.h>
++#include <rex/graphics/draw_observer.h>
+ #include <rex/graphics/xenos.h>
+ #include <rex/memory.h>
+ 
+@@ -206,6 +207,9 @@ void TracePlayer::PlayTraceOnThread(const uint8_t* trace_data, size_t trace_size
+                     std::min(snapshot_size, runtime_snapshot_size));
+         trace_ptr += cmd->encoded_length;
+         command_processor->RestoreEdramSnapshot(edram_snapshot.get());
++        if (DrawObserver* observer = GetDrawObserver()) {
++          observer->OnEdramSnapshot(edram_snapshot.get(), runtime_snapshot_size);
++        }
+         break;
+       }
+       case TraceCommandType::kEvent: {
+-- 
+2.43.0
+

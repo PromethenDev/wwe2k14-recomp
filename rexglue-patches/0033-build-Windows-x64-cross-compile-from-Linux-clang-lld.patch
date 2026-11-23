@@ -1,7 +1,7 @@
 From 097f61a85c11ec3eb7848722e6a88acef6b98437 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 13:42:58 -0700
-Subject: [PATCH 33/97] build: Windows x64 cross-compile from Linux (clang +
+Subject: [PATCH 033/149] build: Windows x64 cross-compile from Linux (clang +
  lld-link + xwin)
 
 - cmake/toolchains/win-amd64-xwin.cmake: clang/clang++ targeting
@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/cmake/toolchains/win-amd64-xwin.cmake b/cmake/toolchains/win-amd64-xwin.cmake
 new file mode 100644
-index 0000000..79f4415
+index 00000000..79f44153
 --- /dev/null
 +++ b/cmake/toolchains/win-amd64-xwin.cmake
 @@ -0,0 +1,96 @@
@@ -128,7 +128,7 @@ index 0000000..79f4415
 +# xwin ships release CRT libs only (no libcmtd.lib); probe with a release config.
 +set(CMAKE_TRY_COMPILE_CONFIGURATION RelWithDebInfo)
 diff --git a/src/core/platform_win.h b/src/core/platform_win.h
-index 44be14e..22da1c0 100644
+index 44be14ee..22da1c0c 100644
 --- a/src/core/platform_win.h
 +++ b/src/core/platform_win.h
 @@ -21,8 +21,8 @@
@@ -143,7 +143,7 @@ index 44be14e..22da1c0 100644
  #include <dwmapi.h>
  #include <shellapi.h>
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
-index 813abab..fe095af 100644
+index 813abab3..fe095afd 100644
 --- a/src/system/mmio_handler.cpp
 +++ b/src/system/mmio_handler.cpp
 @@ -9,9 +9,11 @@
@@ -184,7 +184,7 @@ index 813abab..fe095af 100644
  bool MMIOHandler::ExceptionCallbackThunk(arch::Exception* ex, void* data) {
    return reinterpret_cast<MMIOHandler*>(data)->ExceptionCallback(ex);
 diff --git a/src/ui/CMakeLists.txt b/src/ui/CMakeLists.txt
-index 0ed53f2..bae5da5 100644
+index 0ed53f27..bae5da59 100644
 --- a/src/ui/CMakeLists.txt
 +++ b/src/ui/CMakeLists.txt
 @@ -132,9 +132,12 @@ endif()

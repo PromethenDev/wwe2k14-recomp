@@ -1,0 +1,630 @@
+From ed12b8b192ab73086f4d7999294372c6f078576b Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 16:50:02 -0700
+Subject: [PATCH 128/149] MnK keyboard text entry for name boxes (GitHub #53):
+ answer the type-2 keyboard capability for flags=2, map VK + Unicode
+ keystrokes, suppress A-Z/0-9 pad binds while the title polls keystrokes
+
+Opt-in with WWE2K14_KEYBOARD_TEXT=1 (the launcher sets it with mnk mode). Verified in game 2026-10-26 (lane kbd2,
+CAW NAME field TEST1 / Backspace / Enter). Owner approved for the public release 2026-10-26.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/input/mnk/keyboard_text_mapping.h | 148 +++++++++++++++++
+ src/input/input_system.cpp                    |  21 +++
+ src/input/mnk/mnk_input_driver.cpp            | 150 ++++++++++++++----
+ src/kernel/xam/xam_input.cpp                  |  89 ++++++++++-
+ 4 files changed, 370 insertions(+), 38 deletions(-)
+ create mode 100644 include/rex/input/mnk/keyboard_text_mapping.h
+
+diff --git a/include/rex/input/mnk/keyboard_text_mapping.h b/include/rex/input/mnk/keyboard_text_mapping.h
+new file mode 100644
+index 00000000..d7021e4c
+--- /dev/null
++++ b/include/rex/input/mnk/keyboard_text_mapping.h
+@@ -0,0 +1,148 @@
++#pragma once
++
++#include <array>
++#include <atomic>
++#include <chrono>
++#include <cstddef>
++#include <cstdint>
++#include <cstdlib>
++#include <cstring>
++#include <mutex>
++
++namespace rex::input::mnk {
++
++inline bool KeyboardTextEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("WWE2K14_KEYBOARD_TEXT");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
++constexpr bool IsKeyboardTextAnyDeviceQuery(uint32_t flags) {
++  return (flags & 0xFF) == 0x02;
++}
++
++constexpr bool IsKeyboardTextBindKey(uint16_t virtual_key) {
++  return (virtual_key >= 'A' && virtual_key <= 'Z') ||
++         (virtual_key >= '0' && virtual_key <= '9');
++}
++
++constexpr bool ShouldSuppressKeyboardTextBind(uint16_t virtual_key,
++                                               bool keyboard_text_enabled,
++                                               bool title_polling_active) {
++  return keyboard_text_enabled && title_polling_active &&
++         IsKeyboardTextBindKey(virtual_key);
++}
++
++inline void FilterKeyboardTextBindKeys(const bool (&source)[256],
++                                       bool keyboard_text_enabled,
++                                       bool title_polling_active,
++                                       bool (&filtered)[256]) {
++  for (uint16_t virtual_key = 0; virtual_key < 256; ++virtual_key) {
++    filtered[virtual_key] =
++        source[virtual_key] &&
++        !ShouldSuppressKeyboardTextBind(virtual_key, keyboard_text_enabled,
++                                        title_polling_active);
++  }
++}
++
++constexpr int64_t kKeyboardTextPollingWindowNanoseconds = 500'000'000;
++
++constexpr bool KeyboardTextPollingIsRecent(int64_t now_nanoseconds,
++                                            int64_t last_poll_nanoseconds) {
++  return last_poll_nanoseconds > 0 && now_nanoseconds >= last_poll_nanoseconds &&
++         now_nanoseconds - last_poll_nanoseconds <=
++             kKeyboardTextPollingWindowNanoseconds;
++}
++
++inline std::atomic<int64_t>& LastKeyboardTextPollNanoseconds() {
++  static std::atomic<int64_t> last_poll{0};
++  return last_poll;
++}
++
++inline void NoteKeyboardTextKeystrokePoll(uint32_t flags) {
++  if (!KeyboardTextEnabled() || !IsKeyboardTextAnyDeviceQuery(flags)) {
++    return;
++  }
++  const auto now = std::chrono::steady_clock::now().time_since_epoch();
++  const auto nanoseconds = std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
++  LastKeyboardTextPollNanoseconds().store(nanoseconds, std::memory_order_release);
++}
++
++inline bool KeyboardTextPollingActive() {
++  if (!KeyboardTextEnabled()) {
++    return false;
++  }
++  const auto now = std::chrono::steady_clock::now().time_since_epoch();
++  const auto now_nanoseconds =
++      std::chrono::duration_cast<std::chrono::nanoseconds>(now).count();
++  const int64_t last_poll =
++      LastKeyboardTextPollNanoseconds().load(std::memory_order_acquire);
++  return KeyboardTextPollingIsRecent(now_nanoseconds, last_poll);
++}
++
++enum class KeyboardTextTraceCategory : uint8_t {
++  kCapability,
++  kKeystroke,
++  kHostInput,
++};
++
++// Each trace category is limited to 256 emitted lines per second and 4096
++// emitted lines per process. Calls beyond either budget are counted and the
++// dropped-call count is included in the next emitted line.
++inline bool KeyboardTextTracePermit(KeyboardTextTraceCategory category,
++                                    uint32_t* dropped_since_last = nullptr) {
++  if (!KeyboardTextEnabled()) {
++    return false;
++  }
++
++  struct Bucket {
++    std::mutex mutex;
++    int64_t window_start_milliseconds = 0;
++    uint32_t emitted_this_window = 0;
++    uint32_t emitted_total = 0;
++    uint32_t dropped = 0;
++  };
++  static std::array<Bucket, 3> buckets{};
++
++  const auto now = std::chrono::steady_clock::now().time_since_epoch();
++  const int64_t now_milliseconds =
++      std::chrono::duration_cast<std::chrono::milliseconds>(now).count();
++  Bucket& bucket = buckets[static_cast<std::size_t>(category)];
++  std::lock_guard lock(bucket.mutex);
++  if (bucket.window_start_milliseconds == 0 ||
++      now_milliseconds - bucket.window_start_milliseconds >= 1000) {
++    bucket.window_start_milliseconds = now_milliseconds;
++    bucket.emitted_this_window = 0;
++  }
++  if (bucket.emitted_this_window >= 256 || bucket.emitted_total >= 4096) {
++    ++bucket.dropped;
++    return false;
++  }
++
++  ++bucket.emitted_this_window;
++  ++bucket.emitted_total;
++  if (dropped_since_last) {
++    *dropped_since_last = bucket.dropped;
++  }
++  bucket.dropped = 0;
++  return true;
++}
++
++// Return the standard keyboard VK for the basic Latin characters consumed by
++// the title's custom name grid. The caller retains the original Unicode value.
++constexpr uint16_t MapKeyboardTextVirtualKey(uint16_t unicode) {
++  if (unicode >= 'A' && unicode <= 'Z') {
++    return unicode;
++  }
++  if (unicode >= 'a' && unicode <= 'z') {
++    return static_cast<uint16_t>(unicode - ('a' - 'A'));
++  }
++  if (unicode >= '0' && unicode <= '9') {
++    return unicode;
++  }
++  return 0;
++}
++
++}  // namespace rex::input::mnk
+diff --git a/src/input/input_system.cpp b/src/input/input_system.cpp
+index 7c41e1a3..74c63ec9 100644
+--- a/src/input/input_system.cpp
++++ b/src/input/input_system.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/input/input_driver.h>
+ #include <rex/input/input_system.h>
+ #include <rex/input/mnk/mnk_input_driver.h>
++#include <rex/input/mnk/keyboard_text_mapping.h>
+ #include <rex/input/nop/nop_input_driver.h>
+ #include <rex/input/sdl/sdl_input_driver.h>
+ #include <rex/input/xinput/xinput_input_driver.h>
+@@ -69,6 +70,26 @@ X_RESULT InputSystem::GetCapabilities(uint32_t user_index, uint32_t flags,
+                                       X_INPUT_CAPABILITIES* out_caps) {
+   SCOPE_profile_cpu_f("hid");
+ 
++  // The title asks specifically for the type-2 keyboard device. Search all
++  // drivers so an earlier gamepad backend cannot mask the MnK keyboard result.
++  if (mnk::IsKeyboardTextAnyDeviceQuery(flags) && mnk::KeyboardTextEnabled()) {
++    bool any_connected = false;
++    for (auto& driver : drivers_) {
++      X_INPUT_CAPABILITIES candidate = {};
++      X_RESULT result = driver->GetCapabilities(user_index, flags, &candidate);
++      if (result != X_ERROR_DEVICE_NOT_CONNECTED) {
++        any_connected = true;
++      }
++      if (result == X_ERROR_SUCCESS && candidate.type == 0x02) {
++        if (out_caps) {
++          *out_caps = candidate;
++        }
++        return result;
++      }
++    }
++    return any_connected ? X_ERROR_EMPTY : X_ERROR_DEVICE_NOT_CONNECTED;
++  }
++
+   bool any_connected = false;
+   for (auto& driver : drivers_) {
+     X_RESULT result = driver->GetCapabilities(user_index, flags, out_caps);
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 426c4862..28cac7cc 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -9,6 +9,7 @@
+  *              See LICENSE file in the project root for full license text.
+  */
+ #include <rex/input/mnk/mnk_input_driver.h>
++#include <rex/input/mnk/keyboard_text_mapping.h>
+ 
+ #include <chrono>
+ 
+@@ -150,6 +151,41 @@ static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_v
+   return idx < 256 && key_down[idx];
+ }
+ 
++static bool IsConfiguredBind(uint16_t virtual_key, const std::string& cvar_val) {
++  const VirtualKey bind = rex::ui::ParseVirtualKey(cvar_val);
++  return bind != VirtualKey::kNone &&
++         static_cast<uint16_t>(bind) == virtual_key;
++}
++
++static const char* MnkBindForKey(uint16_t virtual_key) {
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_a))) return "A";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_b))) return "B";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_x))) return "X";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_y))) return "Y";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_left_trigger))) return "left-trigger";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_right_trigger))) return "right-trigger";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_left_shoulder))) return "left-shoulder";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_right_shoulder))) return "right-shoulder";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_lstick_up))) return "left-stick-up";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_lstick_down))) return "left-stick-down";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_lstick_left))) return "left-stick-left";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_lstick_right))) return "left-stick-right";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_lstick_press))) return "left-stick-press";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_rstick_up))) return "right-stick-up";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_rstick_down))) return "right-stick-down";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_rstick_left))) return "right-stick-left";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_rstick_right))) return "right-stick-right";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_rstick_press))) return "right-stick-press";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_dpad_up))) return "dpad-up";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_dpad_down))) return "dpad-down";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_dpad_left))) return "dpad-left";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_dpad_right))) return "dpad-right";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_back))) return "back";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_start))) return "start";
++  if (IsConfiguredBind(virtual_key, REXCVAR_GET(keybind_guide))) return "guide";
++  return "none";
++}
++
+ static bool AnyBoundKeyDown(const bool (&key_down)[256]) {
+   return IsBindPressed(key_down, REXCVAR_GET(keybind_a)) ||
+          IsBindPressed(key_down, REXCVAR_GET(keybind_b)) ||
+@@ -209,7 +245,7 @@ X_RESULT MnkInputDriver::GetCapabilities(uint32_t user_index, uint32_t flags,
+   }
+   if (out_caps) {
+     std::memset(out_caps, 0, sizeof(*out_caps));
+-    out_caps->type = 0x01;
++    out_caps->type = KeyboardTextEnabled() && IsKeyboardTextAnyDeviceQuery(flags) ? 0x02 : 0x01;
+     out_caps->sub_type = 0x01;
+     out_caps->flags = 0;
+     out_caps->gamepad.buttons = 0xFFFF;
+@@ -325,63 +361,69 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+     return X_ERROR_SUCCESS;
+   }
+ 
++  bool bind_key_down[256] = {};
++  const bool keyboard_text_enabled = KeyboardTextEnabled();
++  const bool title_polling_active = KeyboardTextPollingActive();
++  FilterKeyboardTextBindKeys(key_down_, keyboard_text_enabled, title_polling_active,
++                             bind_key_down);
++
+   uint16_t buttons = 0;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_a)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_a)))
+     buttons |= X_INPUT_GAMEPAD_A;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_b)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_b)))
+     buttons |= X_INPUT_GAMEPAD_B;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_x)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_x)))
+     buttons |= X_INPUT_GAMEPAD_X;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_y)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_y)))
+     buttons |= X_INPUT_GAMEPAD_Y;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_left_shoulder)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_left_shoulder)))
+     buttons |= X_INPUT_GAMEPAD_LEFT_SHOULDER;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_right_shoulder)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_right_shoulder)))
+     buttons |= X_INPUT_GAMEPAD_RIGHT_SHOULDER;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_press)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_lstick_press)))
+     buttons |= X_INPUT_GAMEPAD_LEFT_THUMB;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_press)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_rstick_press)))
+     buttons |= X_INPUT_GAMEPAD_RIGHT_THUMB;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_back)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_back)))
+     buttons |= X_INPUT_GAMEPAD_BACK;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_start)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_start)))
+     buttons |= X_INPUT_GAMEPAD_START;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_guide)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_guide)))
+     buttons |= X_INPUT_GAMEPAD_GUIDE;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_up)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_dpad_up)))
+     buttons |= X_INPUT_GAMEPAD_DPAD_UP;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_down)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_dpad_down)))
+     buttons |= X_INPUT_GAMEPAD_DPAD_DOWN;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_left)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_dpad_left)))
+     buttons |= X_INPUT_GAMEPAD_DPAD_LEFT;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_dpad_right)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_dpad_right)))
+     buttons |= X_INPUT_GAMEPAD_DPAD_RIGHT;
+ 
+-  uint8_t lt = IsBindPressed(key_down_, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
+-  uint8_t rt = IsBindPressed(key_down_, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
++  uint8_t lt = IsBindPressed(bind_key_down, REXCVAR_GET(keybind_left_trigger)) ? 0xFF : 0;
++  uint8_t rt = IsBindPressed(bind_key_down, REXCVAR_GET(keybind_right_trigger)) ? 0xFF : 0;
+ 
+   int32_t lx = 0;
+   int32_t ly = 0;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_left)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_lstick_left)))
+     lx -= INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_right)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_lstick_right)))
+     lx += INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_up)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_lstick_up)))
+     ly += INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_lstick_down)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_lstick_down)))
+     ly -= INT16_MAX;
+ 
+   double sensitivity = REXCVAR_GET(mnk_sensitivity);
+   constexpr double kBaseScale = 200.0;
+   int32_t rx = 0;
+   int32_t ry = 0;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_left)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_rstick_left)))
+     rx -= INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_right)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_rstick_right)))
+     rx += INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_up)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_rstick_up)))
+     ry += INT16_MAX;
+-  if (IsBindPressed(key_down_, REXCVAR_GET(keybind_rstick_down)))
++  if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_rstick_down)))
+     ry -= INT16_MAX;
+   rx += static_cast<int32_t>(mouse_dx_ * sensitivity * kBaseScale);
+   ry += static_cast<int32_t>(-mouse_dy_ * sensitivity * kBaseScale);
+@@ -522,14 +564,26 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+ }
+ 
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
++  const uint16_t vk = static_cast<uint16_t>(e.virtual_key());
++  const bool keyboard_text_enabled = KeyboardTextEnabled();
++  const bool title_polling_active = KeyboardTextPollingActive();
++  uint32_t dropped_host_events = 0;
++  if (KeyboardTextTracePermit(KeyboardTextTraceCategory::kHostInput,
++                              &dropped_host_events)) {
++    REXLOG_INFO("[keyboard-text] host-keydown vk=0x{:04X} bind={} text_enabled={} title_polling={} suppress_bind={} prev={} dropped={}",
++                vk, MnkBindForKey(vk), keyboard_text_enabled ? 1 : 0,
++                title_polling_active ? 1 : 0,
++                ShouldSuppressKeyboardTextBind(vk, keyboard_text_enabled,
++                                              title_polling_active) ? 1 : 0,
++                e.prev_state() ? 1 : 0, dropped_host_events);
++  }
+   if (InputTraceEnabled()) {
+     REXLOG_INFO("[input-trace] keydown vk={} has_focus={} active={}",
+-                static_cast<uint16_t>(e.virtual_key()), has_focus_ ? 1 : 0,
++                vk, has_focus_ ? 1 : 0,
+                 is_active() ? 1 : 0);
+   }
+   if (!IsEnabled() || !has_focus_)
+     return;
+-  uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+   bool ctrl_v = false;
+   bool paste = false;
+   {
+@@ -614,11 +668,33 @@ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnKeyChar(rex::ui::KeyEvent& e) {
++  const uint16_t unicode = static_cast<uint16_t>(e.virtual_key());
++  const bool keyboard_text_enabled = KeyboardTextEnabled();
++  const bool title_polling_active = KeyboardTextPollingActive();
++  const uint16_t mapped_vk = keyboard_text_enabled
++                                 ? MapKeyboardTextVirtualKey(unicode)
++                                 : 0;
++  const bool filtered = IsFilteredTextCharacter(unicode);
++  const uint16_t event_vk = unicode == static_cast<uint16_t>(VirtualKey::kSpace)
++                                ? static_cast<uint16_t>(VirtualKey::kSpace)
++                                : (mapped_vk ? mapped_vk
++                                             : static_cast<uint16_t>(VirtualKey::kPacket));
++  const char* mapping = filtered ? "filtered"
++                                 : (unicode == static_cast<uint16_t>(VirtualKey::kSpace)
++                                        ? "space-keydown"
++                                        : (mapped_vk ? "basic-latin-vk" : "vk-packet"));
++  uint32_t dropped_host_events = 0;
++  if (KeyboardTextTracePermit(KeyboardTextTraceCategory::kHostInput,
++                              &dropped_host_events)) {
++    REXLOG_INFO("[keyboard-text] host-char unicode=U+{:04X} mapped_vk=0x{:04X} event_vk=0x{:04X} mapping={} repeat={} title_polling={} ctrl={} dropped={}",
++                unicode, mapped_vk, event_vk, mapping,
++                e.repeat_count(), title_polling_active ? 1 : 0,
++                e.is_ctrl_pressed() ? 1 : 0, dropped_host_events);
++  }
+   if (!IsEnabled())
+     return;
+ 
+-  const uint16_t unicode = static_cast<uint16_t>(e.virtual_key());
+-  if (IsFilteredTextCharacter(unicode)) {
++  if (filtered) {
+     return;
+   }
+ 
+@@ -645,12 +721,16 @@ void MnkInputDriver::OnKeyChar(rex::ui::KeyEvent& e) {
+   if (unicode == static_cast<uint16_t>(VirtualKey::kSpace))
+     return;
+ 
+-  // WWE '13 reserves VK 3..40 for UI actions. VK_PACKET keeps translated
+-  // printable text on the guest's unicode insertion path, including punctuation
+-  // whose character value overlaps one of those action VKs.
++  // In opt-in keyboard-text mode use the standard letter/digit VK alongside
++  // the host Unicode. The title dispatches printable characters on KEYDOWN,
++  // then filters/normalizes the Unicode in its text handler; preserve the
++  // host's Unicode case and do not synthesize a printable KEYUP. Preserve the
++  // existing VK_PACKET path for the default behavior and unsupported characters.
++  const uint16_t text_vk = mapped_vk;
++  const uint16_t keystroke_vk =
++      text_vk ? text_vk : static_cast<uint16_t>(VirtualKey::kPacket);
+   for (int i = 0; i < repeat_count; ++i) {
+-    EnqueueKeystroke(static_cast<uint16_t>(VirtualKey::kPacket), true, unicode,
+-                     e.prev_state() || i > 0);
++    EnqueueKeystroke(keystroke_vk, true, unicode, e.prev_state() || i > 0);
+   }
+ }
+ 
+diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
+index 9c0e0260..4b6a8ebb 100644
+--- a/src/kernel/xam/xam_input.cpp
++++ b/src/kernel/xam/xam_input.cpp
+@@ -14,6 +14,7 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/input/input.h>
+ #include <rex/input/input_system.h>
++#include <rex/input/mnk/keyboard_text_mapping.h>
+ #include <rex/kernel/xam/private.h>
+ #include <rex/logging.h>
+ #include <rex/ppc/function.h>
+@@ -45,6 +46,38 @@ rex::input::InputSystem* input_system() {
+   return static_cast<rex::input::InputSystem*>(REX_KERNEL_STATE()->emulator()->input_system());
+ }
+ 
++void TraceKeyboardCapabilityQuery(uint32_t user_index, uint32_t flags,
++                                  uint32_t result, bool has_answer,
++                                  uint8_t caps_type) {
++  uint32_t dropped = 0;
++  if (!rex::input::mnk::KeyboardTextTracePermit(
++          rex::input::mnk::KeyboardTextTraceCategory::kCapability, &dropped)) {
++    return;
++  }
++  REXKRNL_INFO("[keyboard-text] capability user={} flags=0x{:08X} result=0x{:08X} answer={} type={} dropped={}",
++               user_index, flags, result, has_answer ? 1 : 0,
++               has_answer ? static_cast<uint32_t>(caps_type) : 0xFF, dropped);
++}
++
++void TraceKeyboardKeystrokeCall(const char* api, uint32_t requested_user,
++                                uint32_t actual_user, uint32_t returned_user,
++                                uint32_t flags, uint32_t result,
++                                bool has_keystroke, uint16_t virtual_key,
++                                uint16_t unicode, uint16_t keystroke_flags) {
++  uint32_t dropped = 0;
++  if (!rex::input::mnk::KeyboardTextTracePermit(
++          rex::input::mnk::KeyboardTextTraceCategory::kKeystroke, &dropped)) {
++    return;
++  }
++  REXKRNL_INFO("[keyboard-text] {} requested_user={} actual_user={} returned_user={} flags=0x{:08X} result=0x{:08X} returned={} vk=0x{:04X} unicode=U+{:04X} ks_flags=0x{:04X} dropped={}",
++               api, requested_user, actual_user, returned_user, flags, result,
++               has_keystroke ? 1 : 0,
++               has_keystroke ? static_cast<uint32_t>(virtual_key) : 0xFFFF,
++               has_keystroke ? static_cast<uint32_t>(unicode) : 0xFFFF,
++               has_keystroke ? static_cast<uint32_t>(keystroke_flags) : 0xFFFF,
++               dropped);
++}
++
+ void XamResetInactivity_entry() {
+   // Do we need to do anything?
+ }
+@@ -59,11 +92,19 @@ ppc_u32_result_t XamInputGetCapabilities_entry(ppc_u32_t user_index, ppc_u32_t f
+   REXKRNL_TRACE("[XAM] XamInputGetCapabilities called: user={}, flags=0x{:X}", (uint32_t)user_index,
+                 (uint32_t)flags);
+   if (!caps) {
++    TraceKeyboardCapabilityQuery(static_cast<uint32_t>(user_index),
++                                 static_cast<uint32_t>(flags), X_ERROR_BAD_ARGUMENTS,
++                                 false, 0xFF);
+     return X_ERROR_BAD_ARGUMENTS;
+   }
+ 
+-  if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0) {
++  if ((flags & 0xFF) && (flags & XINPUT_FLAG_GAMEPAD) == 0 &&
++      !(rex::input::mnk::IsKeyboardTextAnyDeviceQuery(flags) &&
++        rex::input::mnk::KeyboardTextEnabled())) {
+     // Ignore any query for other types of devices.
++    TraceKeyboardCapabilityQuery(static_cast<uint32_t>(user_index),
++                                 static_cast<uint32_t>(flags),
++                                 X_ERROR_DEVICE_NOT_CONNECTED, false, 0xFF);
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
+@@ -74,7 +115,11 @@ ppc_u32_result_t XamInputGetCapabilities_entry(ppc_u32_t user_index, ppc_u32_t f
+   }
+ 
+   auto* is = input_system();
+-  return is->GetCapabilities(actual_user_index, flags, caps);
++  X_RESULT result = is->GetCapabilities(actual_user_index, flags, caps);
++  TraceKeyboardCapabilityQuery(
++      actual_user_index, static_cast<uint32_t>(flags), result,
++      result == X_ERROR_SUCCESS, result == X_ERROR_SUCCESS ? caps->type : 0xFF);
++  return result;
+ }
+ 
+ ppc_u32_result_t XamInputGetCapabilitiesEx_entry(ppc_u32_t unk, ppc_u32_t user_index,
+@@ -175,14 +220,26 @@ ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flag
+   // flags = XINPUT_FLAG_GAMEPAD (| _ANYUSER | _ANYDEVICE)
+ 
+   if (!keystroke) {
++    TraceKeyboardKeystrokeCall("getkeystroke", static_cast<uint32_t>(user_index),
++                               static_cast<uint32_t>(user_index),
++                               static_cast<uint32_t>(user_index),
++                               static_cast<uint32_t>(flags), X_ERROR_BAD_ARGUMENTS,
++                               false, 0, 0, 0);
+     return X_ERROR_BAD_ARGUMENTS;
+   }
+ 
+   if ((flags & 0xFF) && (flags & (XINPUT_FLAG_GAMEPAD | XINPUT_FLAG_ANY_DEVICE)) == 0) {
+     // Ignore any query for other types of devices.
++    TraceKeyboardKeystrokeCall("getkeystroke", static_cast<uint32_t>(user_index),
++                               static_cast<uint32_t>(user_index),
++                               static_cast<uint32_t>(user_index),
++                               static_cast<uint32_t>(flags),
++                               X_ERROR_DEVICE_NOT_CONNECTED, false, 0, 0, 0);
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  rex::input::mnk::NoteKeyboardTextKeystrokePoll(static_cast<uint32_t>(flags));
++
+   uint32_t actual_user_index = user_index;
+   if ((actual_user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
+     // Always pin user to 0.
+@@ -192,6 +249,14 @@ ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flag
+   auto* is = input_system();
+   X_RESULT result = is->GetKeystroke(actual_user_index, flags, keystroke);
+   DebugCountKeystrokePoll(flags, result);
++  const bool has_keystroke = result == X_ERROR_SUCCESS;
++  TraceKeyboardKeystrokeCall(
++      "getkeystroke", static_cast<uint32_t>(user_index), actual_user_index,
++      has_keystroke ? static_cast<uint32_t>(keystroke->user_index) : actual_user_index,
++      static_cast<uint32_t>(flags), result, has_keystroke,
++      has_keystroke ? static_cast<uint16_t>(keystroke->virtual_key) : 0,
++      has_keystroke ? static_cast<uint16_t>(keystroke->unicode) : 0,
++      has_keystroke ? static_cast<uint16_t>(keystroke->flags) : 0);
+   return result;
+ }
+ 
+@@ -199,23 +264,41 @@ ppc_u32_result_t XamInputGetKeystroke_entry(ppc_u32_t user_index, ppc_u32_t flag
+ ppc_u32_result_t XamInputGetKeystrokeEx_entry(ppc_pu32_t user_index_ptr, ppc_u32_t flags,
+                                               ppc_ptr_t<X_INPUT_KEYSTROKE> keystroke) {
+   if (!keystroke) {
++    TraceKeyboardKeystrokeCall("getkeystroke_ex", 0xFFFFFFFF, 0xFFFFFFFF,
++                               0xFFFFFFFF, static_cast<uint32_t>(flags),
++                               X_ERROR_BAD_ARGUMENTS, false, 0, 0, 0);
+     return X_ERROR_BAD_ARGUMENTS;
+   }
+ 
+   if ((flags & 0xFF) && (flags & (XINPUT_FLAG_GAMEPAD | XINPUT_FLAG_ANY_DEVICE)) == 0) {
+     // Ignore any query for other types of devices.
++    TraceKeyboardKeystrokeCall("getkeystroke_ex", 0xFFFFFFFF, 0xFFFFFFFF,
++                               0xFFFFFFFF, static_cast<uint32_t>(flags),
++                               X_ERROR_DEVICE_NOT_CONNECTED, false, 0, 0, 0);
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
+-  uint32_t user_index = *user_index_ptr;
++  const uint32_t requested_user = *user_index_ptr;
++  uint32_t user_index = requested_user;
+   if ((user_index & 0xFF) == 0xFF || (flags & XINPUT_FLAG_ANY_USER)) {
+     // Always pin user to 0.
+     user_index = 0;
+   }
+ 
++  rex::input::mnk::NoteKeyboardTextKeystrokePoll(static_cast<uint32_t>(flags));
++
+   auto* is = input_system();
+   auto result = is->GetKeystroke(user_index, flags, keystroke);
+   DebugCountKeystrokePoll(flags, result);
++  const bool has_keystroke = XSUCCEEDED(result);
++  const uint32_t returned_user =
++      has_keystroke ? static_cast<uint32_t>(keystroke->user_index) : user_index;
++  TraceKeyboardKeystrokeCall(
++      "getkeystroke_ex", requested_user, user_index, returned_user,
++      static_cast<uint32_t>(flags), result, has_keystroke,
++      has_keystroke ? static_cast<uint16_t>(keystroke->virtual_key) : 0,
++      has_keystroke ? static_cast<uint16_t>(keystroke->unicode) : 0,
++      has_keystroke ? static_cast<uint16_t>(keystroke->flags) : 0);
+   if (XSUCCEEDED(result)) {
+     *user_index_ptr = keystroke->user_index;
+   }
+-- 
+2.43.0
+

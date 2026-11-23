@@ -1,0 +1,86 @@
+diff --git a/plume_d3d12.cpp b/plume_d3d12.cpp
+index dcae4e3..72310c3 100644
+--- a/plume_d3d12.cpp
++++ b/plume_d3d12.cpp
+@@ -7,6 +7,8 @@
+ 
+ #include "plume_d3d12.h"
+ 
++#include <cctype>
++
+ #include <unordered_set>
+ 
+ #include <dxgi1_5.h>
+@@ -2322,7 +2324,10 @@ namespace plume {
+ 
+         const D3D12_TEXTURE_COPY_LOCATION copyDstLocation = toD3D12(dstLocation);
+         const D3D12_TEXTURE_COPY_LOCATION copySrcLocation = toD3D12(srcLocation);
+-        setSamplePositions(dstLocation.texture);
++        // WWE '12: a texture-to-buffer copy (read-back) has a buffer destination, no texture.
++        if (dstLocation.type == RenderTextureCopyType::SUBRESOURCE) {
++            setSamplePositions(dstLocation.texture);
++        }
+         d3d->CopyTextureRegion(&copyDstLocation, dstX, dstY, dstZ, &copySrcLocation, (srcBox != nullptr) ? &copyBox : nullptr);
+         resetSamplePositions();
+     }
+@@ -3669,7 +3674,45 @@ namespace plume {
+         // Detect adapter to use that will offer the best performance and features.
+         HRESULT res;
+         UINT adapterIndex = 0;
++        bool userChoicePicked = false;
+         IDXGIAdapter1 *adapterOption = nullptr;
++        // WWE '13 (2026-11-19): decide up front which adapter the user's GPU setting names. An exact
++        // DXGI description match wins; only when none matches does the vendor fallback below apply,
++        // and then the same-vendor adapter sharing the most words with the setting. Before, the first
++        // adapter of the named vendor was locked in, so on a PC with two Intel GPUs (UHD 630 + Arc)
++        // choosing the UHD 630 picked the Arc.
++        int userChoiceIndex = -1;
++        if (!preferredDeviceName.empty()) {
++            const auto words = [](const std::string &text) {
++                std::vector<std::string> out; std::string w;
++                for (char c : text) {
++                    if (std::isalnum(static_cast<unsigned char>(c))) { w += char(std::tolower(static_cast<unsigned char>(c))); }
++                    else if (!w.empty()) { out.push_back(w); w.clear(); }
++                }
++                if (!w.empty()) out.push_back(w);
++                return out;
++            };
++            const std::vector<std::string> wanted = words(preferredDeviceName);
++            const auto names = [&](const char *word) { return preferredDeviceName.find(word) != std::string::npos; };
++            int bestScore = -1;
++            IDXGIAdapter1 *scan = nullptr;
++            for (UINT i = 0; renderInterface->dxgiFactory->EnumAdapters1(i, &scan) != DXGI_ERROR_NOT_FOUND; ++i) {
++                DXGI_ADAPTER_DESC1 d;
++                scan->GetDesc1(&d);
++                scan->Release();
++                if (d.Flags & (DXGI_ADAPTER_FLAG_REMOTE | DXGI_ADAPTER_FLAG_SOFTWARE)) continue;
++                const std::string name = Utf16ToUtf8(d.Description);
++                if (name == preferredDeviceName) { userChoiceIndex = int(i); break; }
++                const bool vendorNamed = (d.VendorId == 0x8086 && names("Intel")) ||
++                    (d.VendorId == 0x10DE && (names("NVIDIA") || names("GeForce"))) ||
++                    (d.VendorId == 0x1002 && (names("AMD") || names("Radeon")));
++                if (!vendorNamed) continue;
++                int score = 0;
++                for (const std::string &w : words(name))
++                    for (const std::string &x : wanted) score += (w == x) ? 1 : 0;
++                if (score > bestScore) { bestScore = score; userChoiceIndex = int(i); }
++            }
++        }
+         while (renderInterface->dxgiFactory->EnumAdapters1(adapterIndex++, &adapterOption) != DXGI_ERROR_NOT_FOUND) {
+             DXGI_ADAPTER_DESC1 adapterDesc;
+             adapterOption->GetDesc1(&adapterDesc);
+@@ -3761,9 +3804,12 @@ namespace plume {
+             std::string deviceName = Utf16ToUtf8(adapterDesc.Description);
+             bool preferOverNothing = (adapter == nullptr) || (d3d == nullptr);
+             bool preferVideoMemory = adapterDesc.DedicatedVideoMemory > description.dedicatedVideoMemory;
+-            bool preferUserChoice = preferredDeviceName == deviceName;
+-            bool preferOption = preferOverNothing || preferVideoMemory || preferUserChoice;
++            bool preferUserChoice = int(adapterIndex) - 1 == userChoiceIndex;
++            // WWE '12: once the adapter the user named is picked, a later one with more video
++            // memory (the discrete GPU of a laptop) no longer replaces it.
++            bool preferOption = !userChoicePicked && (preferOverNothing || preferVideoMemory || preferUserChoice);
+             if (preferOption) {
++                userChoicePicked = preferUserChoice;
+                 if (d3d != nullptr) {
+                     d3d->Release();
+                 }

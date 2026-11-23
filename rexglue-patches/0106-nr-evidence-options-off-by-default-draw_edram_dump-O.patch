@@ -1,0 +1,260 @@
+From 09c2ed9cb2c4c4f71e4b64f1c1efa7615314e805 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 13:52:50 -0700
+Subject: [PATCH 106/149] nr evidence options (off by default):
+ --draw_edram_dump=ORD1,ORD2,...:DIR writes the whole EDRAM (every host render
+ target dumped, guest layout) after listed draw packets;
+ --replay_trace_edram_dump=FILE does it at the end of a (partial) replay.
+ CommandProcessor::DumpEdram (Vulkan: trace EDRAM download into a vector).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit e023a2ae3e7d21074792fff4c923e34ee51cb9d9)
+---
+ include/rex/graphics/command_processor.h      |  5 +++
+ .../rex/graphics/vulkan/command_processor.h   |  1 +
+ .../rex/graphics/vulkan/render_target_cache.h |  4 ++
+ src/graphics/command_processor.cpp            | 44 +++++++++++++++++++
+ src/graphics/vulkan/command_processor.cpp     | 13 ++++++
+ src/graphics/vulkan/render_target_cache.cpp   | 31 +++++++++++++
+ src/ui/rex_app.cpp                            | 26 +++++++++++
+ 7 files changed, 124 insertions(+)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 134a19bc..fbcb90c0 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -140,6 +140,9 @@ class CommandProcessor {
+                                       bool = false) {
+     return false;
+   }
++  // nr evidence (replay_trace_edram_dump): the whole EDRAM in the guest layout with every host
++  // render target dumped into it. GPU thread only.
++  virtual bool DumpEdram(std::vector<uint8_t>&) { return false; }
+ 
+   void RestoreRegisters(uint32_t first_register, const uint32_t* register_values,
+                         uint32_t register_count, bool execute_callbacks);
+@@ -246,6 +249,8 @@ class CommandProcessor {
+   uint32_t current_draw_ordinal_ = 0;
+   // draw_state_dump evidence writer (off unless the cvar is set).
+   void DumpDrawState(uint32_t ordinal, uint32_t draw_initiator, const IndexBufferInfo* index_info);
++  // nr evidence (draw_edram_dump): the whole EDRAM after listed draw packets.
++  void DumpEdramAfterDraw(uint32_t ordinal);
+   bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
+                               uint32_t viz_query_condition, uint32_t count_remaining);
+   bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index bf5ed954..c6692cc4 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -147,6 +147,7 @@ class VulkanCommandProcessor : public CommandProcessor {
+ 
+   bool CaptureLastRenderTarget(ui::RawImage& image_out,
+                                bool full_render_target = false) override;
++  bool DumpEdram(std::vector<uint8_t>& out) override;
+ 
+   void RestoreEdramSnapshot(const void* snapshot) override;
+ 
+diff --git a/include/rex/graphics/vulkan/render_target_cache.h b/include/rex/graphics/vulkan/render_target_cache.h
+index 88248bd4..2a9a9596 100644
+--- a/include/rex/graphics/vulkan/render_target_cache.h
++++ b/include/rex/graphics/vulkan/render_target_cache.h
+@@ -16,6 +16,7 @@
+ #include <functional>
+ #include <memory>
+ #include <unordered_map>
++#include <vector>
+ 
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/pipeline/render_target/cache.h>
+@@ -113,6 +114,9 @@ class VulkanRenderTargetCache final : public RenderTargetCache {
+   // Returns true if any downloads were submitted to the command processor.
+   bool InitializeTraceSubmitDownloads();
+   void InitializeTraceCompleteDownloads();
++  // nr evidence: after InitializeTraceSubmitDownloads + queue idle, the EDRAM (all render targets
++  // dumped) in the guest layout, instead of writing it to the trace.
++  bool CompleteEdramDownloadTo(std::vector<uint8_t>& out);
+   void RestoreEdramSnapshot(const void* snapshot);
+ 
+   bool Update(bool is_rasterization_done, reg::RB_DEPTHCONTROL normalized_depth_control,
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 070a39d8..e18db144 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -54,6 +54,10 @@ REXCVAR_DEFINE_STRING(resolve_dump_dir, "", "GPU",
+                       "Native-renderer evidence: after every resolve (copy) draw, write its destination "
+                       "extent from guest memory to DIR/resolve-<ordinal>-<dest>.bin (needs "
+                       "readback_resolve=full so the result is in guest memory)");
++REXCVAR_DEFINE_STRING(draw_edram_dump, "", "GPU",
++                      "Native-renderer evidence: ORD1,ORD2,...:DIR - after each listed draw packet "
++                      "(numbered as draw_state_dump), write the whole EDRAM (guest layout, every "
++                      "host render target dumped into it) to DIR/sdk-edram-ORD.bin");
+ REXCVAR_DEFINE_STRING(draw_state_dump, "", "GPU",
+                       "Native-renderer evidence: FIRST:LAST:DIR - for draw packets FIRST..LAST "
+                       "(zero-based, counted from process start as they reach the draw handler, "
+@@ -1704,6 +1708,45 @@ DrawObserver* g_draw_observer = nullptr;
+ void SetDrawObserver(DrawObserver* observer) { g_draw_observer = observer; }
+ DrawObserver* GetDrawObserver() { return g_draw_observer; }
+ 
++void CommandProcessor::DumpEdramAfterDraw(uint32_t ordinal) {
++  const std::string& spec = REXCVAR_GET(draw_edram_dump);
++  if (spec.empty()) {
++    return;
++  }
++  static std::vector<uint32_t> ordinals;
++  static std::string dir;
++  static bool parsed = false;
++  if (!parsed) {
++    parsed = true;
++    const size_t colon = spec.find(':');
++    if (colon == std::string::npos) {
++      REXGPU_ERROR("draw_edram_dump: expected ORD1,ORD2,...:DIR, got '{}'", spec);
++      return;
++    }
++    dir = spec.substr(colon + 1);
++    size_t pos = 0;
++    const std::string list = spec.substr(0, colon);
++    while (pos < list.size()) {
++      size_t end = list.find(',', pos);
++      if (end == std::string::npos) end = list.size();
++      ordinals.push_back(uint32_t(std::strtoul(list.substr(pos, end - pos).c_str(), nullptr, 0)));
++      pos = end + 1;
++    }
++  }
++  if (std::find(ordinals.begin(), ordinals.end(), ordinal) == ordinals.end()) {
++    return;
++  }
++  std::vector<uint8_t> edram;
++  const std::string path = dir + "/sdk-edram-" + std::to_string(ordinal) + ".bin";
++  FILE* f = DumpEdram(edram) ? std::fopen(path.c_str(), "wb") : nullptr;
++  if (!f || std::fwrite(edram.data(), 1, edram.size(), f) != edram.size()) {
++    REXGPU_ERROR("draw_edram_dump: could not write the EDRAM after draw {} to {}", ordinal, path);
++  } else {
++    REXGPU_INFO("draw_edram_dump: EDRAM after draw {} -> {}", ordinal, path);
++  }
++  if (f) std::fclose(f);
++}
++
+ void CommandProcessor::DumpDrawState(uint32_t ordinal, uint32_t draw_initiator,
+                                      const IndexBufferInfo* index_info) {
+   const std::string& spec = REXCVAR_GET(draw_state_dump);
+@@ -1983,6 +2026,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   // for instance, features not supported by the host), don't terminate command
+   // buffer processing as that would leave rendering in a way more inconsistent
+   // state than just a single dropped draw command.
++  DumpEdramAfterDraw(current_draw_ordinal_);
+   return true;
+ }
+ 
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 8d0b5cc7..cb60d968 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -6593,6 +6593,19 @@ void VulkanCommandProcessor::WriteGuestOcclusionResult(uint32_t sample_count_add
+   sample_counts->StencilFail_B = 0;
+ }
+ 
++bool VulkanCommandProcessor::DumpEdram(std::vector<uint8_t>& out) {
++  if (!BeginSubmission(true)) {
++    return false;
++  }
++  if (!render_target_cache_->InitializeTraceSubmitDownloads()) {
++    return false;
++  }
++  if (!AwaitAllQueueOperationsCompletion()) {
++    return false;
++  }
++  return render_target_cache_->CompleteEdramDownloadTo(out);
++}
++
+ void VulkanCommandProcessor::InitializeTrace() {
+   CommandProcessor::InitializeTrace();
+ 
+diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
+index 5d96f129..c92db09a 100644
+--- a/src/graphics/vulkan/render_target_cache.cpp
++++ b/src/graphics/vulkan/render_target_cache.cpp
+@@ -1331,6 +1331,37 @@ void VulkanRenderTargetCache::InitializeTraceCompleteDownloads() {
+   ResetTraceDownload();
+ }
+ 
++bool VulkanRenderTargetCache::CompleteEdramDownloadTo(std::vector<uint8_t>& out) {
++  if (edram_snapshot_download_buffer_memory_ == VK_NULL_HANDLE) {
++    return false;
++  }
++  const ui::vulkan::VulkanDevice* const vulkan_device = command_processor_.GetVulkanDevice();
++  const ui::vulkan::VulkanDevice::Functions& dfn = vulkan_device->functions();
++  const VkDevice device = vulkan_device->device();
++  void* mapping = nullptr;
++  bool ok = false;
++  if (dfn.vkMapMemory(device, edram_snapshot_download_buffer_memory_, 0, VK_WHOLE_SIZE, 0,
++                      &mapping) == VK_SUCCESS) {
++    if (!(vulkan_device->memory_types().host_coherent &
++          (uint32_t(1) << edram_snapshot_download_buffer_memory_type_))) {
++      VkMappedMemoryRange range = {};
++      range.sType = VK_STRUCTURE_TYPE_MAPPED_MEMORY_RANGE;
++      range.memory = edram_snapshot_download_buffer_memory_;
++      range.offset = 0;
++      range.size = std::min(rex::round_up(VkDeviceSize(xenos::GetEdramSizeBytes()),
++                                          vulkan_device->properties().nonCoherentAtomSize),
++                            edram_snapshot_download_buffer_memory_size_);
++      dfn.vkInvalidateMappedMemoryRanges(device, 1, &range);
++    }
++    const uint8_t* src = static_cast<const uint8_t*>(mapping);
++    out.assign(src, src + xenos::GetEdramSizeBytes());
++    dfn.vkUnmapMemory(device, edram_snapshot_download_buffer_memory_);
++    ok = true;
++  }
++  ResetTraceDownload();
++  return ok;
++}
++
+ void VulkanRenderTargetCache::RestoreEdramSnapshot(const void* snapshot) {
+   InvalidateUpdateFastPath();
+   if (IsDrawResolutionScaled()) {
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 1bf8ce8b..a072ed71 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -74,6 +74,10 @@ REXCVAR_DEFINE_INT32(replay_trace_stop_after_draw, -1, "GPU",
+                      "(-1 replays the full frame)");
+ REXCVAR_DEFINE_BOOL(replay_trace_capture_full_rt, false, "GPU",
+                      "replay_trace: capture the whole bound RT instead of the draw scissor");
++REXCVAR_DEFINE_STRING(replay_trace_edram_dump, "", "GPU",
++                      "Native-renderer evidence: after a (partial) replay_trace, write the whole "
++                      "EDRAM (2048 tiles x 5120 bytes, guest layout, every host render target "
++                      "dumped into it) to this file");
+ REXCVAR_DEFINE_STRING(update_data_root, "", "Runtime", "Override update data path");
+ REXCVAR_DEFINE_INT32(close_exit_timeout_seconds, 3, "Runtime",
+                      "After the window is closed, force the process to exit if shutdown has not "
+@@ -358,6 +362,28 @@ bool ReXApp::OnInitialize() {
+             }
+             if (f) std::fclose(f);
+           }
++          const std::string edram_dump_path = REXCVAR_GET(replay_trace_edram_dump);
++          if (!edram_dump_path.empty()) {
++            auto* command_processor = replay_graphics->command_processor();
++            std::vector<uint8_t> edram;
++            bool edram_ok = false;
++            if (command_processor) {
++              std::promise<bool> edram_result;
++              std::future<bool> edram_future = edram_result.get_future();
++              command_processor->CallInThread([command_processor, &edram, &edram_result]() {
++                edram_result.set_value(command_processor->DumpEdram(edram));
++              });
++              edram_ok = edram_future.get();
++            }
++            FILE* f = edram_ok ? std::fopen(edram_dump_path.c_str(), "wb") : nullptr;
++            if (!f || std::fwrite(edram.data(), 1, edram.size(), f) != edram.size()) {
++              REXLOG_ERROR("Replay dump: could not write the EDRAM to {}", edram_dump_path);
++              dumps_ok = false;
++            } else {
++              REXLOG_INFO("Replay dump: EDRAM ({} bytes) -> {}", edram.size(), edram_dump_path);
++            }
++            if (f) std::fclose(f);
++          }
+           if (partial && stop_after_draw < 0) {
+             REXLOG_INFO("Replay {}: partial frame, no image", dumps_ok ? "wrote" : "FAILED");
+             app_context().CallInUIThread([this]() { app_context().QuitFromUIThread(); });
+-- 
+2.43.0
+

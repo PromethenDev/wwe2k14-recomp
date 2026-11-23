@@ -1,7 +1,7 @@
 From 40b5dbae54115f08c5491ff405fd3f17f5a33adb Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 20:41:32 -0700
-Subject: [PATCH 12/97] graphics: add debug_rt_cache_ownership render-target
+Subject: [PATCH 012/149] graphics: add debug_rt_cache_ownership render-target
  log (default off)
 
 ---
@@ -10,7 +10,7 @@ Subject: [PATCH 12/97] graphics: add debug_rt_cache_ownership render-target
  2 files changed, 84 insertions(+)
 
 diff --git a/include/rex/graphics/pipeline/render_target/cache.h b/include/rex/graphics/pipeline/render_target/cache.h
-index 18e6b14..9c5e5e6 100644
+index 18e6b148..9c5e5e62 100644
 --- a/include/rex/graphics/pipeline/render_target/cache.h
 +++ b/include/rex/graphics/pipeline/render_target/cache.h
 @@ -564,6 +564,8 @@ class RenderTargetCache {
@@ -32,7 +32,7 @@ index 18e6b14..9c5e5e6 100644
    // would require transferring data - primarily for barrier placement on the
    // pixel shader interlock path (where transfers do not involve copying, but
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index db82ab0..c467fc5 100644
+index db82ab07..c467fc52 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
 @@ -41,6 +41,28 @@ REXCVAR_DEFINE_BOOL(direct_host_resolve, true, "GPU",

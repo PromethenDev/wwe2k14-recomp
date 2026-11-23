@@ -1,0 +1,180 @@
+From 13b9641484bd2d9e21668a2b517bf7007054286e Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 30 Oct 2026 21:53:46 -0700
+Subject: [PATCH 131/149] diagnostics: watch-only observers for file opens,
+ input state and fatal POSIX signals (WWE2K14 timeline tracker, card LOG1;
+ owner OK 2026-10-31)
+
+SetFileOpenObserver (NtCreateFile result + guest path), SetInputObserver
+(successful XamInputGetState), SetCrashObserver (POSIX: only on the path that
+chains to the previous handler / terminates; signal-tolerant contract). One
+relaxed atomic load when nobody registered; observers cannot change results.
+Windows crash notification is left to the game's SetUnhandledExceptionFilter.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/observers.h | 23 +++++++++++++++++++++++
+ src/core/CMakeLists.txt             |  1 +
+ src/core/observers.cpp              | 25 +++++++++++++++++++++++++
+ src/core/seh_posix.cpp              | 10 ++++++++++
+ src/kernel/xam/xam_input.cpp        |  8 +++++++-
+ src/kernel/xboxkrnl/xboxkrnl_io.cpp |  3 +++
+ 6 files changed, 69 insertions(+), 1 deletion(-)
+ create mode 100644 include/rex/diagnostics/observers.h
+ create mode 100644 src/core/observers.cpp
+
+diff --git a/include/rex/diagnostics/observers.h b/include/rex/diagnostics/observers.h
+new file mode 100644
+index 00000000..3e31d8f1
+--- /dev/null
++++ b/include/rex/diagnostics/observers.h
+@@ -0,0 +1,23 @@
++#pragma once
++
++#include <cstdint>
++
++namespace rex::diagnostics::observers {
++using FileOpenFn = void (*)(const char* guest_path, uint32_t status, bool is_directory);
++using InputFn = void (*)(uint32_t user_index, uint16_t buttons, uint8_t left_trigger,
++                         uint8_t right_trigger);
++using CrashFn = void (*)(const char* summary);
++
++// Crash callbacks run in the SDK's existing fatal-crash context: POSIX only, from the
++// signal handler when a fault is passed on to the previous handler / termination (signal
++// context). They must be signal-tolerant: no allocation, locks, or exceptions. On Windows
++// the game installs its own SetUnhandledExceptionFilter (vectored handlers also see
++// exceptions that are handled later, so they cannot tell a crash).
++void SetFileOpenObserver(FileOpenFn fn) noexcept;
++void SetInputObserver(InputFn fn) noexcept;
++void SetCrashObserver(CrashFn fn) noexcept;
++void NotifyFileOpen(const char* guest_path, uint32_t status, bool is_directory) noexcept;
++void NotifyInput(uint32_t user_index, uint16_t buttons, uint8_t left_trigger,
++                 uint8_t right_trigger) noexcept;
++void NotifyCrash(const char* summary) noexcept;
++}  // namespace rex::diagnostics::observers
+diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
+index 8e65ebc6..5fbc5921 100644
+--- a/src/core/CMakeLists.txt
++++ b/src/core/CMakeLists.txt
+@@ -14,6 +14,7 @@ add_library(rexcore STATIC
+     filesystem_wildcard.cpp
+     logging.cpp
+     memory.cpp
++    observers.cpp
+     mutex.cpp
+     ppc.cpp
+     rate_census.cpp
+diff --git a/src/core/observers.cpp b/src/core/observers.cpp
+new file mode 100644
+index 00000000..4527cda3
+--- /dev/null
++++ b/src/core/observers.cpp
+@@ -0,0 +1,25 @@
++#include <rex/diagnostics/observers.h>
++#include <atomic>
++
++namespace rex::diagnostics::observers {
++namespace {
++std::atomic<FileOpenFn> file_open{nullptr};
++std::atomic<InputFn> input{nullptr};
++std::atomic<CrashFn> crash{nullptr};
++std::atomic_flag crash_called = ATOMIC_FLAG_INIT;
++}
++void SetFileOpenObserver(FileOpenFn fn) noexcept { file_open.store(fn, std::memory_order_relaxed); }
++void SetInputObserver(InputFn fn) noexcept { input.store(fn, std::memory_order_relaxed); }
++void SetCrashObserver(CrashFn fn) noexcept { crash.store(fn, std::memory_order_relaxed); }
++void NotifyFileOpen(const char* p, uint32_t s, bool d) noexcept {
++  if (auto fn = file_open.load(std::memory_order_relaxed)) fn(p, s, d);
++}
++void NotifyInput(uint32_t u, uint16_t b, uint8_t l, uint8_t r) noexcept {
++  if (auto fn = input.load(std::memory_order_relaxed)) fn(u, b, l, r);
++}
++void NotifyCrash(const char* s) noexcept {
++  if (auto fn = crash.load(std::memory_order_relaxed)) {
++    if (!crash_called.test_and_set(std::memory_order_relaxed)) fn(s);
++  }
++}
++}  // namespace rex::diagnostics::observers
+diff --git a/src/core/seh_posix.cpp b/src/core/seh_posix.cpp
+index 6971ec76..95b91cad 100644
+--- a/src/core/seh_posix.cpp
++++ b/src/core/seh_posix.cpp
+@@ -18,11 +18,15 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
+ #include <cstring>   // std::memset()
+ 
+ #include <rex/ppc/exceptions.h>
++#include <rex/diagnostics/observers.h>
++#include <atomic>
++#include <cstdio>
+ 
+ namespace rex::ppc::detail {
+ 
+ static thread_local SehThreadState tls_seh_state;
+ static thread_local bool tls_seh_active = false;
++static std::atomic_flag crash_observer_called = ATOMIC_FLAG_INIT;
+ 
+ // The signal actions that were installed before the PPC SEH layer claimed
+ // SIGSEGV/SIGBUS/SIGFPE/SIGILL. A fault that the PPC SEH layer declines (we
+@@ -101,6 +105,12 @@ static void signal_handler(int sig, siginfo_t* info, void* context) {
+     // Not in SEH region - pass the fault to the handler that owned the signal
+     // before this layer (e.g. an application crash reporter), or terminate
+     // with the default disposition if there was none.
++    if (!crash_observer_called.test_and_set(std::memory_order_relaxed)) {
++      char summary[96];
++      std::snprintf(summary, sizeof(summary), "signal=%d address=0x%llX", sig,
++                    static_cast<unsigned long long>(info ? reinterpret_cast<uintptr_t>(info->si_addr) : 0));
++      rex::diagnostics::observers::NotifyCrash(summary);
++    }
+     ChainToPreviousHandler(sig, info, context);
+   }
+ 
+diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
+index 4b6a8ebb..0cfdc2c0 100644
+--- a/src/kernel/xam/xam_input.cpp
++++ b/src/kernel/xam/xam_input.cpp
+@@ -11,6 +11,7 @@
+ 
+ #include <atomic>
+ #include <rex/cvar.h>
++#include <rex/diagnostics/observers.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/input/input.h>
+ #include <rex/input/input_system.h>
+@@ -167,7 +168,12 @@ ppc_u32_result_t XamInputGetState_entry(ppc_u32_t user_index, ppc_u32_t flags,
+   }
+ 
+   auto* is = input_system();
+-  return is->GetState(actual_user_index, input_state);
++  const X_RESULT result = is->GetState(actual_user_index, input_state);
++  if (result == X_ERROR_SUCCESS && input_state) {
++    rex::diagnostics::observers::NotifyInput(actual_user_index, input_state->gamepad.buttons,
++        input_state->gamepad.left_trigger, input_state->gamepad.right_trigger);
++  }
++  return result;
+ }
+ 
+ // https://msdn.microsoft.com/en-us/library/windows/desktop/microsoft.directx_sdk.reference.xinputsetstate(v=vs.85).aspx
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+index 487c5872..5b4fe484 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/filesystem/device.h>
+ #include <rex/kernel/xboxkrnl/private.h>
+ #include <rex/logging.h>
++#include <rex/diagnostics/observers.h>
+ #include <rex/memory.h>
+ #include <rex/ppc/function.h>
+ #include <rex/ppc/types.h>
+@@ -152,6 +153,8 @@ ppc_u32_result_t NtCreateFile_entry(ppc_pu32_t handle_out, ppc_u32_t desired_acc
+       root_entry, target_path, rex::filesystem::FileDisposition((uint32_t)creation_disposition),
+       desired_access, (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0,
+       (create_options & CreateOptions::FILE_NON_DIRECTORY_FILE) != 0, &vfs_file, &file_action);
++  rex::diagnostics::observers::NotifyFileOpen(target_path.c_str(), result,
++      (create_options & CreateOptions::FILE_DIRECTORY_FILE) != 0);
+   object_ref<XFile> file = nullptr;
+ 
+   X_HANDLE handle = X_INVALID_HANDLE_VALUE;
+-- 
+2.43.0
+

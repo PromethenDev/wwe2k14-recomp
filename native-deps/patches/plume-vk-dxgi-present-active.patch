@@ -1,0 +1,44 @@
+# Flag for the game log: whether createSwapChain returned the DXGI flip swap chain (VulkanDxgiPresentActive). Apply after
+# plume-vk-dxgi-present.patch (patch -p1 in native-deps/plume). 2026-11-21.
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -3659,13 +3659,18 @@
+ #   if defined(_WIN64)
+         if (VulkanDxgiPresent) {
+             if (device->dxgiPresentSupported) {
+-                if (auto dxgi = CreateVulkanDxgiSwapChain(this, desc))
++                if (auto dxgi = CreateVulkanDxgiSwapChain(this, desc)) {
++                    VulkanDxgiPresentActive = true;
+                     return dxgi;
++                }
+             }
+             fprintf(stderr, "[plume-dxgi] DXGI present unavailable (extensions %s), using the Vulkan swap chain\n",
+                     device->dxgiPresentSupported ? "yes" : "no");
+         }
+ #   endif
++#   if defined(_WIN64)
++        VulkanDxgiPresentActive = false;
++#   endif
+         return std::make_unique<VulkanSwapChain>(this, desc);
+     }
+ 
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -225,6 +225,7 @@
+ 
+     // plume_vulkan_dxgi.cpp (Windows): present through a DXGI flip-model swap chain; nullptr if unavailable.
+     extern bool VulkanDxgiPresent;
++    extern bool VulkanDxgiPresentActive;  // set when createSwapChain returned the DXGI swap chain (for the game log)
+     std::unique_ptr<RenderSwapChain> CreateVulkanDxgiSwapChain(VulkanCommandQueue *queue, const RenderSwapChainDesc &desc);
+ 
+     struct VulkanSwapChain : RenderSwapChain {
+--- a/plume_vulkan_dxgi.cpp
++++ b/plume_vulkan_dxgi.cpp
+@@ -31,6 +31,7 @@
+ using Microsoft::WRL::ComPtr;
+ 
+ bool VulkanDxgiPresent = false;
++bool VulkanDxgiPresentActive = false;
+ VkFormat toVk(RenderFormat format);  // plume_vulkan.cpp
+ 
+ namespace {

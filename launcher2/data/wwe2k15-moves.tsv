@@ -1,0 +1,15 @@
+# WWE 2K15 import: move decisions from our own research (move and wrestler IDs only; no game data).
+# unsupported<TAB>MOVE<TAB>reason: the 2K15 move uses events or bone flags WWE 2K14 lacks (P15-4); it falls back.
+# stall-donor-212<TAB>SOURCE: CPU v CPU stall fix, move slots 212-213 come from the donor (card P15-R-u4-freeze).
+# stall-slot<TAB>SOURCE<TAB>SLOT:MOVE,...: those slots are planned from these 2K15 moves instead (Sting 91, run X3a).
+unsupported	54046	events 291,292,293,294
+unsupported	56193	bone flags
+unsupported	56195	bone flags
+unsupported	56196	bone flags
+stall-donor-212	401
+stall-donor-212	409
+stall-donor-212	410
+stall-donor-212	420
+stall-donor-212	422
+stall-donor-212	424
+stall-slot	410	17:51123,18:58031

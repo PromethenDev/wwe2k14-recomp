@@ -1,0 +1,63 @@
+From c0fde9e3128b202d084ab8ef6afc036d3b9868bd Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 19:05:19 -0700
+Subject: [PATCH 109/149] nr: NrInvalidateGuestRange hook (as
+ TracePlaybackWroteMemory) for observer guest writes; off unless called
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8fcf5d79a3c148e40f0abce7ebfc92c17849ca25)
+---
+ include/rex/graphics/draw_observer.h |  7 +++++++
+ src/graphics/command_processor.cpp   | 11 +++++++++++
+ 2 files changed, 18 insertions(+)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 27ba126a..4f25a61a 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -54,6 +54,13 @@ class DrawObserver {
+ // --nr_compare_dump_dir is set).
+ void RequestNrCompareFrame();
+ 
++// Native-renderer replace mode: tell the SDK that [physical_base, +length) of guest memory was
++// written outside its view of memory - exactly what trace playback does after it writes memory
++// (CommandProcessor::TracePlaybackWroteMemory: shared memory + primitive processor invalidation,
++// exact range). Call only on the GPU command processor thread (from DrawObserver::OnDraw, as trace
++// playback runs there). Inert until called; never called by the SDK itself.
++void NrInvalidateGuestRange(uint32_t physical_base, uint32_t length);
++
+ // Not thread-safe to change while the GPU thread runs; set before the title or replay starts.
+ void SetDrawObserver(DrawObserver* observer);
+ DrawObserver* GetDrawObserver();
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 13f483b5..9c1cdeed 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1865,6 +1865,16 @@ std::string NrCompareSdkDir() {
+ }
+ }  // namespace
+ 
++namespace {
++CommandProcessor* g_nr_command_processor = nullptr;  // set on the CP thread before observer calls
++}  // namespace
++
++void NrInvalidateGuestRange(uint32_t physical_base, uint32_t length) {
++  if (g_nr_command_processor && length) {
++    g_nr_command_processor->TracePlaybackWroteMemory(physical_base, length);
++  }
++}
++
+ void RequestNrCompareFrame() {
+   if (!REXCVAR_GET(nr_compare_dump_dir).empty()) {
+     g_nr_compare_request.store(true, std::memory_order_relaxed);
+@@ -2040,6 +2050,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+     NrCompareAtStart();
+     DumpDrawState(ordinal, vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr);
+     if (DrawObserver* observer = g_draw_observer) {
++      g_nr_command_processor = this;
+       string::StringBuffer disasm;
+       Shader* vs = active_vertex_shader();
+       Shader* ps = active_pixel_shader();
+-- 
+2.43.0
+

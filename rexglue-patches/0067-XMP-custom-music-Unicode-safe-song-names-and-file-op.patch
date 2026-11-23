@@ -1,7 +1,7 @@
 From a19db2cb5f0a485499cd0750331752ee2f97375f Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 07:27:38 -0700
-Subject: [PATCH 67/97] XMP custom music: Unicode-safe song names and file
+Subject: [PATCH 067/149] XMP custom music: Unicode-safe song names and file
  opens on Windows (path::string() threw for names outside the ANSI code page,
  e.g. superscript letters -> game crash on opening the entrance editor); _w
  decoder opens + _wfopen for stb_vorbis; folder scan and decode wrapped so a
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 93 insertions(+), 62 deletions(-)
 
 diff --git a/src/audio/custom_music_player.cpp b/src/audio/custom_music_player.cpp
-index 74e4da4..2fd6a31 100644
+index 74e4da44..2fd6a31c 100644
 --- a/src/audio/custom_music_player.cpp
 +++ b/src/audio/custom_music_player.cpp
 @@ -15,8 +15,12 @@
@@ -132,7 +132,7 @@ index 74e4da4..2fd6a31 100644
        cursor_ = 0;
        state_.store(kPlaying, std::memory_order_relaxed);
 diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
-index d150c18..8055d49 100644
+index d150c18b..8055d49e 100644
 --- a/src/kernel/xam/apps/xmp_app.cpp
 +++ b/src/kernel/xam/apps/xmp_app.cpp
 @@ -229,7 +229,7 @@ X_HRESULT XmpApp::XMPPlayCustomSong(const CustomMusicSong* song) {

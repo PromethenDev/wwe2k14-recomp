@@ -1,0 +1,104 @@
+From 595dd0b194da73f27930d025a1aac9bbb56c7b48 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 12:07:58 -0700
+Subject: [PATCH 102/149] nr: resolve_dump_dir evidence option - after every
+ resolve, write the destination extent from guest memory
+ (readback_resolve=full) and a resolves.tsv line
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 21bac0705d13e69d39a032c22b53d0d461cc8363)
+---
+ include/rex/graphics/command_processor.h |  3 +++
+ src/graphics/command_processor.cpp       | 34 ++++++++++++++++++++++++
+ 2 files changed, 37 insertions(+)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index 11ec9e48..fa637cac 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -233,6 +233,9 @@ class CommandProcessor {
+                                           uint32_t count);
+   virtual bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
+                                                   uint32_t count);
++  // resolve_dump_dir evidence writer (off unless the cvar is set).
++  void DumpResolveResult();
++  uint32_t current_draw_ordinal_ = 0;
+   // draw_state_dump evidence writer (off unless the cvar is set).
+   void DumpDrawState(uint32_t ordinal, uint32_t draw_initiator, const IndexBufferInfo* index_info);
+   bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 85519df0..070a39d8 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -30,6 +30,7 @@
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
+ #include <rex/graphics/draw_observer.h>
++#include <rex/graphics/util/draw.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/diagnostics/rate_census.h>
+@@ -49,6 +50,10 @@ REXCVAR_DEFINE_BOOL(vsync, true, "GPU", "Enable vertical sync");
+ 
+ REXCVAR_DEFINE_BOOL(cp_read_pointer_writeback_per_block, false, "GPU",
+                     "Opt in to ring read-pointer writebacks at the configured CP_RB_CNTL block frequency");
++REXCVAR_DEFINE_STRING(resolve_dump_dir, "", "GPU",
++                      "Native-renderer evidence: after every resolve (copy) draw, write its destination "
++                      "extent from guest memory to DIR/resolve-<ordinal>-<dest>.bin (needs "
++                      "readback_resolve=full so the result is in guest memory)");
+ REXCVAR_DEFINE_STRING(draw_state_dump, "", "GPU",
+                       "Native-renderer evidence: FIRST:LAST:DIR - for draw packets FIRST..LAST "
+                       "(zero-based, counted from process start as they reach the draw handler, "
+@@ -1792,6 +1797,33 @@ void CommandProcessor::DumpDrawState(uint32_t ordinal, uint32_t draw_initiator,
+   }
+ }
+ 
++// resolve_dump_dir: the destination extent of a resolve, as it is in guest memory after the
++// backend's copy (readback_resolve=full writes it back synchronously).
++void CommandProcessor::DumpResolveResult() {
++  const std::string& dir = REXCVAR_GET(resolve_dump_dir);
++  if (dir.empty() || register_file_->Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kCopy) {
++    return;
++  }
++  draw_util::ResolveInfo info;
++  if (!draw_util::GetResolveInfo(*register_file_, *memory_, trace_writer_, 1, 1, false, false, info) ||
++      !info.copy_dest_extent_length) {
++    return;
++  }
++  const std::string path = fmt::format("{}/resolve-{:06}-{:08X}.bin", dir, current_draw_ordinal_,
++                                       info.copy_dest_base);
++  if (FILE* f = std::fopen(path.c_str(), "wb")) {
++    const uint8_t* src = memory_->TranslatePhysical(info.copy_dest_extent_start);
++    std::fwrite(src, 1, info.copy_dest_extent_length, f);
++    std::fclose(f);
++  }
++  if (FILE* f = std::fopen((dir + "/resolves.tsv").c_str(), "ab")) {
++    std::fprintf(f, "%u\t%08X\t%08X\t%u\t%08X\t%08X\n", current_draw_ordinal_, info.copy_dest_base,
++                 info.copy_dest_extent_start, info.copy_dest_extent_length, info.rb_copy_control.value,
++                 info.copy_dest_info.value);
++    std::fclose(f);
++  }
++}
++
+ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet,
+                                               const char* opcode_name, uint32_t viz_query_condition,
+                                               uint32_t count_remaining) {
+@@ -1881,6 +1913,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   {
+     static std::atomic<uint32_t> draw_ordinal{0};
+     const uint32_t ordinal = draw_ordinal.fetch_add(1, std::memory_order_relaxed);
++    current_draw_ordinal_ = ordinal;
+     DumpDrawState(ordinal, vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr);
+     if (DrawObserver* observer = g_draw_observer) {
+       string::StringBuffer disasm;
+@@ -1929,6 +1962,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+       draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+                                  is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
++      DumpResolveResult();
+       if (!draw_succeeded) {
+         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+         auto vgt_hos_cntl = register_file_->Get<reg::VGT_HOS_CNTL>();
+-- 
+2.43.0
+

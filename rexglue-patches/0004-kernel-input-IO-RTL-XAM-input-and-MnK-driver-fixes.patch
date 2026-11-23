@@ -1,7 +1,7 @@
 From 6022f40216c886474c51dd01ebda4ef6d5226ec0 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 12:48:59 -0700
-Subject: [PATCH 04/97] kernel/input: IO, RTL, XAM input and MnK driver fixes
+Subject: [PATCH 004/149] kernel/input: IO, RTL, XAM input and MnK driver fixes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  5 files changed, 148 insertions(+), 3 deletions(-)
 
 diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
-index b8eae3c..b005782 100644
+index b8eae3cc..b0057828 100644
 --- a/src/input/mnk/mnk_input_driver.cpp
 +++ b/src/input/mnk/mnk_input_driver.cpp
 @@ -112,6 +112,30 @@ static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_v
@@ -68,7 +68,7 @@ index b8eae3c..b005782 100644
  
  void MnkInputDriver::OnMouseDown(rex::ui::MouseEvent& e) {
 diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
-index a5e9088..1aab507 100644
+index a5e9088f..1aab507d 100644
 --- a/src/kernel/xam/apps/xmp_app.cpp
 +++ b/src/kernel/xam/apps/xmp_app.cpp
 @@ -405,8 +405,14 @@ X_HRESULT XmpApp::DispatchMessageSync(uint32_t message, uint32_t buffer_ptr,
@@ -88,7 +88,7 @@ index a5e9088..1aab507 100644
        if (!XThread::GetCurrentThread()->main_thread()) {
          // Atrain spawns a thread 82437FD0 to call this in a tight loop forever.
 diff --git a/src/kernel/xam/xam_input.cpp b/src/kernel/xam/xam_input.cpp
-index f03f439..2db5561 100644
+index f03f4392..2db5561f 100644
 --- a/src/kernel/xam/xam_input.cpp
 +++ b/src/kernel/xam/xam_input.cpp
 @@ -32,6 +32,10 @@ using rex::input::X_INPUT_STATE;
@@ -121,7 +121,7 @@ index f03f439..2db5561 100644
      return X_ERROR_DEVICE_NOT_CONNECTED;
    }
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io.cpp b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
-index 3883e2f..d73269d 100644
+index 3883e2f7..d73269d5 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io.cpp
 @@ -198,6 +198,68 @@ ppc_u32_result_t NtReadFile_entry(ppc_u32_t file_handle, ppc_u32_t event_handle,
@@ -194,7 +194,7 @@ index 3883e2f..d73269d 100644
    bool apc_queued = false;
  
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
-index db31f40..f353e3a 100644
+index db31f40d..f353e3ae 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_rtl.cpp
 @@ -384,6 +384,27 @@ ppc_u32_result_t RtlInitializeCriticalSectionAndSpinCount_entry(

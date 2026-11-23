@@ -1,4 +1,4 @@
-// Always-on freeze-report guest-state provider.
+// Always-on freeze-report guest-state provider (docs/CAGE-SPIN.md section 6).
 //
 // The freeze logger lives in rexcore (below rex::system) and its report runs on
 // the 1 Hz watchdog thread, which is not a bound guest ThreadState, so it
@@ -20,12 +20,16 @@
 #include <rex/ppc/context.h>
 #include <rex/ppc/memory.h>
 
+#include "timeline.h"
+
+extern "C" void wwe2k14_pump_ring_dump(FILE* file);  // src/cage_hang_probe.cpp (D8 recorder; no-op when not armed)
+
 namespace {
 
 std::atomic<const uint8_t*> g_guest_base{nullptr};
 std::atomic<uint32_t> g_pump_object{0};
 
-// Guest .data addresses found by analysing the freeze.
+// Guest .data addresses from docs/CAGE-SPIN.md sections 1 and 6.
 constexpr uint32_t kPresentDeviceGlobal = 0x83929AB8;
 constexpr uint32_t kPumpFrameGlobal = 0x83940170;   // written 76.cpp:8774
 constexpr uint32_t kPumpPresentGlobal = 0x8394016C; // read 76.cpp:8765
@@ -112,7 +116,15 @@ void DumpGuestState(FILE* file, uint64_t now_ns) {
   std::fprintf(file, "timing 0x%08X=0x%08X 0x%08X=0x%08X 0x%08X=0x%08X\n", kTimingAccum0,
                Load32(base, kTimingAccum0), kTimingAccum1, Load32(base, kTimingAccum1),
                kTimingAccum2, Load32(base, kTimingAccum2));
+  wwe2k14_pump_ring_dump(file);
   std::fflush(file);
+}
+
+// Card LOG1: a real freeze also marks the timeline and writes it at once (the game may never recover). The timeline
+// ignores reports while it still sees frames (the SDK logger's false report at ~210 s uptime).
+void DumpGuestStateWithTimeline(FILE* file, uint64_t now_ns) {
+  DumpGuestState(file, now_ns);
+  wwe2k14::timeline::OnFreezeReport();
 }
 
 }  // namespace
@@ -127,7 +139,7 @@ extern "C" void wwe2k14_freeze_record_pump(uint8_t* base, uint32_t object) {
 namespace wwe2k14 {
 
 void RegisterFreezeGuestState() {
-  rex::diagnostics::freeze_logger::SetGuestStateDumpFn(&DumpGuestState);
+  rex::diagnostics::freeze_logger::SetGuestStateDumpFn(&DumpGuestStateWithTimeline);
 }
 
 }  // namespace wwe2k14

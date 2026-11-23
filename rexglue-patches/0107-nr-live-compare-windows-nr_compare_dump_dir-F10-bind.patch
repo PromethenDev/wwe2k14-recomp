@@ -1,0 +1,208 @@
+From 968145cadf081ac75839d8a5aff21833309dd8b1 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:00:05 -0700
+Subject: [PATCH 107/149] nr: live compare windows (--nr_compare_dump_dir, F10
+ bind, frame-end hook, EDRAM snapshot to observer); off by default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 588cccbd39b8f5a5edd044730aff65b96e456c3a)
+---
+ include/rex/graphics/command_processor.h |  3 +
+ include/rex/graphics/draw_observer.h     |  9 +++
+ include/rex/graphics/flags.h             |  1 +
+ src/graphics/command_processor.cpp       | 78 +++++++++++++++++++++++-
+ src/ui/rex_app.cpp                       | 12 ++++
+ 5 files changed, 102 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index fbcb90c0..cc2c0ec0 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -251,6 +251,9 @@ class CommandProcessor {
+   void DumpDrawState(uint32_t ordinal, uint32_t draw_initiator, const IndexBufferInfo* index_info);
+   // nr evidence (draw_edram_dump): the whole EDRAM after listed draw packets.
+   void DumpEdramAfterDraw(uint32_t ordinal);
++  void NrCompareOnSwap();
++  void NrCompareAtStart();
++  void DumpResolveResultTo(const std::string& dir);
+   bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
+                               uint32_t viz_query_condition, uint32_t count_remaining);
+   bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 1d1a5dee..8c152460 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -41,8 +41,17 @@ class DrawObserver {
+   // A trace replay restored the EDRAM from a snapshot (raw 2048 tiles x 5120 bytes, the guest
+   // layout), before the frame's first draw.
+   virtual void OnEdramSnapshot(const void* data, size_t size) { (void)data; (void)size; }
++  // Compare window (--nr_compare_dump_dir, off by default): begin = true at the frame boundary
++  // that starts a requested compare frame (followed by OnEdramSnapshot with the SDK's EDRAM in a
++  // live run), begin = false at the next frame boundary. frame = the swap counter used in the
++  // frame-trace (.xtr) file name, so an F9-style trace of the same frame has the same number.
++  virtual void OnCompareFrame(bool begin, uint32_t frame) { (void)begin; (void)frame; }
+ };
+ 
++// Request a compare window for the next frame (thread-safe; a no-op unless
++// --nr_compare_dump_dir is set).
++void RequestNrCompareFrame();
++
+ // Not thread-safe to change while the GPU thread runs; set before the title or replay starts.
+ void SetDrawObserver(DrawObserver* observer);
+ DrawObserver* GetDrawObserver();
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 49c065a5..b77379f4 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -15,6 +15,7 @@
+ 
+ // GPU Core
+ REXCVAR_DECLARE(bool, vsync);
++REXCVAR_DECLARE(std::string, nr_compare_dump_dir);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index e18db144..081cf9d4 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -54,6 +54,14 @@ REXCVAR_DEFINE_STRING(resolve_dump_dir, "", "GPU",
+                       "Native-renderer evidence: after every resolve (copy) draw, write its destination "
+                       "extent from guest memory to DIR/resolve-<ordinal>-<dest>.bin (needs "
+                       "readback_resolve=full so the result is in guest memory)");
++REXCVAR_DEFINE_STRING(nr_compare_dump_dir, "", "GPU",
++                      "Native-renderer live compare windows (off when empty): on request "
++                      "(RequestNrCompareFrame, bind_nr_compare_frame), the next frame's resolves are "
++                      "written to DIR/frame-<n>/sdk (as resolve_dump_dir; needs readback_resolve=full) "
++                      "and the draw observer is told the window begins / ends");
++REXCVAR_DEFINE_BOOL(nr_compare_at_start, false, "GPU",
++                    "Native-renderer evidence: open a compare window (frame 0) at the first draw - for "
++                    "trace replays, whose EDRAM snapshot comes from the trace");
+ REXCVAR_DEFINE_STRING(draw_edram_dump, "", "GPU",
+                       "Native-renderer evidence: ORD1,ORD2,...:DIR - after each listed draw packet "
+                       "(numbered as draw_state_dump), write the whole EDRAM (guest layout, every "
+@@ -1243,6 +1251,7 @@ bool CommandProcessor::ExecutePacketType3(memory::RingBuffer* reader, uint32_t p
+ 
+   trace_writer_.WritePacketEnd();
+   if (opcode == PM4_XE_SWAP) {
++    NrCompareOnSwap();
+     // End the trace writer frame.
+     if (trace_writer_.is_open()) {
+       trace_writer_.WriteEvent(EventCommand::Type::kSwap);
+@@ -1842,8 +1851,74 @@ void CommandProcessor::DumpDrawState(uint32_t ordinal, uint32_t draw_initiator,
+ 
+ // resolve_dump_dir: the destination extent of a resolve, as it is in guest memory after the
+ // backend's copy (readback_resolve=full writes it back synchronously).
++namespace {
++std::atomic<bool> g_nr_compare_request{false};
++bool g_nr_compare_active = false;
++bool g_nr_compare_started_at_start = false;
++uint32_t g_nr_compare_frame = 0;
++std::string NrCompareSdkDir() {
++  return fmt::format("{}/frame-{}/sdk", REXCVAR_GET(nr_compare_dump_dir), g_nr_compare_frame);
++}
++}  // namespace
++
++void RequestNrCompareFrame() {
++  if (!REXCVAR_GET(nr_compare_dump_dir).empty()) {
++    g_nr_compare_request.store(true, std::memory_order_relaxed);
++  }
++}
++
++// Frame boundary (XE_SWAP packet end): close an open compare window, open a requested one. A
++// live window starts from the SDK's own EDRAM, handed to the observer as a snapshot.
++void CommandProcessor::NrCompareOnSwap() {
++  if (REXCVAR_GET(nr_compare_dump_dir).empty()) {
++    return;
++  }
++  DrawObserver* observer = GetDrawObserver();
++  if (g_nr_compare_active) {
++    g_nr_compare_active = false;
++    REXGPU_INFO("nr_compare: window for frame {} closed", g_nr_compare_frame);
++    if (observer) observer->OnCompareFrame(false, g_nr_compare_frame);
++  }
++  if (!g_nr_compare_request.exchange(false, std::memory_order_relaxed)) {
++    return;
++  }
++  g_nr_compare_frame = counter_ - 1;
++  std::error_code ec;
++  std::filesystem::create_directories(NrCompareSdkDir(), ec);
++  g_nr_compare_active = true;
++  REXGPU_INFO("nr_compare: window for frame {} opened ({})", g_nr_compare_frame, NrCompareSdkDir());
++  if (observer) {
++    observer->OnCompareFrame(true, g_nr_compare_frame);
++    std::vector<uint8_t> edram;
++    if (DumpEdram(edram)) {
++      observer->OnEdramSnapshot(edram.data(), edram.size());
++    } else {
++      REXGPU_ERROR("nr_compare: EDRAM download failed for frame {}", g_nr_compare_frame);
++    }
++  }
++}
++
++void CommandProcessor::NrCompareAtStart() {
++  if (g_nr_compare_started_at_start || !REXCVAR_GET(nr_compare_at_start) ||
++      REXCVAR_GET(nr_compare_dump_dir).empty()) {
++    return;
++  }
++  g_nr_compare_started_at_start = true;
++  g_nr_compare_frame = 0;
++  std::error_code ec;
++  std::filesystem::create_directories(NrCompareSdkDir(), ec);
++  g_nr_compare_active = true;
++  if (DrawObserver* observer = GetDrawObserver()) observer->OnCompareFrame(true, 0);
++}
++
+ void CommandProcessor::DumpResolveResult() {
+-  const std::string& dir = REXCVAR_GET(resolve_dump_dir);
++  if (g_nr_compare_active) {
++    DumpResolveResultTo(NrCompareSdkDir());
++  }
++  DumpResolveResultTo(REXCVAR_GET(resolve_dump_dir));
++}
++
++void CommandProcessor::DumpResolveResultTo(const std::string& dir) {
+   if (dir.empty() || register_file_->Get<reg::RB_MODECONTROL>().edram_mode != xenos::EdramMode::kCopy) {
+     return;
+   }
+@@ -1957,6 +2032,7 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+     static std::atomic<uint32_t> draw_ordinal{0};
+     const uint32_t ordinal = draw_ordinal.fetch_add(1, std::memory_order_relaxed);
+     current_draw_ordinal_ = ordinal;
++    NrCompareAtStart();
+     DumpDrawState(ordinal, vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr);
+     if (DrawObserver* observer = g_draw_observer) {
+       string::StringBuffer disasm;
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index a072ed71..403f7497 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -29,6 +29,8 @@
+ #include <rex/ui/overlay/debug_overlay.h>
+ #include <rex/ui/overlay/settings_overlay.h>
+ #include <rex/graphics/graphics_system.h>
++#include <rex/graphics/draw_observer.h>
++#include <rex/graphics/flags.h>
+ #include <rex/graphics/trace_player.h>
+ #if REX_HAS_VULKAN
+ #include <rex/graphics/vulkan/graphics_system.h>
+@@ -293,6 +295,16 @@ bool ReXApp::OnInitialize() {
+ 
+     // Single-frame GPU trace (.xtr) written to trace_gpu_prefix, for offline
+     // inspection with the trace dump tool.
++    // Native-renderer live compare window (only with --nr_compare_dump_dir): the next frame is
++    // compared per copy-out and, for an offline repeat, also traced (trace_gpu_prefix).
++    if (!REXCVAR_GET(nr_compare_dump_dir).empty()) {
++      rex::ui::RegisterBind("bind_nr_compare_frame", "F10", "Native renderer: compare the next frame",
++                            [graphics_system] {
++                              REXLOG_INFO("nr_compare: frame requested");
++                              graphics_system->RequestFrameTrace();
++                              rex::graphics::RequestNrCompareFrame();
++                            });
++    }
+     if (REXCVAR_GET(debug_ui)) {
+       rex::ui::RegisterBind("bind_gpu_frame_trace", "F9", "Capture a single-frame GPU trace",
+                             [graphics_system] {
+-- 
+2.43.0
+

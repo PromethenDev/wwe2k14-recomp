@@ -1,7 +1,7 @@
 From 2ecb730551d8a0b957a86446deb14ae16bef783a Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 9 Oct 2026 21:55:15 -0700
-Subject: [PATCH 98/99] Replace the multi-object wait polling loop with a
+Subject: [PATCH 098/149] Replace the multi-object wait polling loop with a
  blocking wait (AK::IOThread burned a core on Linux/Android)
 
 Alertable waits polled in 1 ms slices and WaitMultiple truncated the remaining time to whole ms, so
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 445 insertions(+), 158 deletions(-)
 
 diff --git a/src/core/threading_posix.cpp b/src/core/threading_posix.cpp
-index 5ad3b57..a88bdc4 100644
+index 5ad3b574..a88bdc4d 100644
 --- a/src/core/threading_posix.cpp
 +++ b/src/core/threading_posix.cpp
 @@ -13,6 +13,7 @@ static_assert(REX_PLATFORM_LINUX || REX_PLATFORM_MAC, "This file is POSIX-only")
@@ -551,7 +551,7 @@ index 5ad3b57..a88bdc4 100644
  
    current_thread_ = nullptr;
 diff --git a/tests/unit/core/threading_test.cpp b/tests/unit/core/threading_test.cpp
-index 72c4c5a..84380f6 100644
+index 72c4c5a7..84380f6b 100644
 --- a/tests/unit/core/threading_test.cpp
 +++ b/tests/unit/core/threading_test.cpp
 @@ -8,11 +8,13 @@

@@ -1,7 +1,7 @@
 From 008ac8dd271c06deb35b44993dec1a9c757626e1 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 09:58:41 -0700
-Subject: [PATCH 31/97] graphics: on-demand GPU->CPU visibility for resolved
+Subject: [PATCH 031/149] graphics: on-demand GPU->CPU visibility for resolved
  data
 
 CommandProcessor::MakeGpuWritesVisibleToCpu(guest_address, length) copies back, synchronously
@@ -27,7 +27,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  6 files changed, 185 insertions(+), 1 deletion(-)
 
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index cb74a27..ebe0695 100644
+index cb74a279..ebe0695b 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -12,6 +12,8 @@
@@ -76,7 +76,7 @@ index cb74a27..ebe0695 100644
    std::vector<uint32_t> me_bin_;
  
 diff --git a/include/rex/graphics/shared_memory.h b/include/rex/graphics/shared_memory.h
-index b05df6a..208359b 100644
+index b05df6aa..208359b5 100644
 --- a/include/rex/graphics/shared_memory.h
 +++ b/include/rex/graphics/shared_memory.h
 @@ -95,6 +95,10 @@ class SharedMemory {
@@ -91,7 +91,7 @@ index b05df6a..208359b 100644
   protected:
    SharedMemory(memory::Memory& memory);
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index bfd90dd..e5fbfcd 100644
+index bfd90ddb..e5fbfcdf 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -476,6 +476,7 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -103,7 +103,7 @@ index bfd90dd..e5fbfcd 100644
    bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
  
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 2749a56..d21aa64 100644
+index 2749a56e..d21aa648 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -242,6 +242,56 @@ void CommandProcessor::CallInThread(std::function<void()> fn) {
@@ -187,7 +187,7 @@ index 2749a56..d21aa64 100644
        }
      }
 diff --git a/src/graphics/shared_memory.cpp b/src/graphics/shared_memory.cpp
-index 333becb..078ddd0 100644
+index 333becb8..078ddd04 100644
 --- a/src/graphics/shared_memory.cpp
 +++ b/src/graphics/shared_memory.cpp
 @@ -310,6 +310,29 @@ void SharedMemory::FireWatches(uint32_t page_first, uint32_t page_last, bool inv
@@ -221,7 +221,7 @@ index 333becb..078ddd0 100644
    if (length == 0 || start >= kBufferSize) {
      return;
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 286ccd0..7446d0b 100644
+index 286ccd03..7446d0b1 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -5296,6 +5296,83 @@ bool VulkanCommandProcessor::IssueCopy_ReadbackResolvePath() {

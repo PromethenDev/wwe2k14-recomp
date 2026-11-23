@@ -1,7 +1,7 @@
 From b0e20dc98a63e80871c54a39a9ad4d636d840f7b Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 15:45:52 -0700
-Subject: [PATCH 36/97] graphics: enable persistent Vulkan shader/pipeline
+Subject: [PATCH 036/149] graphics: enable persistent Vulkan shader/pipeline
  storage
 
 The Xenia-derived storage (<user data>/cache/shaders/shareable/<title>.*)
@@ -28,7 +28,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 71 insertions(+), 26 deletions(-)
 
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 87c49c7..a0b28df 100644
+index 87c49c75..a0b28df8 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -40,9 +40,10 @@ REXCVAR_DEFINE_STRING(swap_post_effect, "none", "GPU", "Swap post effect: none,
@@ -54,7 +54,7 @@ index 87c49c7..a0b28df 100644
    }
    if (blocking) {
 diff --git a/src/graphics/vulkan/pipeline_cache.cpp b/src/graphics/vulkan/pipeline_cache.cpp
-index 91ac08f..e894a08 100644
+index 91ac08f6..e894a089 100644
 --- a/src/graphics/vulkan/pipeline_cache.cpp
 +++ b/src/graphics/vulkan/pipeline_cache.cpp
 @@ -12,6 +12,7 @@
@@ -193,7 +193,7 @@ index 91ac08f..e894a08 100644
        shader_header.ucode_data_hash = shader->ucode_data_hash();
        shader_header.ucode_dword_count = shader->ucode_dword_count();
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 293d9fa..68c99ca 100644
+index 293d9fa1..68c99cae 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -167,6 +167,16 @@ bool ReXApp::OnInitialize() {

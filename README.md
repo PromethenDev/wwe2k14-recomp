@@ -1,8 +1,58 @@
-# WWE 2K14 Recomp v1.6.0
+# WWE 2K14 Recomp v1.7.0
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
+
+## What's new in v1.7.0
+
+- **New renderer (Windows):** WWE 2K14 now draws through the WWE '13 v1.6 native renderer by iMrBurn. It is smoother
+  and starts much faster: on an Intel UHD 630 a 720p match went from about 42 to about 58 fps, and the first picture
+  appears in a few seconds instead of about 40. On an AMD Radeon 780M laptop the game holds its 60 / 30 fps with about
+  half the stutters.
+- **Renderer choice:** **Settings > Renderer** offers **Vulkan** (recommended), **DirectX 12** and **DirectX 11** (the
+  new renderer) or **Xbox** (the original Xbox 360 renderer). Old settings start on Vulkan.
+- **New Settings page:** one row per setting with arrows to change it, and a help box that explains the highlighted
+  row. Works with mouse, keyboard and controller.
+- **Graphics card choice** now also applies to the new renderer (laptops with two graphics chips).
+- **In the game (new renderer):** **F1** or **Back + Start** opens its settings, **F3** shows the frame rate.
+- **Fixed:** imported WWE '13 arenas together with DLC packs left the game on the title screen (GitHub #171, #175, #176).
+- **Fixed:** after a WWE 2K15 import, the Mods page said "Nothing imported yet" (GitHub #178).
+- **WWE 2K15 titantrons** convert with the right colours (GitHub #155).
+- **Crash reports:** crashes that used to leave nothing in the game log now write the reason first (GitHub #174, #177, #179).
+- **Linux** keeps the previous native renderer in this version.
+
+## What's new in v1.6.1
+
+- **Imported wrestlers in the main select grid (new):** your WWE '13 and WWE 2K15 imports now appear in the main
+  Superstars and Divas grids with their own faces, so you no longer have to open Downloaded Superstars. They fill the
+  free places first; press **Down** past the bottom row for the next page of imports and **Up** past the top row to go
+  back. Every row can be reached with Up and Down. Turn it off in **Mods > Gameplay** if you prefer the old way.
+- **Faces for wrestlers you imported before:** when you press Play, the launcher adds a select-screen face for every
+  imported wrestler that has none. No need to import again; the first Play after updating takes a few seconds longer.
+- **Unlock everything (new):** **Mods > Gameplay > Unlock everything** opens every Unlockable and every 30 Years of
+  WrestleMania era and match. Your save keeps what is unlocked, so a save backup is made first (GitHub #109).
+- **Import in any order:** you can import from WWE '13 while WWE 2K15 wrestlers are imported; the launcher takes the
+  WWE 2K15 wrestlers out and puts them back by itself.
+- **WWE 2K15 wrestlers** bring their own entrance themes, and the ring announcer says their names.
+- **Capes and long coats** of imported WWE '13 wrestlers (Ministry Undertaker, Undertaker '13) now hang and swing instead
+  of floating.
+- **Fixed:** imported wrestlers sometimes came out to a stock WWE 2K14 theme instead of their own.
+- **Keyboard (new option):** keep keys bound to buttons working while you type names (GitHub #87).
+- **WWE '13 import into a folder changed by another copy of the launcher** now repairs that folder first, then imports
+  (GitHub #141).
+- **Mods page** has a tidier layout: **Wrestlers**, **Import** and **Gameplay** tabs, with one card per game for importing
+  and undoing.
+- **Linux: WWE '13 / WWE 2K15 imports** no longer show placeholder portraits or load matches endlessly (add-on files are now loaded in the right order).
+- **Moving to a new folder** now keeps your imported wrestlers instead of showing "Error Roster" (GitHub #132).
+- **Created-wrestler import** should accept more saves that it used to refuse (GitHub #115, #75): anything it doesn't recognise is left untouched, and a full backup is still made first. If yours is still refused, please send a bug report.
+- **Black outfits** (GitHub #105): a missing graphics helper file is now warned about.
+- **Select screen** can list more than 32 add-on wrestlers per pack.
+- **WWE 2K15 import:** all 74 WWE 2K15 wrestlers can be imported.
+- **WWE '13 imports** get their victory motions (GitHub #142) and more free row numbers (GitHub #141).
+- **Linux WWE '13 import** finds files in any letter case (GitHub #135).
+- **Add-ons installed twice** (in two userdata folders) are now loaded only once.
+- **Bug reports** include more information, and a stuck loading screen now saves a report.
 
 ## What's new in v1.6.0
 
@@ -249,7 +299,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.6.0 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.7.0 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -274,14 +324,14 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 - **Windows 10 or 11 (64-bit)**, or **Linux** (glibc 2.38 or newer, e.g. Ubuntu 24.04, with GTK3; on Wayland the
   game window runs through XWayland, installed by default on most distributions).
 - **CPU**: a 64-bit processor with AVX2 (most PCs from 2013 onward: Intel Haswell / AMD Ryzen or newer).
-- **Graphics**: up-to-date Vulkan drivers. With the **Native** renderer, integrated graphics such as AMD Radeon 780M
-  and Intel UHD 630 are supported (start with 480p). The **Xbox** renderer needs a dedicated graphics card.
+- **Graphics**: up-to-date graphics drivers with Vulkan, DirectX 12 or DirectX 11. With the new renderer, integrated
+  graphics such as AMD Radeon 780M and Intel UHD 630 are supported. The **Xbox** renderer needs a dedicated graphics card.
 - About 10 GB of free space for the game files.
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.6.0.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.6.0.zip`.
+1. Download `WWE2K14-Recomp-v1.7.0-x64.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.7.0-x64.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or
@@ -297,12 +347,14 @@ The launcher checks every file and shows **Game files ready** when everything is
 ```text
 WWE2K14-Recomp-x64/
 ├── WWE 2K14 Launcher.exe       # start here (Windows)
-├── wwe2k14.exe                 # the game (started by the launcher)
+├── wwe2k14-vulkan.exe, wwe2k14-d3d12.exe, wwe2k14-d3d11.exe   # the game with the new renderer
+├── wwe2k14.exe                 # the game with the Xbox renderer (the launcher starts the one you chose)
+├── dxcompiler.dll, dxil.dll, pipelines_seed.w12p               # used by the new renderer
 ├── pipelines-seed.keys         # first-start graphics list (Linux: Linux-x86_64/pipelines-seed.keys)
 ├── wwe2k14.toml                # keyboard keys (change them on the launcher's Controls page)
 ├── avcodec-58.dll, avutil-56.dll
-├── shaders/                    # Native renderer shaders (shared by Windows and Linux)
-├── shaders32/                  # Native renderer shaders for GPUs without 64-bit shader support (Intel Ice Lake)
+├── shaders/                    # previous native renderer shaders (used on Linux)
+├── shaders32/                  # the same for GPUs without 64-bit shader support (Intel Ice Lake)
 ├── crowd-cards/                # extra crowd shaders (Linux: Linux-x86_64/crowd-cards)
 ├── shadertools/                # converts rare missing shaders at run time (Linux: Linux-x86_64/shadertools)
 ├── Linux-x86_64/               # Linux launcher + game
@@ -317,21 +369,25 @@ WWE2K14-Recomp-x64/
 
 The launcher shows a recommended setup for your graphics card. You can also choose:
 
-- **Renderer** - **Native** (default, recommended) or **Xbox** (the previous renderer).
-- With **Native**: **Picture size** (480p, 720p, 1080p, 1440p, 4K - how sharp the 3D picture is drawn), **Frame
-  rate** (Locked 30, 30 / 60, 60 everywhere), **Anti-aliasing** and **Lower CPU use**.
+- **Renderer** - **Vulkan** (default, recommended), **DirectX 12** or **DirectX 11** (the new renderer), or **Xbox**
+  (the original Xbox 360 renderer). Try DirectX 12 or 11 if Vulkan has problems on your PC.
+- With the new renderer: **Picture size** (480p to 4K - how sharp the 3D picture is drawn) and **Frame rate** (Locked
+  30, 30 / 60, 60 everywhere). More options are in the game: **F1** (or **Back + Start**) opens its settings, **F3**
+  shows the frame rate. On Linux the previous native renderer keeps its options (Anti-aliasing, Crowd, Shadows,
+  Lower CPU use and more).
 - With **Xbox**: **Resolution** 720p, 1080p or 1440p (the game draws at 1280x720 like the Xbox 360 and is scaled),
   **Frame rate** and **Anti-aliasing** (FXAA).
 - **Language** - the game's language (English, Français, Deutsch, Italiano, Español).
 - **Display** - fullscreen or windowed (press **F11** in the game to switch at any time); **Graphics card** - for PCs
   with two GPUs (laptops: pick the one you want to play on).
-- **Stretch to fill wide screens** - fill a 21:9 or 16:10 screen instead of showing black bars.
+- **Stretch to fill wide screens** (Xbox renderer) - fill a 21:9 or 16:10 screen instead of showing black bars.
 - **Creation Suite** - import created superstars and arenas (Beta), and drop your own songs in for the game's
   custom music.
-- **Mods** - **Gameplay** changes such as the Hell in a Cell weapon wheel (off by default), and **Import from WWE '13**.
+- **Mods** - three tabs: **Wrestlers** (your imported wrestlers), **Import** (WWE '13 and WWE 2K15) and **Gameplay**
+  (imported wrestlers in the main select grid, Unlock everything, the Hell in a Cell weapon wheel).
   Importing many wrestlers takes a few minutes and needs free disk space; the launcher checks the space first. Each
   titantron movie is converted on your PC. If one cannot be converted, that wrestler uses a WWE 2K14 titantron instead
-  and the launcher tells you. **Undo WWE '13 import** restores your original files.
+  and the launcher tells you. **Undo** on each game's card restores your original files.
 - **Saves** - **Back Up Now** and **Restore** your saves with one click.
 
 ## Updates
@@ -375,7 +431,8 @@ The game keeps saves, DLC and settings in `userdata/` beside the launcher. It is
   work in this version reduced that in our test but did not remove it.
 - **Post-match replays** are off for now on Windows and Linux (with them on, matches with a created superstar never
   finished loading).
-- **Native renderer**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; Randy Savage, Hulk Hogan
+- **New renderer**: no crowd, shadow or anti-aliasing options yet; the launcher's Stretch and Sync options apply to the Xbox renderer only.
+- **Previous native renderer (Linux)**: Bobby Heenan's outfit can show a red tint in WrestleMania mode; Randy Savage, Hulk Hogan
   and Miss Elizabeth can look white in 30 Years of WrestleMania (WrestleMania V); John Cena's title belt can shake
   with **60 everywhere** (use **30 / 60**);
   rarely, the loading screen after choosing wrestlers does not finish (restart the game). If something blocks you,
@@ -417,8 +474,16 @@ thread and what it was waiting on at the moment it stopped presenting.
 - **Recompiler and runtime**: the [ReXGlue SDK](https://github.com/rexglue/rexglue-sdk) (this project builds on the
   [rexglue-sdk-yukes](https://github.com/HollywoodAkeem/rexglue-sdk-yukes) fork), which is derived from
   [Xenia](https://github.com/xenia-project/xenia). See their licenses in `third-party-licenses/`.
-- **Native renderer**: draws through [plume](https://github.com/renderbag/plume) (MIT license); its shaders are converted
-  with [XenosRecomp](https://github.com/hedge-dev/XenosRecomp). Memory is managed with the Vulkan Memory Allocator (MIT).
+- **New renderer** (`wwe2k14-vulkan.exe`, `wwe2k14-d3d12.exe`, `wwe2k14-d3d11.exe`): the WWE '13 Recomp v1.6 native
+  renderer by **iMrBurn**, released jointly with PromethenDev under the **GNU General Public License v3**. These three
+  programs are therefore distributed under GPL-3.0; their source code is the `v1.7.0` tag of this repository. Parts:
+  re:Blue (BSD 3-Clause), plume (MIT), the Direct3D 11 backend from Kaiko's WWE SmackDown vs. Raw 2011 PC port (used with
+  permission), XenosRecomp (MIT). See `third-party-licenses/new-renderer/`.
+- **Shader compiler**: `dxcompiler.dll` and `dxil.dll` are Microsoft's DirectX Shader Compiler v1.8.2407, unchanged.
+  `dxil.dll` is under Microsoft's licence terms (`third-party-licenses/dxc/LICENSE-MS.txt`); using it means you accept them.
+- **Previous native renderer** (Linux and `wwe2k14.exe`): draws through [plume](https://github.com/renderbag/plume) (MIT
+  license); its shaders are converted with [XenosRecomp](https://github.com/hedge-dev/XenosRecomp). Memory is managed
+  with the Vulkan Memory Allocator (MIT).
 - **Video**: [FFmpeg](https://ffmpeg.org/) libraries under the LGPL 2.1 or later; the corresponding source is included
   (`ffmpeg-source-*.zip`).
 - **Import from WWE '13**: no WWE '13 or WWE 2K14 game files are included; the import works only with files you already
@@ -427,6 +492,7 @@ thread and what it was waiting on at the moment it stopped presenting.
   decoder library (`wwe2k14_lzx`) is from libmspack under the LGPL 2.1; its source is attached too
   (`libmspack-lzx-source-*.tar.gz`). See `licenses/importer-NOTICE.txt`.
 - Other components and their licenses are listed in `licenses/` and `third-party-licenses/`.
-- **License**: this project's own code is under the BSD 3-Clause [LICENSE](LICENSE). It does not cover WWE 2K14 or any game
-  content, and third-party components keep their own licenses.
+- **License**: this project's own code is under the BSD 3-Clause [LICENSE](LICENSE); the three new-renderer programs
+  as a whole are under GPL-3.0 (see above). Neither covers WWE 2K14 or any game content, and third-party components keep
+  their own licenses.
 - Contributors: see [CONTRIBUTORS.md](CONTRIBUTORS.md).

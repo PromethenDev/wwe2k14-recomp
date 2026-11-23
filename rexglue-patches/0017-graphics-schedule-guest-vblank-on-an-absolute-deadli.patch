@@ -1,8 +1,8 @@
 From d2e362ff70790cd00281a04d119e41ff1faeb552 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 08:00:06 -0700
-Subject: [PATCH 17/97] graphics: schedule guest vblank on an absolute deadline
- (59/s -> 60/s)
+Subject: [PATCH 017/149] graphics: schedule guest vblank on an absolute
+ deadline (59/s -> 60/s)
 
 The vsync worker reset its baseline to the late 1 ms poll time, so every
 interval overshot and the guest saw ~59 vblanks/s. Schedule against
@@ -17,7 +17,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 30 insertions(+), 6 deletions(-)
 
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index c842957..87c49c7 100644
+index c8429576..87c49c75 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -143,16 +143,40 @@ X_STATUS GraphicsSystem::Setup(runtime::FunctionDispatcher* function_dispatcher,

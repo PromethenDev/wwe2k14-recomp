@@ -208,7 +208,11 @@ bool StfsReader::Open(const std::filesystem::path& package_path, std::string* er
 
   std::set<uint32_t> visited_table_blocks;
   uint32_t table_block = file_table_block_;
-  for (uint16_t block_index = 0; block_index < file_table_block_count_; ++block_index) {
+  // Some community packages (Best of Save 93CustomSuperStar.cas) have one real entry followed by uncleared bytes in
+  // the rest of the table block. After at least one valid entry, the first impossible entry ends the list; the
+  // payload is still validated by its own container checks.
+  bool table_ended = false;
+  for (uint16_t block_index = 0; block_index < file_table_block_count_ && !table_ended; ++block_index) {
     if (table_block == kEndOfChain || table_block >= metadata_.total_blocks ||
         !visited_table_blocks.insert(table_block).second) {
       if (error) {
@@ -227,28 +231,32 @@ bool StfsReader::Open(const std::filesystem::path& package_path, std::string* er
       if (name_length == 0) {
         break;
       }
-      if (name_length > 0x28) {
-        if (error) {
-          *error = "This package's file list is damaged.";
-        }
-        return false;
-      }
       StfsEntry entry;
-      entry.name = DecodeLatin1(raw, name_length);
-      if (!IsValidComponent(entry.name)) {
+      if (name_length <= 0x28) {
+        entry.name = DecodeLatin1(raw, name_length);
+        entry.directory = (flags_and_length & 0x80) != 0;
+        entry.first_block = ReadLittleEndianU24(raw + 0x2F);
+        entry.block_count = ReadLittleEndianU24(raw + 0x2C);
+        entry.parent_index = ReadBigEndianU16(raw + 0x32);
+        entry.size = ReadBigEndianU32(raw + 0x34);
+      }
+      const bool plausible = name_length <= 0x28 && IsValidComponent(entry.name) &&
+                             entry.block_count <= metadata_.total_blocks &&
+                             (entry.block_count == 0 || entry.first_block < metadata_.total_blocks);
+      if (!plausible) {
+        if (!entries_.empty()) {
+          table_ended = true;
+          break;
+        }
         if (error) {
-          *error = "This package contains an invalid file name.";
+          *error = name_length > 0x28 ? "This package's file list is damaged."
+                                      : "This package contains an invalid file name.";
         }
         return false;
       }
-      entry.directory = (flags_and_length & 0x80) != 0;
-      entry.first_block = ReadLittleEndianU24(raw + 0x2F);
-      entry.block_count = ReadLittleEndianU24(raw + 0x2C);
-      entry.parent_index = ReadBigEndianU16(raw + 0x32);
-      entry.size = ReadBigEndianU32(raw + 0x34);
       entries_.push_back(std::move(entry));
     }
-    if (block_index + 1 < file_table_block_count_) {
+    if (!table_ended && block_index + 1 < file_table_block_count_) {
       uint32_t next = kEndOfChain;
       if (!ReadNextBlock(table_block, &next, error) || next == kEndOfChain) {
         if (error && error->empty()) {
@@ -484,15 +492,23 @@ bool StfsReader::CopyFile(const StfsEntry& entry, std::ostream& output,
     }
     return false;
   }
+  const uint64_t required_blocks = entry.size / kBlockSize + (entry.size % kBlockSize != 0);
+  if (required_blocks > entry.block_count || entry.block_count > metadata_.total_blocks) {
+    if (error) {
+      *error = "A file in this package is incomplete.";
+    }
+    return false;
+  }
   uint64_t remaining = entry.size;
   uint32_t block = entry.first_block;
   uint64_t copied = 0;
   uint64_t reported = 0;
+  uint32_t traversed_blocks = 0;
   std::set<uint32_t> visited;
   std::array<uint8_t, kBlockSize> bytes{};
   while (remaining) {
     if (block == kEndOfChain || block >= metadata_.total_blocks ||
-        !visited.insert(block).second || copied / kBlockSize >= entry.block_count) {
+        !visited.insert(block).second || traversed_blocks >= entry.block_count) {
       if (error) {
         *error = "A file in this package is incomplete.";
       }
@@ -513,6 +529,7 @@ bool StfsReader::CopyFile(const StfsEntry& entry, std::ostream& output,
     }
     remaining -= count;
     copied += count;
+    ++traversed_blocks;
     uint32_t next = kEndOfChain;
     if (!ReadNextBlock(block, &next, error)) {
       return false;
@@ -529,7 +546,26 @@ bool StfsReader::CopyFile(const StfsEntry& entry, std::ostream& output,
       }
     }
   }
-  if (copied / kBlockSize + (copied % kBlockSize != 0) != entry.block_count) {
+
+  if (traversed_blocks != required_blocks) {
+    if (error) {
+      *error = "A file in this package is incomplete.";
+    }
+    return false;
+  }
+  while (traversed_blocks < entry.block_count) {
+    if (block == kEndOfChain || block >= metadata_.total_blocks || !visited.insert(block).second) {
+      if (error) {
+        *error = "A file in this package is incomplete.";
+      }
+      return false;
+    }
+    ++traversed_blocks;
+    uint32_t next = kEndOfChain;
+    if (!ReadNextBlock(block, &next, error)) return false;
+    block = next;
+  }
+  if (block != kEndOfChain) {
     if (error) {
       *error = "A file in this package is incomplete.";
     }
@@ -538,7 +574,7 @@ bool StfsReader::CopyFile(const StfsEntry& entry, std::ostream& output,
   return true;
 }
 
-bool DecodeWwe2k14TitleId(const std::filesystem::path& executable, uint32_t* title_id) {
+bool DecodeXexTitleId(const std::filesystem::path& executable, uint32_t* title_id) {
   std::error_code filesystem_error;
   const uint64_t size = std::filesystem::file_size(executable, filesystem_error);
   if (filesystem_error || size < 0x18) {
@@ -594,6 +630,10 @@ bool DecodeWwe2k14TitleId(const std::filesystem::path& executable, uint32_t* tit
   }
   *title_id = ReadBigEndianU32(title.data());
   return true;
+}
+
+bool DecodeWwe2k14TitleId(const std::filesystem::path& executable, uint32_t* title_id) {
+  return DecodeXexTitleId(executable, title_id);
 }
 
 }  // namespace wwe2k14::launcher::internal

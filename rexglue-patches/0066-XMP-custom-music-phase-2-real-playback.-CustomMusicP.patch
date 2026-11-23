@@ -1,7 +1,7 @@
 From a740beef391b930104e5fba20b85d4bbe86def44 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 02:08:11 -0700
-Subject: [PATCH 66/97] XMP custom music phase 2: real playback.
+Subject: [PATCH 066/149] XMP custom music phase 2: real playback.
  CustomMusicPlayer decodes mp3/flac/wav/ogg (vendored dr_libs + stb_vorbis,
  public domain/MIT-0) on a worker thread, resamples to the 48 kHz device rate
  and mixes into the SDL output; 0x7003B name-first play, 0x7000E song info,
@@ -37,7 +37,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 thirdparty/decoders/stb_vorbis.c
 
 diff --git a/cmake/rexglue_install.cmake b/cmake/rexglue_install.cmake
-index dc03601..c38ac46 100644
+index dc03601a..c38ac46c 100644
 --- a/cmake/rexglue_install.cmake
 +++ b/cmake/rexglue_install.cmake
 @@ -19,6 +19,7 @@ set(REXGLUE_INSTALL_TARGETS
@@ -50,7 +50,7 @@ index dc03601..c38ac46 100644
      rexglue
 diff --git a/include/rex/audio/custom_music_player.h b/include/rex/audio/custom_music_player.h
 new file mode 100644
-index 0000000..5e4b0e5
+index 00000000..5e4b0e5c
 --- /dev/null
 +++ b/include/rex/audio/custom_music_player.h
 @@ -0,0 +1,131 @@
@@ -186,7 +186,7 @@ index 0000000..5e4b0e5
 +
 +}  // namespace rex::audio
 diff --git a/include/rex/audio/sdl/sdl_audio_driver.h b/include/rex/audio/sdl/sdl_audio_driver.h
-index f8949ca..b79e5bc 100644
+index f8949cae..b79e5bc6 100644
 --- a/include/rex/audio/sdl/sdl_audio_driver.h
 +++ b/include/rex/audio/sdl/sdl_audio_driver.h
 @@ -31,6 +31,11 @@ class SDLAudioDriver : public AudioDriver {
@@ -202,7 +202,7 @@ index f8949ca..b79e5bc 100644
    static void SDLCallback(void* userdata, SDL_AudioStream* stream, int additional_amount,
                            int total_amount);
 diff --git a/include/rex/kernel/xam/apps/xmp_app.h b/include/rex/kernel/xam/apps/xmp_app.h
-index 7fc63a6..921ae8d 100644
+index 7fc63a6a..921ae8d8 100644
 --- a/include/rex/kernel/xam/apps/xmp_app.h
 +++ b/include/rex/kernel/xam/apps/xmp_app.h
 @@ -76,6 +76,14 @@ class XmpApp : public system::xam::App {
@@ -259,7 +259,7 @@ index 7fc63a6..921ae8d 100644
    rex::thread::global_critical_region global_critical_region_;
    std::unordered_map<uint32_t, Playlist*> playlists_;
 diff --git a/src/audio/CMakeLists.txt b/src/audio/CMakeLists.txt
-index 0d4f9a4..1c442fe 100644
+index 0d4f9a48..1c442fe3 100644
 --- a/src/audio/CMakeLists.txt
 +++ b/src/audio/CMakeLists.txt
 @@ -5,6 +5,7 @@ add_library(rexaudio STATIC
@@ -279,7 +279,7 @@ index 0d4f9a4..1c442fe 100644
  )
 diff --git a/src/audio/custom_music_player.cpp b/src/audio/custom_music_player.cpp
 new file mode 100644
-index 0000000..74e4da4
+index 00000000..74e4da44
 --- /dev/null
 +++ b/src/audio/custom_music_player.cpp
 @@ -0,0 +1,455 @@
@@ -739,7 +739,7 @@ index 0000000..74e4da4
 +
 +}  // namespace rex::audio
 diff --git a/src/audio/sdl/sdl_audio_driver.cpp b/src/audio/sdl/sdl_audio_driver.cpp
-index 46719f3..d2c9d05 100644
+index 46719f3a..d2c9d050 100644
 --- a/src/audio/sdl/sdl_audio_driver.cpp
 +++ b/src/audio/sdl/sdl_audio_driver.cpp
 @@ -15,6 +15,7 @@
@@ -784,7 +784,7 @@ index 46719f3..d2c9d05 100644
          REXAPU_ERROR("SDL_PutAudioStreamData() failed: {}", SDL_GetError());
          driver->frames_unused_.push(buffer);
 diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
-index 0d3338a..d150c18 100644
+index 0d3338a7..d150c18b 100644
 --- a/src/kernel/xam/apps/xmp_app.cpp
 +++ b/src/kernel/xam/apps/xmp_app.cpp
 @@ -10,17 +10,21 @@
@@ -964,7 +964,7 @@ index 0d3338a..d150c18 100644
        }
        auto& song = active_playlist_->songs[active_song_index_];
 diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
-index 04b2c94..755ca33 100644
+index 04b2c941..755ca331 100644
 --- a/thirdparty/CMakeLists.txt
 +++ b/thirdparty/CMakeLists.txt
 @@ -89,6 +89,21 @@ target_include_directories(simde INTERFACE
@@ -991,7 +991,7 @@ index 04b2c94..755ca33 100644
  #=============================================================================
 diff --git a/thirdparty/decoders/README.md b/thirdparty/decoders/README.md
 new file mode 100644
-index 0000000..bbf6434
+index 00000000..bbf6434d
 --- /dev/null
 +++ b/thirdparty/decoders/README.md
 @@ -0,0 +1,23 @@
@@ -1020,7 +1020,7 @@ index 0000000..bbf6434
 +`v0.7.4 - TBD` / `v0.13.4 - TBD` / `v0.14.6 - TBD`, and stb_vorbis.c says `v1.22`.
 diff --git a/thirdparty/decoders/decoder_impl.cpp b/thirdparty/decoders/decoder_impl.cpp
 new file mode 100644
-index 0000000..0ef8f74
+index 00000000..0ef8f74d
 --- /dev/null
 +++ b/thirdparty/decoders/decoder_impl.cpp
 @@ -0,0 +1,20 @@
@@ -1046,7 +1046,7 @@ index 0000000..0ef8f74
 +#include "stb_vorbis.c"
 diff --git a/thirdparty/decoders/dr_flac.h b/thirdparty/decoders/dr_flac.h
 new file mode 100644
-index 0000000..051f37c
+index 00000000..051f37c6
 --- /dev/null
 +++ b/thirdparty/decoders/dr_flac.h
 @@ -0,0 +1,12760 @@
@@ -13812,7 +13812,7 @@ index 0000000..051f37c
 +*/
 diff --git a/thirdparty/decoders/dr_mp3.h b/thirdparty/decoders/dr_mp3.h
 new file mode 100644
-index 0000000..a631ae4
+index 00000000..a631ae40
 --- /dev/null
 +++ b/thirdparty/decoders/dr_mp3.h
 @@ -0,0 +1,5430 @@
@@ -19248,7 +19248,7 @@ index 0000000..a631ae4
 +*/
 diff --git a/thirdparty/decoders/dr_wav.h b/thirdparty/decoders/dr_wav.h
 new file mode 100644
-index 0000000..bfe8426
+index 00000000..bfe84268
 --- /dev/null
 +++ b/thirdparty/decoders/dr_wav.h
 @@ -0,0 +1,9209 @@
@@ -28463,7 +28463,7 @@ index 0000000..bfe8426
 +*/
 diff --git a/thirdparty/decoders/stb_vorbis.c b/thirdparty/decoders/stb_vorbis.c
 new file mode 100644
-index 0000000..3e5c250
+index 00000000..3e5c2504
 --- /dev/null
 +++ b/thirdparty/decoders/stb_vorbis.c
 @@ -0,0 +1,5584 @@

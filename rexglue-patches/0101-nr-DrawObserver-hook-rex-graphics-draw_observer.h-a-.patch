@@ -1,0 +1,147 @@
+From 570dcfbdbb97b4ac5332c262b789b99aa85020cb Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 11:29:13 -0700
+Subject: [PATCH 101/149] nr: DrawObserver hook (rex/graphics/draw_observer.h)
+ - a registered observer sees every executed draw packet (register file,
+ analysed shaders, index info, memory) before IssueDraw; nothing registered by
+ default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 3ff217e2631645497ce124fb0aa9d6afb919f6df)
+---
+ include/rex/graphics/command_processor.h |  2 +-
+ include/rex/graphics/draw_observer.h     | 46 ++++++++++++++++++++++++
+ src/graphics/command_processor.cpp       | 37 ++++++++++++++++---
+ 3 files changed, 80 insertions(+), 5 deletions(-)
+ create mode 100644 include/rex/graphics/draw_observer.h
+
+diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
+index f4ac408d..11ec9e48 100644
+--- a/include/rex/graphics/command_processor.h
++++ b/include/rex/graphics/command_processor.h
+@@ -234,7 +234,7 @@ class CommandProcessor {
+   virtual bool ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* reader, uint32_t packet,
+                                                   uint32_t count);
+   // draw_state_dump evidence writer (off unless the cvar is set).
+-  void DumpDrawState(uint32_t draw_initiator, const IndexBufferInfo* index_info);
++  void DumpDrawState(uint32_t ordinal, uint32_t draw_initiator, const IndexBufferInfo* index_info);
+   bool ExecutePacketType3Draw(memory::RingBuffer* reader, uint32_t packet, const char* opcode_name,
+                               uint32_t viz_query_condition, uint32_t count_remaining);
+   bool ExecutePacketType3_DRAW_INDX(memory::RingBuffer* reader, uint32_t packet, uint32_t count);
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+new file mode 100644
+index 00000000..738593e6
+--- /dev/null
++++ b/include/rex/graphics/draw_observer.h
+@@ -0,0 +1,46 @@
++// Native-renderer draw observer (WWE '13 nr branch).
++//
++// A registered observer sees every draw packet the command processor executes (after
++// predication, resolves included), with the full register file, the analysed shaders and the
++// index buffer, BEFORE the backend's IssueDraw. It must not change GPU state. Nothing is
++// registered by default, so the emulated renderer behaves exactly as before.
++
++#pragma once
++
++#include <cstdint>
++
++namespace rex::memory {
++class Memory;
++}
++
++namespace rex::graphics {
++
++class RegisterFile;
++class Shader;
++
++struct ObservedDraw {
++  // Zero-based count of draw packets that reached the draw handler since process start - the
++  // same numbering as --draw_state_dump.
++  uint32_t ordinal;
++  uint32_t draw_initiator;  // VGT_DRAW_INITIATOR
++  bool indexed;
++  uint32_t index_guest_base;
++  uint32_t index_length_bytes;
++  uint32_t index_endianness;  // xenos::Endian
++  const RegisterFile* regs;
++  Shader* vertex_shader;  // ucode analysed (texture_bindings / vertex_bindings valid); may be null
++  Shader* pixel_shader;   // may be null
++  memory::Memory* memory;
++};
++
++class DrawObserver {
++ public:
++  virtual ~DrawObserver() = default;
++  virtual void OnDraw(const ObservedDraw& draw) = 0;
++};
++
++// Not thread-safe to change while the GPU thread runs; set before the title or replay starts.
++void SetDrawObserver(DrawObserver* observer);
++DrawObserver* GetDrawObserver();
++
++}  // namespace rex::graphics
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index bbd4a157..85519df0 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -29,6 +29,7 @@
+ #include <rex/perf/counter.h>
+ #include <rex/chrono/clock.h>
+ #include <rex/graphics/command_processor.h>
++#include <rex/graphics/draw_observer.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/graphics_system.h>
+ #include <rex/diagnostics/rate_census.h>
+@@ -1692,9 +1693,14 @@ bool CommandProcessor::ExecutePacketType3_EVENT_WRITE_ZPD(memory::RingBuffer* re
+ //   u32 register_count, u32 registers[register_count],
+ //   u32 vs_dwords, u64 vs_hash, u32 vs_ucode[vs_dwords] (host order),
+ //   u32 ps_dwords, u64 ps_hash, u32 ps_ucode[ps_dwords]
+-void CommandProcessor::DumpDrawState(uint32_t draw_initiator, const IndexBufferInfo* index_info) {
+-  static std::atomic<uint32_t> ordinal_counter{0};
+-  const uint32_t ordinal = ordinal_counter.fetch_add(1, std::memory_order_relaxed);
++namespace {
++DrawObserver* g_draw_observer = nullptr;
++}  // namespace
++void SetDrawObserver(DrawObserver* observer) { g_draw_observer = observer; }
++DrawObserver* GetDrawObserver() { return g_draw_observer; }
++
++void CommandProcessor::DumpDrawState(uint32_t ordinal, uint32_t draw_initiator,
++                                     const IndexBufferInfo* index_info) {
+   const std::string& spec = REXCVAR_GET(draw_state_dump);
+   if (spec.empty()) {
+     return;
+@@ -1872,7 +1878,30 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   // we don't support yet.
+   reader->AdvanceRead(count_remaining * sizeof(uint32_t));
+ 
+-  DumpDrawState(vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr);
++  {
++    static std::atomic<uint32_t> draw_ordinal{0};
++    const uint32_t ordinal = draw_ordinal.fetch_add(1, std::memory_order_relaxed);
++    DumpDrawState(ordinal, vgt_draw_initiator.value, is_indexed ? &index_buffer_info : nullptr);
++    if (DrawObserver* observer = g_draw_observer) {
++      string::StringBuffer disasm;
++      Shader* vs = active_vertex_shader();
++      Shader* ps = active_pixel_shader();
++      if (vs && !vs->is_ucode_analyzed()) vs->AnalyzeUcode(disasm);
++      if (ps && !ps->is_ucode_analyzed()) ps->AnalyzeUcode(disasm);
++      ObservedDraw draw{};
++      draw.ordinal = ordinal;
++      draw.draw_initiator = vgt_draw_initiator.value;
++      draw.indexed = is_indexed;
++      draw.index_guest_base = is_indexed ? index_buffer_info.guest_base : 0;
++      draw.index_length_bytes = is_indexed ? index_buffer_info.length : 0;
++      draw.index_endianness = is_indexed ? uint32_t(index_buffer_info.endianness) : 0;
++      draw.regs = register_file_;
++      draw.vertex_shader = vs;
++      draw.pixel_shader = ps;
++      draw.memory = memory_;
++      observer->OnDraw(draw);
++    }
++  }
+ 
+   if (draw_succeeded) {
+     auto viz_query = register_file_->Get<reg::PA_SC_VIZ_QUERY>();
+-- 
+2.43.0
+

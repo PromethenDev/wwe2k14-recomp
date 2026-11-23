@@ -1,7 +1,7 @@
 From 40e770132a7b987088a919b3f3ec329b85ea4c73 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 12:48:58 -0700
-Subject: [PATCH 01/97] codegen: WWE13 function/vtable scanner and builder
+Subject: [PATCH 001/149] codegen: WWE13 function/vtable scanner and builder
  fixes
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  9 files changed, 371 insertions(+), 41 deletions(-)
 
 diff --git a/include/rex/codegen/function_types.h b/include/rex/codegen/function_types.h
-index ef36b6a..f292eee 100644
+index ef36b6a5..f292eee4 100644
 --- a/include/rex/codegen/function_types.h
 +++ b/include/rex/codegen/function_types.h
 @@ -238,6 +238,12 @@ struct JumpTable {
@@ -35,7 +35,7 @@ index ef36b6a..f292eee 100644
  };
  
 diff --git a/include/rex/codegen/vtable_scanner.h b/include/rex/codegen/vtable_scanner.h
-index cb449e6..109e236 100644
+index cb449e61..109e2361 100644
 --- a/include/rex/codegen/vtable_scanner.h
 +++ b/include/rex/codegen/vtable_scanner.h
 @@ -68,8 +68,13 @@ class VTableScanner {
@@ -55,7 +55,7 @@ index cb449e6..109e236 100644
    // Read all function slots from a vtable (until non-executable address)
    std::vector<uint32_t> readVTableSlots(uint32_t vtableStart);
 diff --git a/src/codegen/builders.h b/src/codegen/builders.h
-index 24894f2..efbcaa8 100644
+index 24894f2e..efbcaa8f 100644
 --- a/src/codegen/builders.h
 +++ b/src/codegen/builders.h
 @@ -58,6 +58,7 @@ bool build_divw(BuilderContext& ctx);
@@ -67,7 +67,7 @@ index 24894f2..efbcaa8 100644
  bool build_mulhdu(BuilderContext& ctx);
  bool build_mulhw(BuilderContext& ctx);
 diff --git a/src/codegen/builders/arithmetic.cpp b/src/codegen/builders/arithmetic.cpp
-index 3908bdf..30f675e 100644
+index 3908bdf9..30f675e7 100644
 --- a/src/codegen/builders/arithmetic.cpp
 +++ b/src/codegen/builders/arithmetic.cpp
 @@ -157,6 +157,24 @@ bool build_mulhw(BuilderContext& ctx) {
@@ -96,7 +96,7 @@ index 3908bdf..30f675e 100644
    ctx.println("\t{}.u64 = (uint64_t({}.u32) * uint64_t({}.u32)) >> 32;",
                ctx.r(ctx.insn.operands[0]), ctx.r(ctx.insn.operands[1]),
 diff --git a/src/codegen/builders/control_flow.cpp b/src/codegen/builders/control_flow.cpp
-index 5294cbc..bfefc23 100644
+index 5294cbc1..bfefc23f 100644
 --- a/src/codegen/builders/control_flow.cpp
 +++ b/src/codegen/builders/control_flow.cpp
 @@ -128,7 +128,9 @@ bool build_bctr(BuilderContext& ctx) {
@@ -111,7 +111,7 @@ index 5294cbc..bfefc23 100644
  
        // TODO(tomc): Figure out if this actually is triggered on real hardware and what would
 diff --git a/src/codegen/function_scanner.cpp b/src/codegen/function_scanner.cpp
-index 05fb6bf..58999ec 100644
+index 05fb6bf1..58999ecd 100644
 --- a/src/codegen/function_scanner.cpp
 +++ b/src/codegen/function_scanner.cpp
 @@ -235,6 +235,7 @@ struct BoundsInfo {
@@ -582,7 +582,7 @@ index 05fb6bf..58999ec 100644
      }
  
 diff --git a/src/codegen/instruction_dispatch.cpp b/src/codegen/instruction_dispatch.cpp
-index cdec5d2..3484c84 100644
+index cdec5d28..3484c84a 100644
 --- a/src/codegen/instruction_dispatch.cpp
 +++ b/src/codegen/instruction_dispatch.cpp
 @@ -43,6 +43,7 @@ static const std::unordered_map<int, Builder>& GetDispatchTable() {
@@ -594,7 +594,7 @@ index cdec5d2..3484c84 100644
        {PPC_INST_MULHWU, build_mulhwu},
        {PPC_INST_MULLD, build_mulld},
 diff --git a/src/codegen/vtable_scanner.cpp b/src/codegen/vtable_scanner.cpp
-index 25a3de4..9d53241 100644
+index 25a3de4f..9d53241d 100644
 --- a/src/codegen/vtable_scanner.cpp
 +++ b/src/codegen/vtable_scanner.cpp
 @@ -28,29 +28,36 @@ std::vector<VTableInfo> VTableScanner::scan() {
@@ -688,7 +688,7 @@ index 25a3de4..9d53241 100644
  
  std::vector<uint32_t> VTableScanner::readVTableSlots(uint32_t vtableStart) {
 diff --git a/thirdparty/disasm/ppc-dis.c b/thirdparty/disasm/ppc-dis.c
-index 3e224b4..dcbf105 100644
+index 3e224b46..dcbf1054 100644
 --- a/thirdparty/disasm/ppc-dis.c
 +++ b/thirdparty/disasm/ppc-dis.c
 @@ -5350,7 +5350,14 @@ powerpc_dialect(struct disassemble_info* info)

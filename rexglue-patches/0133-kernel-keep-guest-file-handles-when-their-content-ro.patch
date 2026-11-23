@@ -1,0 +1,400 @@
+From 996e61a15d2755e44727e971ecdb005fcc1c6374 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 09:38:39 -0800
+Subject: [PATCH 133/149] kernel: keep guest file handles when their content
+ root closes (card S5-2 endless loading)
+
+ContentManager::CloseOpenedFilesFromContent released the guest's still-open XFile handles when the
+game closed a content root (it closes its DLC roots while Wwise still streams sound\*.pck). The
+freed numbers were reused at once, so the guest's own later NtClose hit the next owner (Bink's
+mutex), and the number was then reused by DLC_01.pck: Bink waited on a file forever (black
+loading screen, GitHub #29/#72/#83/#84). New cvar WWE2K14_CONTENT_CLOSE_KEEP_FILES (default on)
+keeps the handles; every case is logged as [content-close].
+
+Diagnostics: freeze report lists each blocked thread's guest call chain and, for file waits, the
+path and the slot's previous owner + closer; [stale-handle] warns on waits on closed handles;
+optional WWE2K14_HANDLE_ROUND_ROBIN handle allocation (default off).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/diagnostics/freeze_logger.h    |  7 +++
+ include/rex/system/util/object_table.h     | 12 +++++
+ src/core/freeze_logger.cpp                 | 31 +++++++++++
+ src/kernel/xboxkrnl/xboxkrnl_threading.cpp | 60 ++++++++++++++++++++++
+ src/system/util/object_table.cpp           | 54 +++++++++++++++++++
+ src/system/xam/content_manager.cpp         | 16 +++++-
+ 6 files changed, 179 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/diagnostics/freeze_logger.h b/include/rex/diagnostics/freeze_logger.h
+index 4f7eeb15..398aa3b4 100644
+--- a/include/rex/diagnostics/freeze_logger.h
++++ b/include/rex/diagnostics/freeze_logger.h
+@@ -49,6 +49,13 @@ void RecordSyncEvent(SyncType type, uint32_t handle, uint32_t object_type, const
+ void RecordWaitBegin(uint32_t handle, uint32_t object_type, const char* name, uint64_t guest_lr);
+ void RecordWaitEnd(uint32_t handle);
+ 
++// Card S5-2 (endless loading, Windows): guest call chain (return addresses, innermost first) and an optional
++// detail (the file path when the object is a file) for the wait about to be recorded with RecordWaitBegin on
++// this thread, so a report names the game routine and file behind a wait that never ends. Call before
++// RecordWaitBegin.
++constexpr uint32_t kMaxWaitFrames = 8;
++void RecordWaitContext(const uint32_t* guest_lrs, uint32_t count, const char* detail);
++
+ // Registers the calling host thread as a guest thread slot (for the report) and
+ // unregisters it. Called from XThread's host trampoline.
+ void RegisterThread(uint32_t guest_thread_id, const char* name);
+diff --git a/include/rex/system/util/object_table.h b/include/rex/system/util/object_table.h
+index df9bad43..9149bc0c 100644
+--- a/include/rex/system/util/object_table.h
++++ b/include/rex/system/util/object_table.h
+@@ -78,6 +78,12 @@ class ObjectTable {
+   std::vector<object_ref<XObject>> GetAllObjects();
+   void PurgeAllObjects();  // Purges the object table of all guest objects
+ 
++  // Card S5-2: what a now-free handle last held (object type) and the guest LR of the call that closed it; false
++  // when the slot was never closed. Lets a wait on a stale handle name the closer.
++  // out_closer_lrs: kClosedFrames guest return addresses of the closing call (innermost first, 0 = none).
++  static constexpr uint32_t kClosedFrames = 4;
++  bool LastClosed(X_HANDLE handle, uint32_t* out_type, uint32_t* out_closer_lrs);
++
+  private:
+   struct ObjectTableEntry {
+     int handle_ref_count = 0;
+@@ -93,6 +99,7 @@ class ObjectTable {
+     return (handle - XObject::kHandleBase) >> 2;
+   }
+   X_STATUS FindFreeSlot(uint32_t* out_slot);
++  static void CloserStack(uint32_t* lrs);
+   bool Resize(uint32_t new_capacity);
+ 
+   rex::thread::global_critical_region global_critical_region_;
+@@ -100,6 +107,11 @@ class ObjectTable {
+   uint32_t table_capacity_ = 0;
+   ObjectTableEntry* table_ = nullptr;
+   uint32_t last_free_entry_ = 0;
++  struct ClosedSlot {
++    uint32_t type = 0;  // XObject::Type + 1 (0 = never closed)
++    uint32_t closer_lrs[kClosedFrames] = {};
++  };
++  std::vector<ClosedSlot> closed_;
+   std::unordered_map<string::string_key_case, X_HANDLE> name_table_;
+ };
+ 
+diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
+index 9ba1a537..c9e231a8 100644
+--- a/src/core/freeze_logger.cpp
++++ b/src/core/freeze_logger.cpp
+@@ -115,6 +115,9 @@ struct ThreadSlot {
+   std::atomic<uint32_t> wait_object_type{0};
+   std::atomic<uint64_t> wait_lr{0};
+   char wait_name[48] = {};
++  std::atomic<uint32_t> wait_frames{0};
++  std::atomic<uint32_t> wait_frame_lr[kMaxWaitFrames] = {};
++  char wait_detail[160] = {};
+   std::atomic<uint32_t> cap_depth{0};
+   std::atomic<uint64_t> cap_pc[kMaxCaptureDepth] = {};
+   // R9: leaf host PCs gathered by repeated capture signals at report time.
+@@ -642,6 +645,18 @@ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+                    ObjectTypeName(slot.wait_object_type.load(std::memory_order_relaxed)), wait_name,
+                    double(now_ns - wait_since) / 1e9,
+                    (unsigned long long)slot.wait_lr.load(std::memory_order_relaxed));
++      const uint32_t frames =
++          std::min<uint32_t>(slot.wait_frames.load(std::memory_order_relaxed), kMaxWaitFrames);
++      if (frames) {
++        std::fprintf(file, "  guest_stack:");
++        for (uint32_t f = 0; f < frames; ++f) {
++          std::fprintf(file, " 0x%08X", slot.wait_frame_lr[f].load(std::memory_order_relaxed));
++        }
++        std::fprintf(file, "\n");
++      }
++      char detail[sizeof(slot.wait_detail) + 1] = {};
++      std::memcpy(detail, slot.wait_detail, sizeof(slot.wait_detail));
++      if (detail[0]) std::fprintf(file, "  wait_detail: %s\n", detail);
+     } else {
+       std::fprintf(file, "  waiting_on: (not blocked in a kernel wait)\n");
+     }
+@@ -948,6 +963,22 @@ void RecordWaitBegin(uint32_t handle, uint32_t object_type, const char* name, ui
+   PushEvent(SyncType::kWaitBegin, handle, object_type, name);
+ }
+ 
++void RecordWaitContext(const uint32_t* guest_lrs, uint32_t count, const char* detail) {
++  if (!g_enabled.load(std::memory_order_relaxed)) return;
++  ThreadSlot* slot = t_slot;
++  if (!slot) return;
++  count = std::min<uint32_t>(count, kMaxWaitFrames);
++  for (uint32_t f = 0; f < count; ++f) {
++    slot->wait_frame_lr[f].store(guest_lrs[f], std::memory_order_relaxed);
++  }
++  slot->wait_frames.store(count, std::memory_order_relaxed);
++  if (detail && *detail) {
++    std::strncpy(slot->wait_detail, detail, sizeof(slot->wait_detail) - 1);
++  } else {
++    slot->wait_detail[0] = '\0';
++  }
++}
++
+ void RecordWaitEnd(uint32_t handle) {
+   if (!g_enabled.load(std::memory_order_relaxed)) return;
+   ThreadSlot* slot = t_slot;
+diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+index 375c641c..7203cc96 100644
+--- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
++++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
+@@ -33,6 +33,7 @@
+ #include <rex/system/user_module.h>
+ #include <rex/system/util/string_utils.h>
+ #include <rex/system/xevent.h>
++#include <rex/system/xfile.h>
+ #include <rex/system/xmutant.h>
+ #include <rex/system/xsemaphore.h>
+ #include <rex/system/xthread.h>
+@@ -68,6 +69,58 @@ uint64_t GuestLr() {
+   auto* state = rex::runtime::ThreadState::Get();
+   return state ? uint64_t(state->context()->lr) : 0;
+ }
++
++// Card S5-2: hands the freeze logger the guest call chain of this wait and, for a file object, its path. PPC back
++// chain: [sp] = caller's sp, the caller's saved LR sits at caller_sp - 8. The walk stays inside the thread's stack
++// (PCR stack_end_ptr..stack_base_ptr), so a bad chain ends the walk instead of touching unmapped memory.
++uint32_t GuestStack(uint32_t* lrs, uint32_t max_frames) {
++  auto* state = rex::runtime::ThreadState::Get();
++  if (!state) return 0;
++  auto* memory = REX_KERNEL_MEMORY();
++  auto* pcr = memory->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(state->context()->r13.u64));
++  const uint32_t stack_low = pcr ? uint32_t(pcr->stack_end_ptr) : 0;
++  const uint32_t stack_high = pcr ? uint32_t(pcr->stack_base_ptr) : 0;
++  uint32_t count = 0;
++  uint32_t sp = state->context()->r1.u32;
++  while (count < max_frames && stack_low && sp >= stack_low && sp + 4 <= stack_high) {
++    const uint32_t caller_sp = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(sp));
++    if (caller_sp <= sp || caller_sp > stack_high || caller_sp - 8 < stack_low) break;
++    lrs[count++] = memory::load_and_swap<uint32_t>(memory->TranslateVirtual(caller_sp - 8));
++    sp = caller_sp;
++  }
++  return count;
++}
++
++void RecordWaitContext(XObject* object) {
++  if (!freeze_logger::IsEnabled() || !object) return;
++  uint32_t lrs[freeze_logger::kMaxWaitFrames];
++  const uint32_t count = GuestStack(lrs, freeze_logger::kMaxWaitFrames);
++  std::string path;
++  if (object->type() == XObject::Type::File) {
++    path = static_cast<XFile*>(object)->path();
++    uint32_t type = 0, closer[rex::system::util::ObjectTable::kClosedFrames] = {};
++    if (REX_KERNEL_OBJECTS()->LastClosed(object->handle(), &type, closer)) {
++      path += fmt::format(" | number last held type {} closed by {:08X} {:08X} {:08X} {:08X}", type, closer[0],
++                          closer[1], closer[2], closer[3]);
++    }
++  }
++  freeze_logger::RecordWaitContext(lrs, count, path.c_str());
++}
++
++// Card S5-2: a guest wait on a handle that is no longer open. Logs what the handle last held and the guest LR that
++// closed it (at most 32 lines per session), so a stale handle in game code is visible in player logs.
++void NoteStaleWait(uint32_t handle) {
++  static std::atomic<uint32_t> notes{0};
++  if (handle < XObject::kHandleBase || notes.fetch_add(1, std::memory_order_relaxed) >= 32) return;
++  uint32_t type = 0, closer[rex::system::util::ObjectTable::kClosedFrames] = {};
++  const bool closed = REX_KERNEL_OBJECTS()->LastClosed(handle, &type, closer);
++  uint32_t lrs[6] = {};
++  const uint32_t n = GuestStack(lrs, 6);
++  REXLOG_WARN("[stale-handle] wait on closed handle 0x{:08X} (last held type {}, closed by 0x{:08X} 0x{:08X} 0x{:08X} "
++              "0x{:08X}) waiter lr 0x{:08X} stack 0x{:08X} 0x{:08X} 0x{:08X} 0x{:08X} (frames {})",
++              handle, closed ? int(type) : -1, closer[0], closer[1], closer[2], closer[3], uint32_t(GuestLr()),
++              lrs[0], lrs[1], lrs[2], lrs[3], n);
++}
+ }  // namespace
+ 
+ // r13 + 0x100: pointer to thread local state
+@@ -888,6 +941,7 @@ uint32_t xeKeWaitForSingleObject(void* object_ptr, uint32_t wait_reason, uint32_
+     return X_STATUS_ABANDONED_WAIT_0;
+   }
+ 
++  RecordWaitContext(object.get());
+   freeze_logger::RecordWaitBegin(object->handle(), (uint32_t)object->type(),
+                                  object->name().c_str(), GuestLr());
+   X_STATUS result = object->Wait(wait_reason, processor_mode, alertable, timeout_ptr);
+@@ -922,6 +976,7 @@ ppc_u32_result_t NtWaitForSingleObjectEx_entry(ppc_u32_t object_handle, ppc_u32_
+   auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+   if (object) {
+     uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
++    RecordWaitContext(object.get());
+     freeze_logger::RecordWaitBegin((uint32_t)object_handle, (uint32_t)object->type(),
+                                    object->name().c_str(), GuestLr());
+     if (EvtTraceEnabled()) {
+@@ -938,6 +993,7 @@ ppc_u32_result_t NtWaitForSingleObjectEx_entry(ppc_u32_t object_handle, ppc_u32_
+       XThread::GetCurrentThread()->DeliverAPCs();
+     }
+   } else {
++    NoteStaleWait((uint32_t)object_handle);
+     result = X_STATUS_INVALID_HANDLE;
+   }
+ 
+@@ -964,6 +1020,7 @@ ppc_u32_result_t KeWaitForMultipleObjects_entry(ppc_u32_t count, ppc_pu32_t obje
+ 
+   uint64_t timeout = timeout_ptr ? static_cast<uint64_t>(*timeout_ptr) : 0u;
+   const uint32_t first_handle = objects.empty() ? 0 : objects[0]->handle();
++  RecordWaitContext(objects.empty() ? nullptr : objects[0].get());
+   freeze_logger::RecordWaitBegin(first_handle,
+                                  objects.empty() ? 0 : (uint32_t)objects[0]->type(),
+                                  objects.empty() ? "" : objects[0]->name().c_str(), GuestLr());
+@@ -987,12 +1044,14 @@ uint32_t xeNtWaitForMultipleObjectsEx(uint32_t count, rex::be<uint32_t>* handles
+     uint32_t object_handle = handles[n];
+     auto object = REX_KERNEL_OBJECTS()->LookupObject<XObject>(object_handle);
+     if (!object) {
++      NoteStaleWait(object_handle);
+       return X_STATUS_INVALID_PARAMETER;
+     }
+     objects.push_back(std::move(object));
+   }
+ 
+   const uint32_t first_handle = objects.empty() ? 0 : objects[0]->handle();
++  RecordWaitContext(objects.empty() ? nullptr : objects[0].get());
+   freeze_logger::RecordWaitBegin(first_handle,
+                                  objects.empty() ? 0 : (uint32_t)objects[0]->type(),
+                                  objects.empty() ? "" : objects[0]->name().c_str(), GuestLr());
+@@ -1025,6 +1084,7 @@ ppc_u32_result_t NtSignalAndWaitForSingleObjectEx_entry(ppc_u32_t signal_handle,
+     freeze_logger::RecordSyncEvent(freeze_logger::SyncType::kEventSet, signal_handle,
+                                    (uint32_t)signal_object->type(),
+                                    signal_object->name().c_str());
++    RecordWaitContext(wait_object.get());
+     freeze_logger::RecordWaitBegin(wait_handle, (uint32_t)wait_object->type(),
+                                    wait_object->name().c_str(), GuestLr());
+     result = XObject::SignalAndWait(signal_object.get(), wait_object.get(), 3, 1, alertable,
+diff --git a/src/system/util/object_table.cpp b/src/system/util/object_table.cpp
+index 3af117e4..b66cea94 100644
+--- a/src/system/util/object_table.cpp
++++ b/src/system/util/object_table.cpp
+@@ -12,12 +12,24 @@
+ #include <algorithm>
+ #include <cstring>
+ 
++#include <rex/cvar.h>
+ #include <rex/logging.h>
++#include <rex/memory.h>
+ #include <rex/stream.h>
+ #include <rex/system/util/object_table.h>
+ #include <rex/system/xobject.h>
++#include <rex/system/kernel_state.h>
++#include <rex/system/thread_state.h>
+ #include <rex/system/xthread.h>
+ 
++// Card S5-2 (endless loading on Windows, GitHub #29/#72/#83/#84): the free-slot scan restarted at slot 0, so a closed
++// handle number was handed to the very next new object. A game that still waits on a handle it closed then waited on
++// an unrelated object - in the s52w-3 freeze report the audio lock's mutex handle 0xF8000770 had become the file
++// sound\DLC_01.pck, which never signals. Round-robin allocation reuses a number only after the whole table has
++// cycled, so a stale handle stays invalid (the wait fails at once) instead of aliasing a new object.
++REXCVAR_DEFINE_BOOL(WWE2K14_HANDLE_ROUND_ROBIN, false, "Kernel",
++                    "Allocate guest handles round-robin so closed handle numbers are not reused at once");
++
+ namespace rex::system::util {
+ 
+ ObjectTable::ObjectTable() {}
+@@ -108,6 +120,9 @@ X_STATUS ObjectTable::AddHandle(XObject* object, X_HANDLE* out_handle) {
+ 
+     // Stash.
+     if (XSUCCEEDED(result)) {
++      if (REXCVAR_GET(WWE2K14_HANDLE_ROUND_ROBIN)) {
++        last_free_entry_ = slot + 1 < table_capacity_ ? slot + 1 : 1;
++      }
+       ObjectTableEntry& entry = table_[slot];
+       entry.object = object;
+       entry.handle_ref_count = 1;
+@@ -192,6 +207,14 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
+   if (entry->object) {
+     auto object = entry->object;
+     entry->object = nullptr;
++    const uint32_t slot = GetHandleSlot(handle);
++    if (closed_.size() < table_capacity_) closed_.resize(table_capacity_);
++    if (slot < closed_.size()) {
++      ClosedSlot& closed = closed_[slot];
++      closed = {};
++      closed.type = uint32_t(object->type()) + 1;
++      CloserStack(closed.closer_lrs);
++    }
+     assert_zero(entry->handle_ref_count);
+     entry->handle_ref_count = 0;
+ 
+@@ -214,6 +237,37 @@ X_STATUS ObjectTable::RemoveHandle(X_HANDLE handle) {
+   return X_STATUS_SUCCESS;
+ }
+ 
++// Guest LR of the closing call plus the next back-chain return addresses (PPC: [sp] = caller sp, saved LR at
++// caller_sp - 8), kept inside the thread's stack bounds from its PCR. Host threads record nothing.
++void ObjectTable::CloserStack(uint32_t* lrs) {
++  auto* state = rex::runtime::ThreadState::Get();
++  if (!state) return;
++  auto* context = state->context();
++  lrs[0] = uint32_t(context->lr);
++  auto* memory = context->kernel_state ? context->kernel_state->memory() : nullptr;
++  if (!memory) return;
++  auto* pcr = memory->TranslateVirtual<X_KPCR*>(static_cast<uint32_t>(context->r13.u64));
++  const uint32_t low = pcr ? uint32_t(pcr->stack_end_ptr) : 0, high = pcr ? uint32_t(pcr->stack_base_ptr) : 0;
++  uint32_t sp = context->r1.u32;
++  for (uint32_t n = 1; n < kClosedFrames && low && sp >= low && sp + 4 <= high; ++n) {
++    const uint32_t caller_sp = rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(sp));
++    if (caller_sp <= sp || caller_sp > high || caller_sp - 8 < low) break;
++    lrs[n] = rex::memory::load_and_swap<uint32_t>(memory->TranslateVirtual(caller_sp - 8));
++    sp = caller_sp;
++  }
++}
++
++bool ObjectTable::LastClosed(X_HANDLE handle, uint32_t* out_type, uint32_t* out_closer_lrs) {
++  auto global_lock = global_critical_region_.Acquire();
++  handle = TranslateHandle(handle);
++  if (handle < XObject::kHandleBase) return false;
++  const uint32_t slot = GetHandleSlot(handle);
++  if (slot >= closed_.size() || !closed_[slot].type) return false;
++  *out_type = closed_[slot].type - 1;
++  std::memcpy(out_closer_lrs, closed_[slot].closer_lrs, sizeof(closed_[slot].closer_lrs));
++  return true;
++}
++
+ std::vector<object_ref<XObject>> ObjectTable::GetAllObjects() {
+   auto lock = global_critical_region_.Acquire();
+   std::vector<object_ref<XObject>> results;
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index 50c7d6bc..3111a625 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -16,6 +16,7 @@
+ 
+ #include <fmt/format.h>
+ 
++#include <rex/cvar.h>
+ #include <rex/filesystem.h>
+ #include <rex/filesystem/devices/host_path_device.h>
+ #include <rex/string.h>
+@@ -33,6 +34,11 @@ bool PathExists(const std::filesystem::path& path) {
+ }
+ }  // namespace
+ 
++// Card S5-2: default ON - s52k-off showed the game closing its DLC roots while Wwise still streams their sound\*.pck
++// files; releasing those guest handles is what let a later guest NtClose hit a reused handle number.
++REXCVAR_DEFINE_BOOL(WWE2K14_CONTENT_CLOSE_KEEP_FILES, true, "Kernel",
++                    "Keep guest file handles open when their content root is closed (card S5-2)");
++
+ namespace rex {
+ namespace system {
+ namespace xam {
+@@ -438,7 +444,15 @@ void ContentManager::CloseOpenedFilesFromContent(const std::string_view root_nam
+     bool is_file_inside_content = rex::string::utf8_starts_with(file_path, resolved_path);
+ 
+     if (is_file_inside_content) {
+-      file->ReleaseHandle();
++      // Card S5-2 (endless loading, GitHub #29/#72/#83/#84): releasing here frees a handle the guest still owns.
++      // When the guest later closes "its" file, the number may already belong to a new object (s52w-3: Bink's
++      // mutex), which is then closed under the guest and the number reused again (sound\DLC_01.pck) -> the Bink
++      // lock waits on a file forever. WWE2K14_CONTENT_CLOSE_KEEP_FILES=1 keeps the guest's handles (the guest
++      // closes them itself); either way the release is logged.
++      const bool keep = REXCVAR_GET(WWE2K14_CONTENT_CLOSE_KEEP_FILES);
++      REXSYS_WARN("[content-close] root {} {} guest file handle 0x{:08X} {}", root_name,
++                  keep ? "keeps" : "releases", file->handle(), file_path);
++      if (!keep) file->ReleaseHandle();
+     }
+   }
+ }
+-- 
+2.43.0
+

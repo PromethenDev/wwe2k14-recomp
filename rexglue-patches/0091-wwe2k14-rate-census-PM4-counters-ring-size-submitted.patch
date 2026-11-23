@@ -1,7 +1,7 @@
 From 040fc8100d98f818c196688d9c8d9f86f1532aa8 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 3 Oct 2026 13:32:14 -0700
-Subject: [PATCH 91/97] wwe2k14: rate-census PM4 counters (ring size,
+Subject: [PATCH 091/149] wwe2k14: rate-census PM4 counters (ring size,
  submitted/read-advance dwords/s, CP execute-thread busy %); census-only
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -11,7 +11,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 60 insertions(+)
 
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index 3a47a8f..12175c1 100644
+index 3a47a8f7..12175c12 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -325,6 +325,9 @@ class CommandProcessor {
@@ -25,7 +25,7 @@ index 3a47a8f..12175c1 100644
    std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
    std::atomic<uint32_t> write_ptr_index_;
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 765cd23..22ab518 100644
+index 765cd23c..22ab5188 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -18,6 +18,10 @@

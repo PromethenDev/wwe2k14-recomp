@@ -1,7 +1,7 @@
 From 55bb7dfb117ebfb35b8e538be75c040ef95fba98 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 3 Oct 2026 07:31:46 -0700
-Subject: [PATCH 89/97] wwe2k14: [xma-stats] opt-in (REX_XMA_STATS=1); opt-in
+Subject: [PATCH 089/149] wwe2k14: [xma-stats] opt-in (REX_XMA_STATS=1); opt-in
  --cp_read_pointer_writeback_per_block experiment (default off, no measured
  effect)
 
@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 86 insertions(+), 14 deletions(-)
 
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index ebe0695..3a47a8f 100644
+index ebe0695b..3a47a8f7 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -207,6 +207,7 @@ class CommandProcessor {
@@ -36,7 +36,7 @@ index ebe0695..3a47a8f 100644
    std::unique_ptr<rex::thread::Event> write_ptr_index_event_;
    std::atomic<uint32_t> write_ptr_index_;
 diff --git a/src/audio/xma_context.cpp b/src/audio/xma_context.cpp
-index 7214d26..dd19a5c 100644
+index 7214d26d..dd19a5cb 100644
 --- a/src/audio/xma_context.cpp
 +++ b/src/audio/xma_context.cpp
 @@ -12,6 +12,7 @@
@@ -118,7 +118,7 @@ index 7214d26..dd19a5c 100644
  
      if (!data.IsAnyInputBufferValid() || data.error_status == 4) {
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 0fdb7bc..765cd23 100644
+index 0fdb7bc5..765cd23c 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -42,6 +42,9 @@

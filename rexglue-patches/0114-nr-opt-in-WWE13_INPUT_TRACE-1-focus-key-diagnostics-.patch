@@ -1,0 +1,207 @@
+From 9a256ea74f97d21fd43ee7bcc281ed7fe52c795e Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Thu, 8 Oct 2026 17:03:06 -0700
+Subject: [PATCH 114/149] nr: opt-in WWE13_INPUT_TRACE=1 focus/key diagnostics
+ (MnK driver + Win32 WndProc)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit f9e7a82ee7ada9490ed6056e197c46769463e96e)
+---
+ src/input/mnk/mnk_input_driver.cpp | 67 ++++++++++++++++++++++++++++++
+ src/ui/window_win.cpp              | 39 +++++++++++++++++
+ 2 files changed, 106 insertions(+)
+
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 5cb694fd..426c4862 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -22,6 +22,7 @@
+ 
+ #include <algorithm>
+ #include <cmath>
++#include <cstdlib>
+ #include <cstring>
+ 
+ #if REX_PLATFORM_WIN32
+@@ -73,6 +74,13 @@ constexpr size_t kMaxTextEntryQueueSize = 512;
+ constexpr std::chrono::milliseconds kTextEntryHold{50};
+ constexpr std::chrono::milliseconds kTextEntryGap{50};
+ 
++// Opt-in input diagnostics. The environment variable is read once on first use;
++// when unset, every trace check is a constant false with no log output.
++bool InputTraceEnabled() {
++  static const bool enabled = std::getenv("WWE13_INPUT_TRACE") != nullptr;
++  return enabled;
++}
++
+ bool IsFilteredTextCharacter(uint16_t unicode) {
+   // Match OnKeyChar's single-line text filtering, including UTF-16 surrogate
+   // halves which are not independently useful as guest text input.
+@@ -142,6 +150,34 @@ static bool IsBindPressed(const bool (&key_down)[256], const std::string& cvar_v
+   return idx < 256 && key_down[idx];
+ }
+ 
++static bool AnyBoundKeyDown(const bool (&key_down)[256]) {
++  return IsBindPressed(key_down, REXCVAR_GET(keybind_a)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_b)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_x)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_y)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_left_trigger)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_right_trigger)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_left_shoulder)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_right_shoulder)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_up)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_down)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_left)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_right)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_lstick_press)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_up)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_down)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_left)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_right)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_rstick_press)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_up)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_down)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_left)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_dpad_right)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_back)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_start)) ||
++         IsBindPressed(key_down, REXCVAR_GET(keybind_guide));
++}
++
+ // Virtual keys consumed by the guest's front-end keyboard UI through
+ // XamInputGetKeystroke(Ex): the standard VK navigation/action set (the guest
+ // pump dispatches on VK codes 3..40 and consumes the VK_SHIFT key-up). Only
+@@ -194,6 +230,17 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+     return X_ERROR_DEVICE_NOT_CONNECTED;
+   }
+ 
++  if (InputTraceEnabled()) {
++    static std::chrono::steady_clock::time_point last_getstate_log{};
++    const auto now = std::chrono::steady_clock::now();
++    if (last_getstate_log == std::chrono::steady_clock::time_point{} ||
++        now - last_getstate_log >= std::chrono::seconds(1)) {
++      last_getstate_log = now;
++      REXLOG_INFO("[input-trace] getstate has_focus={} is_active={} any_bound_key_down={}",
++                  has_focus_ ? 1 : 0, is_active() ? 1 : 0, AnyBoundKeyDown(key_down_) ? 1 : 0);
++    }
++  }
++
+   UpdateMouseCapture();
+ 
+   if (!is_active() || !has_focus_) {
+@@ -475,6 +522,11 @@ void MnkInputDriver::SetKeyState(uint16_t vk, bool down) {
+ }
+ 
+ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
++  if (InputTraceEnabled()) {
++    REXLOG_INFO("[input-trace] keydown vk={} has_focus={} active={}",
++                static_cast<uint16_t>(e.virtual_key()), has_focus_ ? 1 : 0,
++                is_active() ? 1 : 0);
++  }
+   if (!IsEnabled() || !has_focus_)
+     return;
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+@@ -543,6 +595,11 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnKeyUp(rex::ui::KeyEvent& e) {
++  if (InputTraceEnabled()) {
++    REXLOG_INFO("[input-trace] keyup vk={} has_focus={} active={}",
++                static_cast<uint16_t>(e.virtual_key()), has_focus_ ? 1 : 0,
++                is_active() ? 1 : 0);
++  }
+   std::lock_guard lock(state_mutex_);
+   uint16_t vk = static_cast<uint16_t>(e.virtual_key());
+   if (vk == static_cast<uint16_t>(VirtualKey::kV)) {
+@@ -648,6 +705,11 @@ void MnkInputDriver::OnMouseMove(rex::ui::MouseEvent& e) {
+ }
+ 
+ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
++  if (InputTraceEnabled()) {
++    REXLOG_INFO("[input-trace] focus=0 hwnd={}",
++                static_cast<const void*>(attached_window_ ? attached_window_->GetNativeWindowHandle()
++                                                          : nullptr));
++  }
+   std::lock_guard lock(state_mutex_);
+   has_focus_ = false;
+   std::memset(key_down_, 0, sizeof(key_down_));
+@@ -662,6 +724,11 @@ void MnkInputDriver::OnLostFocus(rex::ui::UISetupEvent&) {
+ }
+ 
+ void MnkInputDriver::OnGotFocus(rex::ui::UISetupEvent&) {
++  if (InputTraceEnabled()) {
++    REXLOG_INFO("[input-trace] focus=1 hwnd={}",
++                static_cast<const void*>(attached_window_ ? attached_window_->GetNativeWindowHandle()
++                                                          : nullptr));
++  }
+   std::lock_guard lock(state_mutex_);
+   has_focus_ = true;
+ }
+diff --git a/src/ui/window_win.cpp b/src/ui/window_win.cpp
+index 2a38ebd3..97d5b10a 100644
+--- a/src/ui/window_win.cpp
++++ b/src/ui/window_win.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <memory>
+ #include <string>
+ #include <vector>
+@@ -42,6 +43,41 @@ REXCVAR_DEFINE_BOOL(display_refresh_match, true, "UI/Window",
+ 
+ namespace {
+ 
++// Opt-in input diagnostics for the window message pump. The environment
++// variable is read once on first use; when unset, the checks are constant false
++// and no message is logged.
++bool InputTraceEnabled() {
++  static const bool enabled = std::getenv("WWE13_INPUT_TRACE") != nullptr;
++  return enabled;
++}
++
++// Logs the focus/activation transitions and the first 20 WM_KEYDOWN messages.
++void LogInputTraceWindowMessage(HWND hWnd, UINT message, WPARAM wParam) {
++  switch (message) {
++    case WM_SETFOCUS:
++      REXLOG_INFO("[input-trace] wm_setfocus hwnd={}", static_cast<const void*>(hWnd));
++      break;
++    case WM_KILLFOCUS:
++      REXLOG_INFO("[input-trace] wm_killfocus hwnd={}", static_cast<const void*>(hWnd));
++      break;
++    case WM_ACTIVATE:
++      REXLOG_INFO("[input-trace] wm_activate wparam={} hwnd={}", static_cast<uint32_t>(wParam),
++                  static_cast<const void*>(hWnd));
++      break;
++    case WM_KEYDOWN: {
++      static uint32_t keydown_log_count = 0;
++      if (keydown_log_count < 20) {
++        ++keydown_log_count;
++        REXLOG_INFO("[input-trace] wm_keydown vk={} count={} hwnd={}",
++                    static_cast<uint32_t>(wParam), keydown_log_count,
++                    static_cast<const void*>(hWnd));
++      }
++    } break;
++    default:
++      break;
++  }
++}
++
+ uint32_t ResolveWindowWidth(uint32_t requested_width) {
+   if (REXCVAR_GET(window_width) > 0) {
+     return uint32_t(REXCVAR_GET(window_width));
+@@ -1184,6 +1220,9 @@ void Win32Window::AutoHideCursorTimerCallback(void* parameter, BOOLEAN timer_or_
+ }
+ 
+ LRESULT Win32Window::WndProc(HWND hWnd, UINT message, WPARAM wParam, LPARAM lParam) {
++  if (InputTraceEnabled()) {
++    LogInputTraceWindowMessage(hWnd, message, wParam);
++  }
+   if (message >= WM_MOUSEFIRST && message <= WM_MOUSELAST) {
+     WindowDestructionReceiver destruction_receiver(this);
+     // Returning immediately anyway - no need to check
+-- 
+2.43.0
+

@@ -1,0 +1,95 @@
+From 234a791a28f885b1e876131dd2def2c48e2fb02c Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Mon, 16 Nov 2026 05:26:50 -0800
+Subject: [PATCH 146/149] mnk #87 (owner OK 2026-11-16):
+ WWE2K14_KEYBINDS_WHILE_TYPING=1 keeps bound letter/digit keys (and a bound
+ Space) as pad buttons on the title's text screens; they do not type. Default
+ off = unchanged.
+
+Verified lane A gh87-kbd-2 (r162t): keybind_x=W, name field T,W,O -> 'O' (W pressed X = BACK, deleted T; no 'w' insert).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/input/mnk/keyboard_text_mapping.h | 10 ++++++++
+ src/input/mnk/mnk_input_driver.cpp            | 23 +++++++++++++++----
+ 2 files changed, 29 insertions(+), 4 deletions(-)
+
+diff --git a/include/rex/input/mnk/keyboard_text_mapping.h b/include/rex/input/mnk/keyboard_text_mapping.h
+index d7021e4c..69a6ed79 100644
+--- a/include/rex/input/mnk/keyboard_text_mapping.h
++++ b/include/rex/input/mnk/keyboard_text_mapping.h
+@@ -19,6 +19,16 @@ inline bool KeyboardTextEnabled() {
+   return enabled;
+ }
+ 
++// GitHub #87 (player option, launcher Controls page): keep keyboard keybinds as controller buttons on the title's
++// text screens. Bound letter/digit keys then press their pad button and do not type; unbound keys still type.
++inline bool KeybindsWhileTypingEnabled() {
++  static const bool enabled = [] {
++    const char* value = std::getenv("WWE2K14_KEYBINDS_WHILE_TYPING");
++    return value && std::strcmp(value, "1") == 0;
++  }();
++  return enabled;
++}
++
+ constexpr bool IsKeyboardTextAnyDeviceQuery(uint32_t flags) {
+   return (flags & 0xFF) == 0x02;
+ }
+diff --git a/src/input/mnk/mnk_input_driver.cpp b/src/input/mnk/mnk_input_driver.cpp
+index 28cac7cc..cea7c655 100644
+--- a/src/input/mnk/mnk_input_driver.cpp
++++ b/src/input/mnk/mnk_input_driver.cpp
+@@ -364,8 +364,9 @@ X_RESULT MnkInputDriver::GetState(uint32_t user_index, X_INPUT_STATE* out_state)
+   bool bind_key_down[256] = {};
+   const bool keyboard_text_enabled = KeyboardTextEnabled();
+   const bool title_polling_active = KeyboardTextPollingActive();
+-  FilterKeyboardTextBindKeys(key_down_, keyboard_text_enabled, title_polling_active,
+-                             bind_key_down);
++  // #87: with the keybinds-while-typing option the binds are never suppressed (OnKeyChar drops their characters).
++  FilterKeyboardTextBindKeys(key_down_, keyboard_text_enabled && !KeybindsWhileTypingEnabled(),
++                             title_polling_active, bind_key_down);
+ 
+   uint16_t buttons = 0;
+   if (IsBindPressed(bind_key_down, REXCVAR_GET(keybind_a)))
+@@ -573,7 +574,7 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+     REXLOG_INFO("[keyboard-text] host-keydown vk=0x{:04X} bind={} text_enabled={} title_polling={} suppress_bind={} prev={} dropped={}",
+                 vk, MnkBindForKey(vk), keyboard_text_enabled ? 1 : 0,
+                 title_polling_active ? 1 : 0,
+-                ShouldSuppressKeyboardTextBind(vk, keyboard_text_enabled,
++                ShouldSuppressKeyboardTextBind(vk, keyboard_text_enabled && !KeybindsWhileTypingEnabled(),
+                                               title_polling_active) ? 1 : 0,
+                 e.prev_state() ? 1 : 0, dropped_host_events);
+   }
+@@ -598,7 +599,11 @@ void MnkInputDriver::OnKeyDown(rex::ui::KeyEvent& e) {
+     // binding, or emit V itself as a UI keystroke. Repeated Ctrl+V keydowns are
+     // ignored until the matching key-up so a held shortcut pastes only once.
+     SetKeyState(vk, !ctrl_v);
+-    if (!ctrl_v && IsUiKeystrokeKey(vk)) {
++    // #87: a bound Space is a pad button only while the keybinds-while-typing option is on (no typed space).
++    const bool bound_space = KeybindsWhileTypingEnabled() &&
++                             vk == static_cast<uint16_t>(VirtualKey::kSpace) &&
++                             std::strcmp(MnkBindForKey(vk), "none") != 0;
++    if (!ctrl_v && !bound_space && IsUiKeystrokeKey(vk)) {
+       EnqueueKeystroke(vk, true);
+     }
+     if (!ctrl_v && !e.prev_state()) {
+@@ -709,6 +714,16 @@ void MnkInputDriver::OnKeyChar(rex::ui::KeyEvent& e) {
+     return;
+   }
+ 
++  // #87: a key the player bound to a pad button keeps that meaning while typing (option on), so it types nothing.
++  if (KeybindsWhileTypingEnabled()) {
++    const uint16_t bound_vk = unicode == static_cast<uint16_t>(VirtualKey::kSpace)
++                                  ? static_cast<uint16_t>(VirtualKey::kSpace)
++                                  : MapKeyboardTextVirtualKey(unicode);
++    if (bound_vk && std::strcmp(MnkBindForKey(bound_vk), "none") != 0) {
++      return;
++    }
++  }
++
+   const auto repeat_count = std::clamp(e.repeat_count(), 1,
+                                        static_cast<int>(kMaxKeystrokeQueueSize));
+   for (int i = 0; i < repeat_count; ++i) {
+-- 
+2.43.0
+

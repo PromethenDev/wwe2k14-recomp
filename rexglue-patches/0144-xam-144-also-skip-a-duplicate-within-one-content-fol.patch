@@ -1,0 +1,32 @@
+From 1ef435790d14b80727013ccb0b460afc540fab3d Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 08:56:21 -0800
+Subject: [PATCH 144/149] xam #144: also skip a duplicate within one content
+ folder (copied package folder with the same header)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xam/xam_content.cpp | 7 ++++++-
+ 1 file changed, 6 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 8bedca10..378b94e7 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -102,7 +102,12 @@ ppc_u32_result_t XamContentCreateEnumerator_entry(ppc_u32_t user_index, ppc_u32_
+     // List each package file name once (the profile copy wins, as it is listed first).
+     std::set<std::string> listed;
+     for (const auto& content_data : content_datas) {
+-      listed.insert(content_data.file_name());
++      if (!listed.insert(content_data.file_name()).second) {
++        REXKRNL_WARN("XamContentCreateEnumerator: package {} is listed twice in the profile content folder; "
++                     "listing it once",
++                     content_data.file_name());
++        continue;
++      }
+       auto item = e->AppendItem();
+       *item = content_data;
+     }
+-- 
+2.43.0
+

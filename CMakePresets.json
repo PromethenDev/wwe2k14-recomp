@@ -1,6 +1,10 @@
 {
   "version": 6,
-  "cmakeMinimumRequired": { "major": 3, "minor": 25, "patch": 0 },
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
   "configurePresets": [
     {
       "name": "linux-amd64-relwithdebinfo",
@@ -9,10 +13,35 @@
       "cacheVariables": {
         "CMAKE_C_COMPILER": "clang",
         "CMAKE_CXX_COMPILER": "clang++",
-        "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/out/install/linux-amd64",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/.worktrees/wwe2k14/out/install/linux-amd64",
         "CMAKE_CXX_STANDARD": "23"
       },
-      "condition": { "type": "equals", "lhs": "${hostSystemName}", "rhs": "Linux" }
+      "condition": {
+        "type": "equals",
+        "lhs": "${hostSystemName}",
+        "rhs": "Linux"
+      }
+    },
+    {
+      "name": "linux-amd64-localsdk",
+      "description": "linux-amd64-relwithdebinfo, but with the project-local SDK install under dependencies/rexglue",
+      "inherits": "linux-amd64-relwithdebinfo",
+      "binaryDir": "${sourceDir}/out/build/linux-amd64-localsdk",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "${sourceDir}/dependencies/rexglue/out/install/linux-amd64",
+        "WWE2K14_HAS_NR": "ON"
+      }
+    },
+    {
+      "name": "win-amd64-localsdk",
+      "description": "Windows x64 cross build against the project-local SDK win install, with nr",
+      "inherits": "win-amd64-cross",
+      "binaryDir": "${sourceDir}/out/build/win-amd64-localsdk",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/dependencies/rexglue/cmake/toolchains/win-amd64-xwin.cmake",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/dependencies/rexglue/out/install/win-amd64-cross",
+        "WWE2K14_HAS_NR": "ON"
+      }
     },
     {
       "name": "win-amd64-cross",
@@ -20,16 +49,64 @@
       "binaryDir": "${sourceDir}/out/build/win-amd64-cross",
       "cacheVariables": {
         "CMAKE_CONFIGURATION_TYPES": "RelWithDebInfo",
-        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../tools/rexglue/cmake/toolchains/win-amd64-xwin.cmake",
-        "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/out/install/win-amd64-cross",
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/../tools/rexglue/.worktrees/wwe2k14/cmake/toolchains/win-amd64-xwin.cmake",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/../tools/rexglue/.worktrees/wwe2k14/out/install/win-amd64-cross",
         "CMAKE_WIN32_EXECUTABLE": "ON",
         "CMAKE_CXX_STANDARD": "23"
+      }
+    },
+    {
+      "name": "win-amd64-localsdk-d3d12",
+      "inherits": "win-amd64-localsdk",
+      "displayName": "Windows D3D12 game (SDK built with REXGLUE_USE_D3D12=ON; launcher 'DirectX 12' option)",
+      "binaryDir": "${sourceDir}/out/build/win-amd64-localsdk-d3d12",
+      "cacheVariables": {
+        "CMAKE_PREFIX_PATH": "${sourceDir}/dependencies/rexglue/out/install/win-amd64-cross-d3d12"
+      }
+    },
+    {
+      "name": "uwp-xbox",
+      "inherits": "win-amd64-localsdk",
+      "displayName": "Xbox Series X (UWP app family, D3D12 only, native renderer; card C3). SDK: out/lanes/xbox/rexglue branch xbox-uwp2",
+      "binaryDir": "${sourceDir}/out/build/uwp-xbox",
+      "cacheVariables": {
+        "CMAKE_TOOLCHAIN_FILE": "${sourceDir}/out/lanes/xbox/rexglue/cmake/toolchains/win-amd64-xwin-uwp.cmake",
+        "CMAKE_PREFIX_PATH": "${sourceDir}/out/lanes/xbox/rexglue/out/install-uwp",
+        "CMAKE_FIND_PACKAGE_NO_PACKAGE_REGISTRY": "ON"
       }
     }
   ],
   "buildPresets": [
-    { "name": "linux-amd64-relwithdebinfo", "configurePreset": "linux-amd64-relwithdebinfo", "configuration": "RelWithDebInfo" },
-    { "name": "win-amd64-cross", "configurePreset": "win-amd64-cross", "configuration": "RelWithDebInfo" }
+    {
+      "name": "linux-amd64-relwithdebinfo",
+      "configurePreset": "linux-amd64-relwithdebinfo",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "linux-amd64-localsdk",
+      "configurePreset": "linux-amd64-localsdk",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "win-amd64-localsdk",
+      "configurePreset": "win-amd64-localsdk",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "win-amd64-cross",
+      "configurePreset": "win-amd64-cross",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "win-amd64-localsdk-d3d12",
+      "configurePreset": "win-amd64-localsdk-d3d12",
+      "configuration": "RelWithDebInfo"
+    },
+    {
+      "name": "uwp-xbox",
+      "configurePreset": "uwp-xbox",
+      "configuration": "RelWithDebInfo"
+    }
   ],
   "testPresets": []
 }

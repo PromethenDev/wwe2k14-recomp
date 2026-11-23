@@ -1,8 +1,8 @@
 From 3736f2d48072154b2b111d3d4d678c3c95b2b591 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 12:05:40 -0700
-Subject: [PATCH 46/97] ui(win32): switch a non-60-multiple display to a 60 Hz
- multiple while fullscreen
+Subject: [PATCH 046/149] ui(win32): switch a non-60-multiple display to a 60
+ Hz multiple while fullscreen
 
 A 60 fps title on a 165 Hz panel cannot pace evenly (2.75 refreshes per
 frame); the owner's laptop felt "never locked 60" at 165 Hz and smoother
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 142 insertions(+), 2 deletions(-)
 
 diff --git a/include/rex/ui/window_win.h b/include/rex/ui/window_win.h
-index 0b0bb85..7a0d95c 100644
+index 0b0bb854..7a0d95c3 100644
 --- a/include/rex/ui/window_win.h
 +++ b/include/rex/ui/window_win.h
 @@ -77,6 +77,10 @@ class Win32Window : public Window {
@@ -45,7 +45,7 @@ index 0b0bb85..7a0d95c 100644
    // in case something effecting the behavior of AdjustWindowRectEx for the
    // non-fullscreen state is changed mid-fullscreen (for instance, the menu is
 diff --git a/src/ui/window_win.cpp b/src/ui/window_win.cpp
-index 5844070..4caec69 100644
+index 58440709..4caec692 100644
 --- a/src/ui/window_win.cpp
 +++ b/src/ui/window_win.cpp
 @@ -36,6 +36,9 @@

@@ -1,0 +1,58 @@
+[package]
+name = "nihav_rad"
+version = "0.1.0"
+authors = ["Kostya Shishkov <kostya.shishkov@gmail.com>"]
+edition = "2018"
+
+[dependencies.nihav_core]
+path = "../nihav-core"
+
+[dependencies.nihav_codec_support]
+path = "../nihav-codec-support"
+features = [
+    "dct",
+    "fft"
+]
+
+[features]
+default = ["all_decoders", "all_demuxers", "all_encoders", "all_muxers"]
+demuxers = []
+all_demuxers = [
+    "demuxer_smk",
+    "demuxer_bink"
+]
+demuxer_smk = ["demuxers"]
+demuxer_bink = ["demuxers"]
+
+all_decoders = ["all_video_decoders", "all_audio_decoders"]
+decoders = []
+
+all_video_decoders = [
+    "decoder_smkvid",
+    "decoder_binkvid",
+    "decoder_bink2"
+]
+decoder_smkvid = ["decoders"]
+decoder_binkvid = ["decoders"]
+decoder_bink2 = ["decoders"]
+
+all_audio_decoders = [
+    "decoder_smkaud",
+    "decoder_binkaud"
+]
+decoder_binkaud = ["decoders"]
+decoder_smkaud = ["decoders"]
+
+muxers = []
+all_muxers = [
+    "muxer_bink"
+]
+muxer_bink = ["muxers"]
+
+encoders = []
+all_encoders = [
+    "encoder_binkvid",
+    "encoder_binkaud"
+]
+encoder_binkaud = ["encoders"]
+encoder_binkvid = ["encoders"]

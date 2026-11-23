@@ -1,0 +1,366 @@
+diff --git a/XenosRecomp/dxc_compiler.cpp b/XenosRecomp/dxc_compiler.cpp
+index 4a851c2..a8ecc45 100644
+--- a/XenosRecomp/dxc_compiler.cpp
++++ b/XenosRecomp/dxc_compiler.cpp
+@@ -50,6 +50,9 @@ IDxcBlob* DxcCompiler::compile(const std::string& shaderSource, bool compilePixe
+     {
+         args[argCount++] = L"-Wno-ignored-attributes";
+         args[argCount++] = L"-Qstrip_reflect";
++#ifdef REBLUE_RECOMP
++        args[argCount++] = L"-DSVR_DXIL_DEPTH_FLIP";
++#endif
+     }
+ 
+     args[argCount++] = L"-Qstrip_debug";
+diff --git a/XenosRecomp/shader_common.h b/XenosRecomp/shader_common.h
+index 63c37c9..116de83 100644
+--- a/XenosRecomp/shader_common.h
++++ b/XenosRecomp/shader_common.h
+@@ -3,6 +3,8 @@
+ 
+ #define SPEC_CONSTANT_R11G11B10_NORMAL  (1 << 0)
+ #define SPEC_CONSTANT_ALPHA_TEST        (1 << 1)
++// SvR 2008: normals/tangents packed as D3DDECLTYPE_DHEN3N (x 10 bits, y 11, z 11, signed).
++#define SPEC_CONSTANT_DHEN3N_NORMAL     (1 << 5)
+ 
+ #ifdef UNLEASHED_RECOMP
+     #define SPEC_CONSTANT_BICUBIC_GI_FILTER (1 << 2)
+@@ -12,18 +14,29 @@
+ 
+ // SPIR-V vertex input locations, shared with reblue's host input-layout
+ // builder. A semantic missing here gets no location from the emitter.
++// SvR 2008: every vertex input semantic its shaders use (POSITION/NORMAL 0-3 are morph targets),
++// plus Tangent/TexCoord2/Color1 as spares; exactly Vulkan's guaranteed 16 input locations.
+ #define REBLUE_VERTEX_INPUT_LOCATIONS(X) \
+-    X(Position,  0,  0) \
+-    X(Position,  1,  1) \
+-    X(Position,  2,  2) \
+-    X(Position,  3,  3) \
+-    X(Position,  4,  4) \
+-    X(Normal,    0,  5) \
+-    X(Tangent,   0,  6) \
+-    X(TexCoord,  0,  7) \
+-    X(TexCoord,  1,  8) \
+-    X(TexCoord,  2,  9) \
+-    X(Color,     0, 10)
++    X(Position,      0,  0) \
++    X(Position,      1,  1) \
++    X(Position,      2,  2) \
++    X(Position,      3,  3) \
++    X(Normal,        0,  4) \
++    X(Normal,        1,  5) \
++    X(Normal,        2,  6) \
++    X(Normal,        3,  7) \
++    X(BlendIndices,  0,  8) \
++    X(BlendWeight,   0,  9) \
++    X(TexCoord,      0, 10) \
++    X(TexCoord,      1, 11) \
++    X(Color,         0, 12) \
++    X(Tangent,       0, 13) \
++    X(TexCoord,      2, 14) \
++    X(Color,         1, 15) \
++    /* WWE '12: a second bone set (more than 4 bones per vertex) in 24 vertex shaders.  */ \
++    /* Locations past 15 need maxVertexInputAttributes > 16 (32 on desktop GPUs).        */ \
++    X(BlendIndices,  1, 16) \
++    X(BlendWeight,   1, 17)
+ 
+ // SPEC_CONSTANTS_ONLY keeps the HLSL below out of host C++ TUs, which IntelliSense would otherwise parse.
+ #if (!defined(__cplusplus) || defined(__INTELLISENSE__)) && !defined(SHADER_COMMON_SPEC_CONSTANTS_ONLY)
+@@ -55,6 +68,11 @@ struct PushConstants
+ #define g_SwappedPositions         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 320)
+ #define g_SintTexcoords            vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 324)
+ #define g_ShadowPcfScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 328)
++// WWE '12: guest pixels per host pixel (1 / internal render scale), for vPos.
++#define g_InvRenderScale           vk::RawBufferLoad<float>(g_PushConstants.SharedConstants + 332)
++// SvR 2008: window-pixel to clip-space conversion for draws made with the viewport transform off
++// (D3DRS_VIEWPORTENABLE FALSE: the vertex shader outputs window pixels); identity otherwise.
++#define g_ScreenSpace              vk::RawBufferLoad<float4>(g_PushConstants.SharedConstants + 352)
+ #else
+ #define g_Booleans                 vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 256)
+ #define g_SwappedTexcoords         vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + 260)
+@@ -69,6 +87,13 @@ struct PushConstants
+ #else
+ 
+ #ifdef REBLUE_RECOMP
++// WWE '12 D3D12 (DXIL only): old Intel D3D12 drivers (UHD 620) mishandle a reversed viewport depth
++// range (MinZ > MaxZ), so the renderer swaps it and the vertex shader writes z' = w - z.
++#ifdef SVR_DXIL_DEPTH_FLIP
++#define SVR_DEPTH_FLIP_CONSTANT uint g_SvrDepthFlip : packoffset(c21.z);
++#else
++#define SVR_DEPTH_FLIP_CONSTANT
++#endif
+ #define DEFINE_SHARED_CONSTANTS() \
+     uint4 g_BooleansArr[2] : packoffset(c16); \
+     uint g_SwappedTexcoords : packoffset(c18.x); \
+@@ -80,7 +105,10 @@ struct PushConstants
+     uint g_SwappedBlendWeights : packoffset(c19.w); \
+     uint g_SwappedPositions : packoffset(c20.x); \
+     uint g_SintTexcoords : packoffset(c20.y); \
+-    float g_ShadowPcfScale : packoffset(c20.z);
++    float g_ShadowPcfScale : packoffset(c20.z); \
++    float g_InvRenderScale : packoffset(c20.w); \
++    float4 g_ScreenSpace : packoffset(c22); \
++    SVR_DEPTH_FLIP_CONSTANT
+ 
+ #define g_Booleans(i) (g_BooleansArr[(i) / 4][(i) % 4])
+ #else
+@@ -100,6 +128,13 @@ uint g_SpecConstants();
+ #define BOOL_BIT(n) ((g_Booleans((n) / 32u) & (1u << ((n) & 31u))) != 0)
+ #endif
+ 
++// SvR 2008: texture fetches in vertex shaders sample mip 0 explicitly (no derivatives there).
++#ifdef SVR_VERTEX_SHADER
++#define SVR_SAMPLE(...) SampleLevel(__VA_ARGS__, 0)
++#else
++#define SVR_SAMPLE(...) Sample(__VA_ARGS__)
++#endif
++
+ Texture2D<float4> g_Texture2DDescriptorHeap[] : register(t0, space0);
+ Texture3D<float4> g_Texture3DDescriptorHeap[] : register(t0, space1);
+ TextureCube<float4> g_TextureCubeDescriptorHeap[] : register(t0, space2);
+@@ -115,7 +150,7 @@ uint2 getTexture2DDimensions(Texture2D<float4> texture)
+ float4 tfetch2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+ {
+     Texture2D<float4> texture = g_Texture2DDescriptorHeap[resourceDescriptorIndex];
+-    return texture.Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
++    return texture.SVR_SAMPLE(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord + offset / getTexture2DDimensions(texture));
+ }
+ 
+ float2 getWeights2D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float2 texCoord, float2 offset)
+@@ -208,17 +243,17 @@ float4 tfetch2DBicubic(uint resourceDescriptorIndex, uint samplerDescriptorIndex
+     float h1y = h1(fy);
+ 
+     float4 r =
+-        g0(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
+-        g1(fy) * (g0x * texture.Sample(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
+-            g1x * texture.Sample(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
++        g0(fy) * (g0x * texture.SVR_SAMPLE(samplerState, float2(px + h0x, py + h0y) / float2(dimensions)) +
++            g1x * texture.SVR_SAMPLE(samplerState, float2(px + h1x, py + h0y) / float2(dimensions))) +
++        g1(fy) * (g0x * texture.SVR_SAMPLE(samplerState, float2(px + h0x, py + h1y) / float2(dimensions)) +
++            g1x * texture.SVR_SAMPLE(samplerState, float2(px + h1x, py + h1y) / float2(dimensions)));
+ 
+     return r;
+ }
+ 
+ float4 tfetch3D(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord)
+ {
+-    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
++    return g_Texture3DDescriptorHeap[resourceDescriptorIndex].SVR_SAMPLE(g_SamplerDescriptorHeap[samplerDescriptorIndex], texCoord);
+ }
+ 
+ struct CubeMapData
+@@ -236,13 +271,22 @@ struct CubeMapData
+ 
+ float4 tfetchCube(uint resourceDescriptorIndex, uint samplerDescriptorIndex, float3 texCoord, inout CubeMapData cubeMapData)
+ {
+-    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].Sample(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
++    return g_TextureCubeDescriptorHeap[resourceDescriptorIndex].SVR_SAMPLE(g_SamplerDescriptorHeap[samplerDescriptorIndex], cubeMapData.cubeMapDirections[texCoord.z]);
+ }
+ 
+ #ifdef REBLUE_RECOMP
+ // DEC3N normal decode; IA binds as R32_UINT so lane .x carries the raw bits (asuint recovers them).
+ float4 tfetchR11G11B10(float4 value)
+ {
++    if (g_SpecConstants() & SPEC_CONSTANT_DHEN3N_NORMAL)
++    {
++        uint v = asuint(value.x);
++        return float4(
++            (v & 0x00000200 ? -1.0 : 0.0) + ((v & 0x1FF) / 512.0),
++            (v & 0x00100000 ? -1.0 : 0.0) + (((v >> 10) & 0x3FF) / 1024.0),
++            (v & 0x80000000 ? -1.0 : 0.0) + (((v >> 21) & 0x3FF) / 1024.0),
++            0.0);
++    }
+     if (g_SpecConstants() & SPEC_CONSTANT_R11G11B10_NORMAL)
+     {
+         uint v = asuint(value.x);
+diff --git a/XenosRecomp/shader_recompiler.cpp b/XenosRecomp/shader_recompiler.cpp
+index feaa90b..5e872b2 100644
+--- a/XenosRecomp/shader_recompiler.cpp
++++ b/XenosRecomp/shader_recompiler.cpp
+@@ -130,7 +130,18 @@ static constexpr std::pair<DeclUsage, size_t> INTERPOLATORS[] =
+     { DeclUsage::TexCoord, 14 },
+     { DeclUsage::TexCoord, 15 },
+     { DeclUsage::Color, 0 },
+-    { DeclUsage::Color, 1 }
++    { DeclUsage::Color, 1 },
++#ifdef REBLUE_RECOMP
++    // SvR 2009 passes COLOR3/COLOR4 between its shaders (2008 only COLOR0/1). Both stages declare
++    // this whole list in the same order, so the extra slots link by position; 21 vec4 outputs.
++    { DeclUsage::Color, 2 },
++    { DeclUsage::Color, 3 },
++    { DeclUsage::Color, 4 },
++    // WWE '12 also passes NORMAL0/TANGENT0/BINORMAL0 between its shaders; 24 vec4 outputs.
++    { DeclUsage::Normal, 0 },
++    { DeclUsage::Tangent, 0 },
++    { DeclUsage::Binormal, 0 },
++#endif
+ };
+ 
+ static constexpr std::string_view TEXTURE_DIMENSIONS[] = 
+@@ -140,6 +151,19 @@ static constexpr std::string_view TEXTURE_DIMENSIONS[] =
+     "Cube" 
+ };
+ 
++// SvR 2008: descriptor-index slots for samplers 0-31. Slots 0-15 keep re:Blue's layout at the start
++// of the shared constants; slots 16-31 (vertex texture fetch uses s16-s19) live at byte 384.
++static constexpr uint32_t SVR_SAMPLER_SLOTS = 32;
++static uint32_t svrTextureIndexOffset(size_t dimension, uint32_t reg)
++{
++    return reg < 16 ? uint32_t(dimension * 64 + reg * 4) : uint32_t(384 + dimension * 64 + (reg - 16) * 4);
++}
++static uint32_t svrSamplerIndexOffset(uint32_t reg)
++{
++    return reg < 16 ? uint32_t(std::size(TEXTURE_DIMENSIONS) * 64 + reg * 4)
++                    : uint32_t(384 + std::size(TEXTURE_DIMENSIONS) * 64 + (reg - 16) * 4);
++}
++
+ static FetchDestinationSwizzle getDestSwizzle(uint32_t dstSwizzle, uint32_t index)
+ {
+     return FetchDestinationSwizzle((dstSwizzle >> (index * 3)) & 0x7);
+@@ -199,15 +223,15 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     switch (findResult->second.usage)
+     {
+     case DeclUsage::Normal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(swapFloats(g_SwappedNormals, ");
+         break;
+     case DeclUsage::Tangent:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(swapFloats(g_SwappedTangents, ");
+         break;
+     case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(swapFloats(g_SwappedBinormals, ");
+         break;
+     case DeclUsage::BlendWeight:
+@@ -226,7 +250,7 @@ void ShaderRecompiler::recompile(const VertexFetchInstruction& instr, uint32_t a
+     case DeclUsage::Normal:
+     case DeclUsage::Tangent:
+     case DeclUsage::Binormal:
+-        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL;
++        specConstantsMask |= SPEC_CONSTANT_R11G11B10_NORMAL | SPEC_CONSTANT_DHEN3N_NORMAL;
+         print("tfetchR11G11B10(");
+         break;
+ 
+@@ -1280,11 +1304,16 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+     assert((shaderContainer->flags & 0xFFFFFF00) == 0x102A1100);
+     assert(shaderContainer->constantTableOffset != NULL);
+ 
++    isPixelShader = (shaderContainer->flags & 0x1) == 0;
++
++    // SvR 2008: vertex shaders fetch textures too (vertex texture fetch); the shared helpers then
++    // use SampleLevel, since implicit-derivative Sample is pixel-shader only.
++    if (!isPixelShader)
++        out += "#define SVR_VERTEX_SHADER 1\n";
++
+     out += include;
+     out += '\n';
+ 
+-    isPixelShader = (shaderContainer->flags & 0x1) == 0;
+-
+     const auto constantTableContainer = reinterpret_cast<const ConstantTableContainer*>(shaderData + shaderContainer->constantTableOffset);
+     constantTableData = reinterpret_cast<const uint8_t*>(&constantTableContainer->constantTable);
+ 
+@@ -1368,11 +1397,11 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
+                 println("#define {}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 64 + constantInfo->registerIndex * 4);
++                    constantName, TEXTURE_DIMENSIONS[j], svrTextureIndexOffset(j, constantInfo->registerIndex));
+             }
+ 
+             println("#define {}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                constantName, std::size(TEXTURE_DIMENSIONS) * 64 + constantInfo->registerIndex * 4);
++                constantName, svrSamplerIndexOffset(constantInfo->registerIndex));
+ 
+             samplers.emplace(constantInfo->registerIndex, constantName);
+             break;
+@@ -1383,17 +1412,17 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+ #ifdef REBLUE_RECOMP
+     // BD bodies reference unnamed sampler slots; emit fallback descriptor-index defines for any slot 0..15 the table didn't name.
+-    for (uint32_t r = 0; r < 16; r++)
++    for (uint32_t r = 0; r < SVR_SAMPLER_SLOTS; r++)
+     {
+         if (samplers.find(r) != samplers.end())
+             continue;
+         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+         {
+             println("#define s{}_Texture{}DescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-                r, TEXTURE_DIMENSIONS[j], j * 64 + r * 4);
++                r, TEXTURE_DIMENSIONS[j], svrTextureIndexOffset(j, r));
+         }
+         println("#define s{}_SamplerDescriptorIndex vk::RawBufferLoad<uint>(g_PushConstants.SharedConstants + {})",
+-            r, std::size(TEXTURE_DIMENSIONS) * 64 + r * 4);
++            r, svrSamplerIndexOffset(r));
+     }
+ #endif
+ 
+@@ -1449,28 +1478,32 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+ 
+             for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+             {
++                uint32_t offset = svrTextureIndexOffset(j, constantInfo->registerIndex);
+                 println("\tuint {}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                    constantName, TEXTURE_DIMENSIONS[j], j * 4 + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                    constantName, TEXTURE_DIMENSIONS[j], offset / 16, SWIZZLES[(offset % 16) / 4]);
+             }
+ 
++            uint32_t samplerOffset = svrSamplerIndexOffset(constantInfo->registerIndex);
+             println("\tuint {}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-                constantName, 4 * std::size(TEXTURE_DIMENSIONS) + constantInfo->registerIndex / 4, SWIZZLES[constantInfo->registerIndex % 4]);
++                constantName, samplerOffset / 16, SWIZZLES[(samplerOffset % 16) / 4]);
+         }
+     }
+ 
+ #ifdef REBLUE_RECOMP
+     // Mirror the SPIR-V fallback: packoffset slots for any unnamed sampler index 0..15.
+-    for (uint32_t r = 0; r < 16; r++)
++    for (uint32_t r = 0; r < SVR_SAMPLER_SLOTS; r++)
+     {
+         if (samplers.find(r) != samplers.end())
+             continue;
+         for (size_t j = 0; j < std::size(TEXTURE_DIMENSIONS); j++)
+         {
++            uint32_t offset = svrTextureIndexOffset(j, r);
+             println("\tuint s{}_Texture{}DescriptorIndex : packoffset(c{}.{});",
+-                r, TEXTURE_DIMENSIONS[j], j * 4 + r / 4, SWIZZLES[r % 4]);
++                r, TEXTURE_DIMENSIONS[j], offset / 16, SWIZZLES[(offset % 16) / 4]);
+         }
++        uint32_t samplerOffset = svrSamplerIndexOffset(r);
+         println("\tuint s{}_SamplerDescriptorIndex : packoffset(c{}.{});",
+-            r, 4 * std::size(TEXTURE_DIMENSIONS) + r / 4, SWIZZLES[r % 4]);
++            r, samplerOffset / 16, SWIZZLES[(samplerOffset % 16) / 4]);
+     }
+ #endif
+ 
+@@ -1751,7 +1784,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+             print("\tfloat4 r{} = ", i);
+             if (isPixelShader && i == ((shader->fieldC >> 8) & 0xFF))
+             {
++#ifdef REBLUE_RECOMP
++                // vPos in guest pixels: host targets may be rendered at a multiple of the guest's size.
++                out += "float4((iPos.xy * g_InvRenderScale - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++#else
+                 out += "float4((iPos.xy - 0.5) * float2(iFace ? 1.0 : -1.0, 1.0), 0.0, 0.0);\n";
++#endif
+             }
+         #ifdef UNLEASHED_RECOMP
+             else if (!isPixelShader && hasIndexCount && i == 0)
+@@ -2322,6 +2360,12 @@ void ShaderRecompiler::recompile(const uint8_t* shaderData, const std::string_vi
+                     if (!hasMtxProjection)
+                 #endif
+                     {
++                #ifdef REBLUE_RECOMP
++                        out += "\toPos.xy = oPos.xy * g_ScreenSpace.xy + g_ScreenSpace.zw * oPos.w;\n";
++                        out += "#ifdef SVR_DXIL_DEPTH_FLIP\n";
++                        out += "\tif (g_SvrDepthFlip) oPos.z = oPos.w - oPos.z;\n";
++                        out += "#endif\n";
++                #endif
+                         out += "\toPos.xy += g_HalfPixelOffset * oPos.w;\n";
+                     }
+                 }

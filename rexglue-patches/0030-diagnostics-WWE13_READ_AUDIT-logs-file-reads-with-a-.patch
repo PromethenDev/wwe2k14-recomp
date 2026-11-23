@@ -1,7 +1,7 @@
 From 1b4537e04ce985d560ff12229a7d2713b6413395 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 08:41:54 -0700
-Subject: [PATCH 30/97] diagnostics: WWE13_READ_AUDIT logs file reads with a
+Subject: [PATCH 030/149] diagnostics: WWE13_READ_AUDIT logs file reads with a
  hash of the delivered bytes
 
 WWE13_READ_AUDIT=<path substring> logs offset, length, bytes read, buffer and an FNV-1a
@@ -14,7 +14,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 16 insertions(+)
 
 diff --git a/src/system/xfile.cpp b/src/system/xfile.cpp
-index b0971cb..36f508b 100644
+index b0971cb5..36f508bf 100644
 --- a/src/system/xfile.cpp
 +++ b/src/system/xfile.cpp
 @@ -19,6 +19,7 @@

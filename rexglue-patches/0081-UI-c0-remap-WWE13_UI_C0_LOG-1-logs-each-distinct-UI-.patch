@@ -1,7 +1,7 @@
 From 5fa8e4a1495bcc8c6a13f8a12184326d07bdaea4 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 18:48:23 -0700
-Subject: [PATCH 81/97] UI c0 remap: WWE13_UI_C0_LOG=1 logs each distinct (UI
+Subject: [PATCH 081/149] UI c0 remap: WWE13_UI_C0_LOG=1 logs each distinct (UI
  VS, fetch-0 size, remapped) once
 
 Diagnostic for the 576p entrance box: shows which full-screen copies/fades the remap touches per mode.
@@ -10,7 +10,7 @@ Diagnostic for the 576p entrance box: shows which full-screen copies/fades the r
  1 file changed, 27 insertions(+)
 
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 18f8055..e9574a2 100644
+index 18f8055e..e9574a2c 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -10,6 +10,8 @@

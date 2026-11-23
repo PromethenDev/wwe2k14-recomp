@@ -1,7 +1,7 @@
 From 2659e1eb8395468030672393b743568045b4abda Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 10 Oct 2026 23:51:24 -0700
-Subject: [PATCH 97/97] Window close: force exit if shutdown is still running
+Subject: [PATCH 097/149] Window close: force exit if shutdown is still running
  after close_exit_timeout_seconds (default 3, 0 = off)
 
 TerminateTitle() hangs forever on POSIX: guest threads are suspended in the suspend
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 37 insertions(+)
 
 diff --git a/include/rex/logging/api.h b/include/rex/logging/api.h
-index 70c5e72..343dbee 100644
+index 70c5e72f..343dbee6 100644
 --- a/include/rex/logging/api.h
 +++ b/include/rex/logging/api.h
 @@ -61,6 +61,12 @@ void InitLogging(const char* log_file = nullptr,
@@ -38,7 +38,7 @@ index 70c5e72..343dbee 100644
   * Register a new log category at runtime.
   *
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
-index 32fe427..06ddcbb 100644
+index 32fe427e..06ddcbba 100644
 --- a/src/core/logging.cpp
 +++ b/src/core/logging.cpp
 @@ -206,6 +206,16 @@ void InitLogging(const char* log_file, spdlog::level::level_enum level) {
@@ -59,7 +59,7 @@ index 32fe427..06ddcbb 100644
    std::lock_guard lock(g_mutex);
    if (!g_initialized)
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index b72211e..c13d462 100644
+index b72211e0..c13d462f 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -12,6 +12,8 @@

@@ -1,0 +1,40 @@
+From e46881addbafca7e1342ae802800fcde8d3d25c6 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Fri, 9 Oct 2026 11:37:50 -0700
+Subject: [PATCH 117/149] nr: GetNrVulkanDevice reports
+ VK_EXT_shader_stencil_export
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 8188b8853f576a24366b085230b0b551216bbf45)
+---
+ include/rex/graphics/draw_observer.h      | 1 +
+ src/graphics/vulkan/command_processor.cpp | 1 +
+ 2 files changed, 2 insertions(+)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 6977aa6c..49a7c1c0 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -93,6 +93,7 @@ struct NrVulkanDevice {
+   bool shader_int64 = false, buffer_device_address = false, descriptor_indexing = false;
+   bool scalar_block_layout = false, null_descriptor = false, sampler_mirror_clamp_to_edge = false;
+   bool geometry_shader = false;
++  bool shader_stencil_export = false;  // VK_EXT_shader_stencil_export enabled on the device
+ };
+ bool GetNrVulkanDevice(NrVulkanDevice* out);
+ // SetNrExternalSwap: the next IssueSwap presents this image view (an image on the device above, in
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 98c251bb..63330f32 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -8901,6 +8901,7 @@ bool GetNrVulkanDevice(NrVulkanDevice* out) {
+   out->null_descriptor = p.nullDescriptor;
+   out->sampler_mirror_clamp_to_edge = p.samplerMirrorClampToEdge;
+   out->geometry_shader = p.geometryShader;
++  out->shader_stencil_export = d->extensions().ext_EXT_shader_stencil_export;
+   return nr.shader_int64 && nr.buffer_device_address && nr.descriptor_indexing;
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,70 @@
+From 06830cf322fbb02fea06524ab2231a8c6cc59a6b Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 19:18:17 -0700
+Subject: [PATCH 110/149] nr: --nr_compare_trace_same_frame (compare window and
+ trace on the same frame boundary); off by default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 2e6aa10a03928786143fdc6538951c130d15155e)
+---
+ include/rex/graphics/flags.h       | 1 +
+ src/graphics/command_processor.cpp | 8 ++++++++
+ src/ui/rex_app.cpp                 | 4 +++-
+ 3 files changed, 12 insertions(+), 1 deletion(-)
+
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index 0357d3c2..07d1d5f4 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -17,6 +17,7 @@
+ REXCVAR_DECLARE(bool, vsync);
+ REXCVAR_DECLARE(std::string, nr_compare_dump_dir);
+ REXCVAR_DECLARE(bool, nr_skip_host_draws);
++REXCVAR_DECLARE(bool, nr_compare_trace_same_frame);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 9c1cdeed..ec7e6663 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -63,6 +63,10 @@ REXCVAR_DEFINE_BOOL(nr_skip_host_draws, false, "GPU",
+                     "Native-renderer replace mode: draw and copy packets still reach the draw observer, "
+                     "but this backend does not execute them (the observer renders, writes copy-outs to "
+                     "guest memory and the swap presents from guest memory). Off by default");
++REXCVAR_DEFINE_BOOL(nr_compare_trace_same_frame, false, "GPU",
++                    "Native-renderer compare windows: the frame trace (trace_gpu_prefix) is requested at "
++                    "the frame boundary that opens the window, so trace and window are the same frame "
++                    "(the F10 bind then does not request its own trace). Off by default");
+ REXCVAR_DEFINE_BOOL(nr_compare_at_start, false, "GPU",
+                     "Native-renderer evidence: open a compare window (frame 0) at the first draw - for "
+                     "trace replays, whose EDRAM snapshot comes from the trace");
+@@ -1902,6 +1906,10 @@ void CommandProcessor::NrCompareOnSwap() {
+   std::filesystem::create_directories(NrCompareSdkDir(), ec);
+   g_nr_compare_active = true;
+   REXGPU_INFO("nr_compare: window for frame {} opened ({})", g_nr_compare_frame, NrCompareSdkDir());
++  if (REXCVAR_GET(nr_compare_trace_same_frame)) {
++    // The trace writer opens later in this same XE_SWAP packet end (kSingleFrame), named counter_ - 1.
++    RequestFrameTrace(REXCVAR_GET(trace_gpu_prefix));
++  }
+   if (observer) {
+     observer->OnCompareFrame(true, g_nr_compare_frame);
+     std::vector<uint8_t> edram;
+diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
+index 403f7497..f9f0466d 100644
+--- a/src/ui/rex_app.cpp
++++ b/src/ui/rex_app.cpp
+@@ -301,7 +301,9 @@ bool ReXApp::OnInitialize() {
+       rex::ui::RegisterBind("bind_nr_compare_frame", "F10", "Native renderer: compare the next frame",
+                             [graphics_system] {
+                               REXLOG_INFO("nr_compare: frame requested");
+-                              graphics_system->RequestFrameTrace();
++                              if (!REXCVAR_GET(nr_compare_trace_same_frame)) {
++                                graphics_system->RequestFrameTrace();
++                              }
+                               rex::graphics::RequestNrCompareFrame();
+                             });
+     }
+-- 
+2.43.0
+

@@ -1,0 +1,83 @@
+From 6e5c7801a6314abee5d5cbc15d21f43da1824004 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 18:18:33 -0700
+Subject: [PATCH 108/149] nr: replace mode switch --nr_skip_host_draws +
+ per-frame OnSwap observer callback; off by default
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 09e212747a13e46c0beff44df7aff4302a7f7621)
+---
+ include/rex/graphics/draw_observer.h |  2 ++
+ include/rex/graphics/flags.h         |  1 +
+ src/graphics/command_processor.cpp   | 13 ++++++++++---
+ 3 files changed, 13 insertions(+), 3 deletions(-)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 8c152460..27ba126a 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -46,6 +46,8 @@ class DrawObserver {
+   // live run), begin = false at the next frame boundary. frame = the swap counter used in the
+   // frame-trace (.xtr) file name, so an F9-style trace of the same frame has the same number.
+   virtual void OnCompareFrame(bool begin, uint32_t frame) { (void)begin; (void)frame; }
++  // Every frame boundary (XE_SWAP packet end), before compare-window handling.
++  virtual void OnSwap(uint32_t frame) { (void)frame; }
+ };
+ 
+ // Request a compare window for the next frame (thread-safe; a no-op unless
+diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
+index b77379f4..0357d3c2 100644
+--- a/include/rex/graphics/flags.h
++++ b/include/rex/graphics/flags.h
+@@ -16,6 +16,7 @@
+ // GPU Core
+ REXCVAR_DECLARE(bool, vsync);
+ REXCVAR_DECLARE(std::string, nr_compare_dump_dir);
++REXCVAR_DECLARE(bool, nr_skip_host_draws);
+ REXCVAR_DECLARE(bool, clear_memory_page_state);
+ REXCVAR_DECLARE(bool, half_pixel_offset);
+ REXCVAR_DECLARE(bool, async_shader_compilation);
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 081cf9d4..13f483b5 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -59,6 +59,10 @@ REXCVAR_DEFINE_STRING(nr_compare_dump_dir, "", "GPU",
+                       "(RequestNrCompareFrame, bind_nr_compare_frame), the next frame's resolves are "
+                       "written to DIR/frame-<n>/sdk (as resolve_dump_dir; needs readback_resolve=full) "
+                       "and the draw observer is told the window begins / ends");
++REXCVAR_DEFINE_BOOL(nr_skip_host_draws, false, "GPU",
++                    "Native-renderer replace mode: draw and copy packets still reach the draw observer, "
++                    "but this backend does not execute them (the observer renders, writes copy-outs to "
++                    "guest memory and the swap presents from guest memory). Off by default");
+ REXCVAR_DEFINE_BOOL(nr_compare_at_start, false, "GPU",
+                     "Native-renderer evidence: open a compare window (frame 0) at the first draw - for "
+                     "trace replays, whose EDRAM snapshot comes from the trace");
+@@ -1870,10 +1874,11 @@ void RequestNrCompareFrame() {
+ // Frame boundary (XE_SWAP packet end): close an open compare window, open a requested one. A
+ // live window starts from the SDK's own EDRAM, handed to the observer as a snapshot.
+ void CommandProcessor::NrCompareOnSwap() {
++  DrawObserver* observer = GetDrawObserver();
++  if (observer) observer->OnSwap(counter_ - 1);
+   if (REXCVAR_GET(nr_compare_dump_dir).empty()) {
+     return;
+   }
+-  DrawObserver* observer = GetDrawObserver();
+   if (g_nr_compare_active) {
+     g_nr_compare_active = false;
+     REXGPU_INFO("nr_compare: window for frame {} closed", g_nr_compare_frame);
+@@ -2079,8 +2084,10 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+ 
+       bool major_mode_explicit =
+           xenos::IsMajorModeExplicit(vgt_draw_initiator.major_mode, vgt_draw_initiator.prim_type);
+-      draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
+-                                 is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
++      if (!REXCVAR_GET(nr_skip_host_draws)) {
++        draw_succeeded = IssueDraw(vgt_draw_initiator.prim_type, vgt_draw_initiator.num_indices,
++                                   is_indexed ? &index_buffer_info : nullptr, major_mode_explicit);
++      }
+       DumpResolveResult();
+       if (!draw_succeeded) {
+         auto vgt_output_path_cntl = register_file_->Get<reg::VGT_OUTPUT_PATH_CNTL>();
+-- 
+2.43.0
+

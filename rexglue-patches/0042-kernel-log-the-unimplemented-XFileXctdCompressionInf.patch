@@ -1,7 +1,7 @@
 From 4604f375651753529baf2162213173fca87dfd8b Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 00:28:05 -0700
-Subject: [PATCH 42/97] kernel: log the unimplemented
+Subject: [PATCH 042/149] kernel: log the unimplemented
  XFileXctdCompressionInformation query once
 
 WWE 13 issues it for thousands of files (log miner: 7,446 lines across sessions;
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 10 insertions(+), 3 deletions(-)
 
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
-index 1615ab4..80e430c 100644
+index 1615ab49..80e430cf 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_io_info.cpp
 @@ -12,6 +12,8 @@

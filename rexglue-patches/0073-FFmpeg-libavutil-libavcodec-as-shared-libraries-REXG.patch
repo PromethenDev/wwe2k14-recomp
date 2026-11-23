@@ -1,7 +1,7 @@
 From 0ae9ea5fdc5dd794647d80803ae8ed0f87d137c2 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 19:04:40 -0700
-Subject: [PATCH 73/97] FFmpeg libavutil/libavcodec as shared libraries
+Subject: [PATCH 073/149] FFmpeg libavutil/libavcodec as shared libraries
  (REXGLUE_FFMPEG_SHARED, default ON) for LGPL compliance
 
 Windows: avutil-56.dll / avcodec-58.dll (export-all + ff_reverse DATA .def); Linux: libavutil.so.56 /
@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 cmake/ffmpeg-avutil-private.def
 
 diff --git a/CMakeLists.txt b/CMakeLists.txt
-index b986f15..410a51d 100644
+index b986f154..410a51d2 100644
 --- a/CMakeLists.txt
 +++ b/CMakeLists.txt
 @@ -17,6 +17,7 @@ option(REXGLUE_ENABLE_FIDELITYFX "Enable optional AMD FidelityFX integration (ex
@@ -32,14 +32,14 @@ index b986f15..410a51d 100644
  if(REXGLUE_ENABLE_TRACY)
 diff --git a/cmake/ffmpeg-avutil-private.def b/cmake/ffmpeg-avutil-private.def
 new file mode 100644
-index 0000000..0751c4f
+index 00000000..0751c4f7
 --- /dev/null
 +++ b/cmake/ffmpeg-avutil-private.def
 @@ -0,0 +1,2 @@
 +EXPORTS
 +    ff_reverse DATA
 diff --git a/cmake/rexglueConfig.cmake.in b/cmake/rexglueConfig.cmake.in
-index 4e18bd1..ee3b866 100644
+index 4e18bd15..ee3b8665 100644
 --- a/cmake/rexglueConfig.cmake.in
 +++ b/cmake/rexglueConfig.cmake.in
 @@ -10,6 +10,7 @@ include("${CMAKE_CURRENT_LIST_DIR}/rexglue_helpers.cmake")
@@ -51,7 +51,7 @@ index 4e18bd1..ee3b866 100644
  # Required dependencies
  find_dependency(fmt CONFIG)
 diff --git a/cmake/rexglue_helpers.cmake b/cmake/rexglue_helpers.cmake
-index 69fec67..7f3c262 100644
+index 69fec675..7f3c2625 100644
 --- a/cmake/rexglue_helpers.cmake
 +++ b/cmake/rexglue_helpers.cmake
 @@ -63,6 +63,48 @@ function(rexglue_configure_target target_name)
@@ -104,7 +104,7 @@ index 69fec67..7f3c262 100644
      if(WIN32)
          add_custom_command(TARGET ${target_name} POST_BUILD
 diff --git a/thirdparty/CMakeLists.txt b/thirdparty/CMakeLists.txt
-index 755ca33..da635f7 100644
+index 755ca331..da635f75 100644
 --- a/thirdparty/CMakeLists.txt
 +++ b/thirdparty/CMakeLists.txt
 @@ -347,6 +347,62 @@ endif()

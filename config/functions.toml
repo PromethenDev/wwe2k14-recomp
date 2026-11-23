@@ -1,5 +1,5 @@
 # WWE 2K14 (TU 545408B2, image entry 0x822626B8) function boundary overrides.
-# Every entry is verified against the decrypted, TU-patched image.
+# Every entry is verified against the decrypted, TU-patched image; evidence in docs/M1_BRANCH_TARGET_EVIDENCE.md.
 
 [functions]
 
@@ -505,6 +505,6 @@
 
 # M6: two compiler-emitted clones of registered neighbours, reachable only via code-built addresses in
 # registered sub_82D00550 (lis r11,0x82D0; addi r3,r11,-0xB68/-0xB58; blr -> 0x82CFF498 / 0x82CFF4A8).
-# Verified from image bytes: the audit scripts in tools/.
+# Verified from image bytes: out/audit/partA-evidence.md, docs/RECOMP-COMPLETENESS.md.
 0x82CFF498 = { name = "wwe2k14_ptr_82CFF498", size = 0x10 }
 0x82CFF4A8 = { name = "wwe2k14_ptr_82CFF4A8", size = 0x74 }

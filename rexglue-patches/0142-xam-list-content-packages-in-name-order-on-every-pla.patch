@@ -1,0 +1,42 @@
+From 7a5f9236bbcef07e66d8d0f49c801e9939036881 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 15 Nov 2026 11:03:01 -0800
+Subject: [PATCH 142/149] xam: list content packages in name order on every
+ platform (GitHub #135: on Linux the stock Add-On 2 could mount before the
+ import host, so imports had no files); SORT-1 PASS; NEEDS OWNER OK before
+ shipping
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/system/xam/content_manager.cpp | 8 ++++++++
+ 1 file changed, 8 insertions(+)
+
+diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
+index 8a157817..ae7d7060 100644
+--- a/src/system/xam/content_manager.cpp
++++ b/src/system/xam/content_manager.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <algorithm>
+ #include <array>
+ #include <cstring>
+ #include <string>
+@@ -183,6 +184,13 @@ std::vector<XCONTENT_AGGREGATE_DATA> ContentManager::ListContent(uint32_t device
+     }
+   }
+ 
++  // GitHub #135 (2026-11-15): list packages in name order on every platform. Windows directory listings already come
++  // sorted; Linux ones do not, so there the stock 4-offer Add-On 2 (267E5576..) could mount before the launcher's import
++  // host (045BEE31.. / 067E5576.., named to load first), the game kept the first pack-2 catalog, and every import hosted in
++  // the other one had no file name (placeholder portraits, match load never ends).
++  std::sort(result.begin(), result.end(), [](const XCONTENT_AGGREGATE_DATA& a, const XCONTENT_AGGREGATE_DATA& b) {
++    return a.file_name() < b.file_name();
++  });
+   return result;
+ }
+ 
+-- 
+2.43.0
+

@@ -1,0 +1,634 @@
+# Vulkan presented through a DXGI flip-model swap chain (wwe13_vk_dxgi_present). Apply in native-deps/plume with patch -p1
+# on top of the other plume patches. Verified 2026-11-20 UHD 630 runs dx1/dx2b/dx3, kitchk2 (startup probe).
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -104,6 +104,8 @@
+         VK_GOOGLE_DISPLAY_TIMING_EXTENSION_NAME,
+ #   if defined(_WIN64)
+         VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME,
++        VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME,  // VulkanDxgiPresent only
++        VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME,      // VulkanDxgiPresent only
+ #   endif
+         // Vulkan spec requires this to be enabled if supported by the driver.
+         VK_KHR_PORTABILITY_SUBSET_EXTENSION_NAME,
+@@ -3654,6 +3656,16 @@
+     }
+ 
+     std::unique_ptr<RenderSwapChain> VulkanCommandQueue::createSwapChain(const RenderSwapChainDesc &desc) {
++#   if defined(_WIN64)
++        if (VulkanDxgiPresent) {
++            if (device->dxgiPresentSupported) {
++                if (auto dxgi = CreateVulkanDxgiSwapChain(this, desc))
++                    return dxgi;
++            }
++            fprintf(stderr, "[plume-dxgi] DXGI present unavailable (extensions %s), using the Vulkan swap chain\n",
++                    device->dxgiPresentSupported ? "yes" : "no");
++        }
++#   endif
+         return std::make_unique<VulkanSwapChain>(this, desc);
+     }
+ 
+@@ -4126,6 +4138,12 @@
+             supportedOptionalExtensions.erase(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME);
+         }
+         fullScreenExclusiveSupported = supportedOptionalExtensions.count(VK_EXT_FULL_SCREEN_EXCLUSIVE_EXTENSION_NAME) != 0;
++        if (!VulkanDxgiPresent) {
++            supportedOptionalExtensions.erase(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME);
++            supportedOptionalExtensions.erase(VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME);
++        }
++        dxgiPresentSupported = supportedOptionalExtensions.count(VK_KHR_EXTERNAL_MEMORY_WIN32_EXTENSION_NAME) != 0 &&
++                               supportedOptionalExtensions.count(VK_KHR_WIN32_KEYED_MUTEX_EXTENSION_NAME) != 0;
+ #   endif
+ 
+         std::vector<const char *> enabledExtensions;
+--- a/plume_vulkan.h
++++ b/plume_vulkan.h
+@@ -223,6 +223,10 @@
+         static VkDescriptorPool createDescriptorPool(VulkanDevice *device, const std::unordered_map<VkDescriptorType, uint32_t> &typeCounts, bool lastRangeIsBoundless);
+     };
+ 
++    // plume_vulkan_dxgi.cpp (Windows): present through a DXGI flip-model swap chain; nullptr if unavailable.
++    extern bool VulkanDxgiPresent;
++    std::unique_ptr<RenderSwapChain> CreateVulkanDxgiSwapChain(VulkanCommandQueue *queue, const RenderSwapChainDesc &desc);
++
+     struct VulkanSwapChain : RenderSwapChain {
+         RenderSwapChainDesc desc;
+         VkSwapchainKHR vk = VK_NULL_HANDLE;
+@@ -420,6 +424,7 @@
+         std::unique_ptr<RenderBuffer> nullBuffer;
+         bool loadStoreOpNoneSupported = false;
+         bool fullScreenExclusiveSupported = false;  // VK_EXT_full_screen_exclusive enabled (Windows)
++        bool dxgiPresentSupported = false;  // VulkanDxgiPresent: external memory + keyed mutex enabled
+         bool nullDescriptorSupported = false;
+ 
+         // Driver pipeline cache, saved beside the exe between runs (see setVulkanPipelineCacheDirectory).
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -77,8 +77,16 @@
+     )
+ endif()
+ 
++if(WIN32)
++    # Vulkan presented through a DXGI flip-model swap chain (VulkanDxgiPresent).
++    list(APPEND PLUME_SOURCES plume_vulkan_dxgi.cpp)
++endif()
++
+ # Create target
+ add_library(plume STATIC ${PLUME_SOURCES})
++if(WIN32)
++    target_link_libraries(plume PUBLIC d3d11 dxgi)
++endif()
+ 
+ # Include directories
+ target_include_directories(plume PUBLIC
+--- a/plume_vulkan_dxgi.cpp
++++ b/plume_vulkan_dxgi.cpp
+@@ -0,0 +1,548 @@
++// Vulkan rendering presented through a DXGI flip-model swap chain (Windows, opt-in: VulkanDxgiPresent).
++//
++// Why: Intel's UHD 630 Vulkan driver presents a full-screen window by a copy through the desktop compositor
++// ("Composed: Copy with GPU GDI" in PresentMon) and refuses exclusive full screen even when it reports support
++// (WWE '13 run vxf1). D3D11/D3D12 swap chains on the same GPU get "Hardware Composed: Independent Flip".
++//
++// How: the renderer draws into Vulkan images whose memory is a D3D11 texture shared by NT handle
++// (VK_KHR_external_memory_win32, handle type D3D11_TEXTURE; the UHD 630 driver imports it, dedicated only).
++// Ownership moves with the texture's keyed mutex (VK_KHR_win32_keyed_mutex): Vulkan acquires key 0 before the
++// frame and releases key 1 after it; a present thread acquires key 1, copies the texture into the DXGI back
++// buffer, releases key 0 and presents. The render thread never waits for the GPU here; the keyed mutex and the
++// texture count bound how far it runs ahead. (The UHD 630 driver cannot import a D3D11/D3D12 fence into Vulkan,
++// so the keyed mutex is the synchronisation; probe vkprobe 2026-11-20.)
++
++#if defined(_WIN64)
++
++#include "plume_vulkan.h"
++
++#include <d3d11_1.h>
++#include <dxgi1_6.h>
++#include <wrl/client.h>
++
++#include <condition_variable>
++#include <cstdio>
++#include <deque>
++#include <thread>
++#include <vector>
++
++namespace plume {
++
++using Microsoft::WRL::ComPtr;
++
++bool VulkanDxgiPresent = false;
++VkFormat toVk(RenderFormat format);  // plume_vulkan.cpp
++
++namespace {
++
++constexpr uint64_t kKeyVulkan = 0;   // Vulkan may write the texture
++constexpr uint64_t kKeyPresent = 1;  // the present thread may read it
++constexpr uint32_t kVkAcquireTimeoutMs = 1000;
++constexpr DWORD kD3DAcquireTimeoutMs = 1000;
++
++struct VulkanDxgiSwapChain : RenderSwapChain {
++    struct Image {
++        ComPtr<ID3D11Texture2D> texture11;
++        ComPtr<IDXGIKeyedMutex> mutex11;
++        HANDLE shared = nullptr;
++        VkImage image = VK_NULL_HANDLE;
++        VkDeviceMemory memory = VK_NULL_HANDLE;
++        VkCommandBuffer acquireCommands = VK_NULL_HANDLE;
++        VkCommandBuffer releaseCommands = VK_NULL_HANDLE;
++        bool heldByVulkan = false;  // acquired (key 0) and not yet released: a frame abandoned after acquire
++    };
++
++    VulkanCommandQueue *queue = nullptr;
++    VulkanDevice *device = nullptr;
++    RenderSwapChainDesc desc;
++    uint32_t width = 0;
++    uint32_t height = 0;
++    bool vsync = true;
++    bool tearingSupported = false;
++    UINT swapChainFlags = 0;
++
++    ComPtr<IDXGIFactory2> factory;
++    ComPtr<ID3D11Device> device11;
++    ComPtr<ID3D11DeviceContext> context11;
++    ComPtr<IDXGISwapChain1> swapChain;
++
++    VkCommandPool commandPool = VK_NULL_HANDLE;
++    std::vector<Image> images;
++    std::vector<VulkanTexture> textures;
++    uint32_t nextImage = 0;
++
++    std::thread presentThread;
++    std::mutex presentMutex;
++    std::condition_variable presentCv;
++    std::deque<uint32_t> presentQueue;
++    bool presentBusy = false;
++    bool stopping = false;
++    uint32_t presentFailures = 0;
++
++    bool init(VulkanCommandQueue *q, const RenderSwapChainDesc &d) {
++        queue = q;
++        device = q->device;
++        desc = d;
++        if (desc.format != RenderFormat::B8G8R8A8_UNORM) {
++            fprintf(stderr, "[plume-dxgi] swap chain format %u not handled\n", uint32_t(desc.format));
++            return false;
++        }
++        // The D3D11 device must be on the GPU Vulkan renders with: match the adapter LUID.
++        VkPhysicalDeviceIDProperties idProps = {};
++        idProps.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES;
++        VkPhysicalDeviceProperties2 props2 = {};
++        props2.sType = VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2;
++        props2.pNext = &idProps;
++        vkGetPhysicalDeviceProperties2(device->physicalDevice, &props2);
++        if (!idProps.deviceLUIDValid) {
++            fprintf(stderr, "[plume-dxgi] Vulkan device has no LUID\n");
++            return false;
++        }
++        LUID luid;
++        memcpy(&luid, idProps.deviceLUID, sizeof(luid));
++        ComPtr<IDXGIFactory4> factory4;
++        if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory4)))) {
++            fprintf(stderr, "[plume-dxgi] CreateDXGIFactory1 failed\n");
++            return false;
++        }
++        factory4.As(&factory);
++        ComPtr<IDXGIAdapter1> adapter;
++        if (FAILED(factory4->EnumAdapterByLuid(luid, IID_PPV_ARGS(&adapter)))) {
++            fprintf(stderr, "[plume-dxgi] no DXGI adapter for the Vulkan device's LUID\n");
++            return false;
++        }
++        ComPtr<IDXGIFactory5> factory5;
++        if (SUCCEEDED(factory4.As(&factory5))) {
++            BOOL allow = FALSE;
++            tearingSupported = SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allow,
++                                                                       sizeof(allow))) && allow;
++        }
++        swapChainFlags = tearingSupported ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0;
++        const D3D_FEATURE_LEVEL levels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
++        HRESULT hr = D3D11CreateDevice(adapter.Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr,
++                                       D3D11_CREATE_DEVICE_BGRA_SUPPORT, levels, 2, D3D11_SDK_VERSION,
++                                       &device11, nullptr, &context11);
++        if (FAILED(hr)) {
++            fprintf(stderr, "[plume-dxgi] D3D11CreateDevice failed 0x%08X\n", uint32_t(hr));
++            return false;
++        }
++        VkCommandPoolCreateInfo poolInfo = {};
++        poolInfo.sType = VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO;
++        poolInfo.queueFamilyIndex = queue->familyIndex;
++        if (vkCreateCommandPool(device->vk, &poolInfo, nullptr, &commandPool) != VK_SUCCESS) {
++            fprintf(stderr, "[plume-dxgi] vkCreateCommandPool failed\n");
++            return false;
++        }
++        // Probe the whole sharing path once (D3D11 shared texture -> Vulkan import -> keyed mutex): a driver that
++        // cannot do it must fail here, where the caller still falls back to the Vulkan swap chain.
++        {
++            width = 64;
++            height = 64;
++            Image probe;
++            images.clear();
++            const bool ok = createImage(probe);
++            images.push_back(std::move(probe));
++            releaseImages();
++            width = 0;
++            height = 0;
++            if (!ok) {
++                fprintf(stderr, "[plume-dxgi] shared-texture probe failed on this driver\n");
++                return false;
++            }
++        }
++        presentThread = std::thread([this] { presentLoop(); });
++        DXGI_ADAPTER_DESC1 adesc = {};
++        adapter->GetDesc1(&adesc);
++        fprintf(stderr, "[plume-dxgi] presenting through DXGI on %ls (tearing %s)\n", adesc.Description,
++                tearingSupported ? "yes" : "no");
++        return true;
++    }
++
++    ~VulkanDxgiSwapChain() override {
++        {
++            std::unique_lock lock(presentMutex);
++            stopping = true;
++        }
++        presentCv.notify_all();
++        if (presentThread.joinable())
++            presentThread.join();
++        if (device != nullptr) {
++            {
++                const std::scoped_lock queueLock(*queue->queue->mutex);
++                vkQueueWaitIdle(queue->queue->vk);
++            }
++            releaseImages();
++            if (commandPool != VK_NULL_HANDLE)
++                vkDestroyCommandPool(device->vk, commandPool, nullptr);
++        }
++    }
++
++    // Present thread: hand each finished image to DXGI in submission order.
++    void presentLoop() {
++        for (;;) {
++            uint32_t index;
++            {
++                std::unique_lock lock(presentMutex);
++                presentCv.wait(lock, [this] { return stopping || !presentQueue.empty(); });
++                if (stopping)
++                    return;
++                index = presentQueue.front();
++                presentQueue.pop_front();
++                presentBusy = true;
++            }
++            Image &img = images[index];
++            const HRESULT acquired = img.mutex11->AcquireSync(kKeyPresent, kD3DAcquireTimeoutMs);
++            if (acquired == S_OK) {
++                ComPtr<ID3D11Texture2D> back;
++                if (SUCCEEDED(swapChain->GetBuffer(0, IID_PPV_ARGS(&back))))
++                    context11->CopyResource(back.Get(), img.texture11.Get());
++                img.mutex11->ReleaseSync(kKeyVulkan);
++                const UINT flags = (!vsync && tearingSupported) ? DXGI_PRESENT_ALLOW_TEARING : 0;
++                const HRESULT hr = swapChain->Present(vsync ? 1 : 0, flags);
++                if (FAILED(hr) && presentFailures++ < 8)
++                    fprintf(stderr, "[plume-dxgi] Present failed 0x%08X\n", uint32_t(hr));
++            } else if (presentFailures++ < 8) {
++                fprintf(stderr, "[plume-dxgi] keyed mutex acquire for image %u returned 0x%08X, frame dropped\n",
++                        index, uint32_t(acquired));
++            }
++            {
++                std::unique_lock lock(presentMutex);
++                presentBusy = false;
++            }
++            presentCv.notify_all();
++        }
++    }
++
++    void drainPresents() {
++        std::unique_lock lock(presentMutex);
++        presentCv.wait(lock, [this] { return presentQueue.empty() && !presentBusy; });
++    }
++
++    void releaseImages() {
++        textures.clear();  // image views (the images are not owned by VulkanTexture)
++        for (Image &img : images) {
++            if (img.acquireCommands != VK_NULL_HANDLE)
++                vkFreeCommandBuffers(device->vk, commandPool, 1, &img.acquireCommands);
++            if (img.releaseCommands != VK_NULL_HANDLE)
++                vkFreeCommandBuffers(device->vk, commandPool, 1, &img.releaseCommands);
++            if (img.image != VK_NULL_HANDLE)
++                vkDestroyImage(device->vk, img.image, nullptr);
++            if (img.memory != VK_NULL_HANDLE)
++                vkFreeMemory(device->vk, img.memory, nullptr);
++            if (img.shared != nullptr)
++                CloseHandle(img.shared);
++        }
++        images.clear();
++    }
++
++    void recordOwnership(VkCommandBuffer cb, VkImage image, bool toVulkan) {
++        VkCommandBufferBeginInfo begin = {};
++        begin.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO;
++        vkBeginCommandBuffer(cb, &begin);
++        VkImageMemoryBarrier barrier = {};
++        barrier.sType = VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER;
++        barrier.image = image;
++        barrier.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
++        if (toVulkan) {
++            // Contents are rewritten every frame: start from UNDEFINED, end in the layout the renderer
++            // tracks for a presented image (it transitions PRESENT -> its own layouts).
++            barrier.srcQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++            barrier.dstQueueFamilyIndex = queue->familyIndex;
++            barrier.oldLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++            barrier.newLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++            barrier.srcAccessMask = 0;
++            barrier.dstAccessMask = 0;
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, 0, 0,
++                                 nullptr, 0, nullptr, 1, &barrier);
++        } else {
++            barrier.srcQueueFamilyIndex = queue->familyIndex;
++            barrier.dstQueueFamilyIndex = VK_QUEUE_FAMILY_EXTERNAL;
++            barrier.oldLayout = VK_IMAGE_LAYOUT_PRESENT_SRC_KHR;
++            barrier.newLayout = VK_IMAGE_LAYOUT_GENERAL;
++            barrier.srcAccessMask = VK_ACCESS_COLOR_ATTACHMENT_WRITE_BIT | VK_ACCESS_TRANSFER_WRITE_BIT;
++            barrier.dstAccessMask = 0;
++            vkCmdPipelineBarrier(cb, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT, 0,
++                                 0, nullptr, 0, nullptr, 1, &barrier);
++        }
++        vkEndCommandBuffer(cb);
++    }
++
++    bool createImage(Image &img) {
++        D3D11_TEXTURE2D_DESC td = {};
++        td.Width = width;
++        td.Height = height;
++        td.MipLevels = 1;
++        td.ArraySize = 1;
++        td.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++        td.SampleDesc.Count = 1;
++        td.Usage = D3D11_USAGE_DEFAULT;
++        td.BindFlags = D3D11_BIND_RENDER_TARGET | D3D11_BIND_SHADER_RESOURCE;
++        td.MiscFlags = D3D11_RESOURCE_MISC_SHARED_NTHANDLE | D3D11_RESOURCE_MISC_SHARED_KEYEDMUTEX;
++        HRESULT hr = device11->CreateTexture2D(&td, nullptr, &img.texture11);
++        if (FAILED(hr)) {
++            fprintf(stderr, "[plume-dxgi] CreateTexture2D failed 0x%08X\n", uint32_t(hr));
++            return false;
++        }
++        ComPtr<IDXGIResource1> resource;
++        img.texture11.As(&resource);
++        img.texture11.As(&img.mutex11);
++        if (!resource || !img.mutex11 ||
++            FAILED(resource->CreateSharedHandle(nullptr, DXGI_SHARED_RESOURCE_READ | DXGI_SHARED_RESOURCE_WRITE,
++                                                nullptr, &img.shared))) {
++            fprintf(stderr, "[plume-dxgi] shared handle / keyed mutex unavailable\n");
++            return false;
++        }
++
++        VkExternalMemoryImageCreateInfo externalInfo = {};
++        externalInfo.sType = VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_IMAGE_CREATE_INFO;
++        externalInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
++        VkImageCreateInfo ici = {};
++        ici.sType = VK_STRUCTURE_TYPE_IMAGE_CREATE_INFO;
++        ici.pNext = &externalInfo;
++        ici.imageType = VK_IMAGE_TYPE_2D;
++        ici.format = toVk(desc.format);
++        ici.extent = {width, height, 1};
++        ici.mipLevels = 1;
++        ici.arrayLayers = 1;
++        ici.samples = VK_SAMPLE_COUNT_1_BIT;
++        ici.tiling = VK_IMAGE_TILING_OPTIMAL;
++        ici.usage = VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT | VK_IMAGE_USAGE_TRANSFER_DST_BIT;
++        ici.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
++        ici.initialLayout = VK_IMAGE_LAYOUT_UNDEFINED;
++        VkResult res = vkCreateImage(device->vk, &ici, nullptr, &img.image);
++        if (res != VK_SUCCESS) {
++            fprintf(stderr, "[plume-dxgi] vkCreateImage (external) failed 0x%X\n", res);
++            return false;
++        }
++        VkMemoryRequirements req = {};
++        vkGetImageMemoryRequirements(device->vk, img.image, &req);
++        VkMemoryWin32HandlePropertiesKHR handleProps = {};
++        handleProps.sType = VK_STRUCTURE_TYPE_MEMORY_WIN32_HANDLE_PROPERTIES_KHR;
++        res = vkGetMemoryWin32HandlePropertiesKHR(device->vk, VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT,
++                                                  img.shared, &handleProps);
++        const uint32_t bits = req.memoryTypeBits & (res == VK_SUCCESS ? handleProps.memoryTypeBits : ~0u);
++        if (bits == 0) {
++            fprintf(stderr, "[plume-dxgi] no memory type for the shared texture (0x%X)\n", res);
++            return false;
++        }
++        uint32_t typeIndex = 0;
++        while (!(bits & (1u << typeIndex)))
++            ++typeIndex;
++        VkMemoryDedicatedAllocateInfo dedicated = {};
++        dedicated.sType = VK_STRUCTURE_TYPE_MEMORY_DEDICATED_ALLOCATE_INFO;
++        dedicated.image = img.image;
++        VkImportMemoryWin32HandleInfoKHR import = {};
++        import.sType = VK_STRUCTURE_TYPE_IMPORT_MEMORY_WIN32_HANDLE_INFO_KHR;
++        import.pNext = &dedicated;
++        import.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D11_TEXTURE_BIT;
++        import.handle = img.shared;
++        VkMemoryAllocateInfo alloc = {};
++        alloc.sType = VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO;
++        alloc.pNext = &import;
++        alloc.allocationSize = req.size;
++        alloc.memoryTypeIndex = typeIndex;
++        res = vkAllocateMemory(device->vk, &alloc, nullptr, &img.memory);
++        if (res != VK_SUCCESS) {
++            fprintf(stderr, "[plume-dxgi] import of the shared texture failed 0x%X\n", res);
++            return false;
++        }
++        res = vkBindImageMemory(device->vk, img.image, img.memory, 0);
++        if (res != VK_SUCCESS) {
++            fprintf(stderr, "[plume-dxgi] vkBindImageMemory failed 0x%X\n", res);
++            return false;
++        }
++        VkCommandBufferAllocateInfo cbInfo = {};
++        cbInfo.sType = VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO;
++        cbInfo.commandPool = commandPool;
++        cbInfo.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
++        cbInfo.commandBufferCount = 1;
++        if (vkAllocateCommandBuffers(device->vk, &cbInfo, &img.acquireCommands) != VK_SUCCESS ||
++            vkAllocateCommandBuffers(device->vk, &cbInfo, &img.releaseCommands) != VK_SUCCESS)
++            return false;
++        recordOwnership(img.acquireCommands, img.image, true);
++        recordOwnership(img.releaseCommands, img.image, false);
++        return true;
++    }
++
++    void getWindowSize(uint32_t &w, uint32_t &h) const {
++        RECT rect = {};
++        GetClientRect(desc.renderWindow, &rect);
++        w = uint32_t(rect.right - rect.left);
++        h = uint32_t(rect.bottom - rect.top);
++    }
++
++    bool resize() override {
++        uint32_t w, h;
++        getWindowSize(w, h);
++        if (w == 0 || h == 0)
++            return false;
++        drainPresents();
++        {
++            const std::scoped_lock queueLock(*queue->queue->mutex);
++            vkQueueWaitIdle(queue->queue->vk);
++        }
++        releaseImages();
++        width = w;
++        height = h;
++        HRESULT hr;
++        if (!swapChain) {
++            DXGI_SWAP_CHAIN_DESC1 sd = {};
++            sd.Width = width;
++            sd.Height = height;
++            sd.Format = DXGI_FORMAT_B8G8R8A8_UNORM;
++            sd.SampleDesc.Count = 1;
++            sd.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++            sd.BufferCount = 2;
++            sd.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++            sd.Flags = swapChainFlags;
++            hr = factory->CreateSwapChainForHwnd(device11.Get(), desc.renderWindow, &sd, nullptr, nullptr,
++                                                 &swapChain);
++            if (FAILED(hr)) {
++                fprintf(stderr, "[plume-dxgi] CreateSwapChainForHwnd failed 0x%08X\n", uint32_t(hr));
++                return false;
++            }
++            factory->MakeWindowAssociation(desc.renderWindow, DXGI_MWA_NO_ALT_ENTER);
++        } else {
++            hr = swapChain->ResizeBuffers(0, width, height, DXGI_FORMAT_UNKNOWN, swapChainFlags);
++            if (FAILED(hr)) {
++                fprintf(stderr, "[plume-dxgi] ResizeBuffers failed 0x%08X\n", uint32_t(hr));
++                return false;
++            }
++        }
++        images.resize(desc.textureCount);
++        for (Image &img : images) {
++            if (!createImage(img)) {
++                releaseImages();
++                return false;
++            }
++        }
++        textures.resize(desc.textureCount);
++        for (uint32_t i = 0; i < desc.textureCount; i++) {
++            textures[i] = VulkanTexture(device, images[i].image);
++            textures[i].desc.dimension = RenderTextureDimension::TEXTURE_2D;
++            textures[i].desc.format = desc.format;
++            textures[i].desc.width = width;
++            textures[i].desc.height = height;
++            textures[i].desc.depth = 1;
++            textures[i].desc.mipLevels = 1;
++            textures[i].desc.arraySize = 1;
++            textures[i].desc.flags = RenderTextureFlag::RENDER_TARGET;
++            textures[i].fillSubresourceRange();
++            textures[i].createImageView(toVk(desc.format));
++        }
++        nextImage = 0;
++        fprintf(stderr, "[plume-dxgi] swap chain %ux%u, %u shared images\n", width, height, desc.textureCount);
++        return true;
++    }
++
++    bool submitOwnership(uint32_t index, bool toVulkan, VkSemaphore *waits, uint32_t waitCount,
++                         VkSemaphore signal) {
++        Image &img = images[index];
++        const uint64_t key = toVulkan ? kKeyVulkan : kKeyPresent;
++        // Already ours (a frame was abandoned after its acquire): acquiring key 0 again would wait on itself.
++        const bool keyedOp = toVulkan ? !img.heldByVulkan : img.heldByVulkan;
++        const uint32_t timeout = kVkAcquireTimeoutMs;
++        VkWin32KeyedMutexAcquireReleaseInfoKHR keyed = {};
++        keyed.sType = VK_STRUCTURE_TYPE_WIN32_KEYED_MUTEX_ACQUIRE_RELEASE_INFO_KHR;
++        if (!keyedOp) {
++            // no keyed-mutex transfer in this submit
++        } else if (toVulkan) {
++            keyed.acquireCount = 1;
++            keyed.pAcquireSyncs = &img.memory;
++            keyed.pAcquireKeys = &key;
++            keyed.pAcquireTimeouts = &timeout;
++        } else {
++            keyed.releaseCount = 1;
++            keyed.pReleaseSyncs = &img.memory;
++            keyed.pReleaseKeys = &key;
++        }
++        std::vector<VkPipelineStageFlags> stages(waitCount, VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++        VkSubmitInfo submit = {};
++        submit.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
++        submit.pNext = keyedOp ? &keyed : nullptr;
++        submit.waitSemaphoreCount = waitCount;
++        submit.pWaitSemaphores = waitCount ? waits : nullptr;
++        submit.pWaitDstStageMask = waitCount ? stages.data() : nullptr;
++        submit.commandBufferCount = 1;
++        submit.pCommandBuffers = toVulkan ? &img.acquireCommands : &img.releaseCommands;
++        submit.signalSemaphoreCount = signal != VK_NULL_HANDLE ? 1 : 0;
++        submit.pSignalSemaphores = signal != VK_NULL_HANDLE ? &signal : nullptr;
++        VkResult res;
++        {
++            const std::scoped_lock queueLock(*queue->queue->mutex);
++            res = vkQueueSubmit(queue->queue->vk, 1, &submit, VK_NULL_HANDLE);
++        }
++        if (res != VK_SUCCESS) {
++            if (presentFailures++ < 8)
++                fprintf(stderr, "[plume-dxgi] %s submit failed 0x%X\n", toVulkan ? "acquire" : "release", res);
++            return false;
++        }
++        img.heldByVulkan = toVulkan;
++        return true;
++    }
++
++    bool acquireTexture(RenderCommandSemaphore *signalSemaphore, uint32_t *textureIndex) override {
++        if (images.empty())
++            return false;
++        const uint32_t index = nextImage;
++        nextImage = (nextImage + 1) % uint32_t(images.size());
++        auto *semaphore = static_cast<VulkanCommandSemaphore *>(signalSemaphore);
++        if (!submitOwnership(index, true, nullptr, 0, semaphore->vk))
++            return false;
++        *textureIndex = index;
++        return true;
++    }
++
++    bool present(uint32_t textureIndex, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount) override {
++        thread_local std::vector<VkSemaphore> waits;
++        waits.clear();
++        for (uint32_t i = 0; i < waitSemaphoreCount; i++)
++            waits.push_back(static_cast<VulkanCommandSemaphore *>(waitSemaphores[i])->vk);
++        if (!submitOwnership(textureIndex, false, waits.data(), uint32_t(waits.size()), VK_NULL_HANDLE))
++            return false;
++        {
++            std::unique_lock lock(presentMutex);
++            presentQueue.push_back(textureIndex);
++        }
++        presentCv.notify_all();
++        return true;
++    }
++
++    void wait() override {}
++    bool needsResize() const override {
++        uint32_t w, h;
++        getWindowSize(w, h);
++        return !swapChain || images.empty() || w != width || h != height;
++    }
++    void setVsyncEnabled(bool enabled) override { vsync = enabled; }
++    bool isVsyncEnabled() const override { return vsync; }
++    uint32_t getWidth() const override { return width; }
++    uint32_t getHeight() const override { return height; }
++    RenderTexture *getTexture(uint32_t textureIndex) override { return &textures[textureIndex]; }
++    uint32_t getTextureCount() const override { return desc.textureCount; }
++    RenderWindow getWindow() const override { return desc.renderWindow; }
++    bool isEmpty() const override { return !swapChain || images.empty() || width == 0 || height == 0; }
++    uint32_t getRefreshRate() const override {
++        DEVMODEW mode = {};
++        mode.dmSize = sizeof(mode);
++        HMONITOR monitor = MonitorFromWindow(desc.renderWindow, MONITOR_DEFAULTTOPRIMARY);
++        MONITORINFOEXW info = {};
++        info.cbSize = sizeof(info);
++        if (GetMonitorInfoW(monitor, &info) && EnumDisplaySettingsW(info.szDevice, ENUM_CURRENT_SETTINGS, &mode))
++            return mode.dmDisplayFrequency;
++        return 0;
++    }
++};
++
++}  // namespace
++
++std::unique_ptr<RenderSwapChain> CreateVulkanDxgiSwapChain(VulkanCommandQueue *queue, const RenderSwapChainDesc &desc) {
++    auto swapChain = std::make_unique<VulkanDxgiSwapChain>();
++    if (!swapChain->init(queue, desc))
++        return nullptr;
++    return swapChain;
++}
++
++}  // namespace plume
++
++#endif  // _WIN64

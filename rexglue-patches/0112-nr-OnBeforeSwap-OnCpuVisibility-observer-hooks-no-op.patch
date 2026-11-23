@@ -1,0 +1,96 @@
+From 041a4205cf402e2d695512a141fcbd356f54e17a Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Wed, 7 Oct 2026 20:06:12 -0700
+Subject: [PATCH 112/149] nr: OnBeforeSwap + OnCpuVisibility observer hooks
+ (no-op without observer)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+(cherry picked from commit 661d98524d5a371dc1283f693b6b2ea81a511b13)
+---
+ include/rex/graphics/draw_observer.h |  8 ++++++++
+ src/graphics/command_processor.cpp   | 22 ++++++++++++++++++----
+ 2 files changed, 26 insertions(+), 4 deletions(-)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index e07710de..4a4c415b 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -54,6 +54,14 @@ class DrawObserver {
+     (void)physical_base;
+     (void)length;
+   }
++  // XE_SWAP packet, before IssueSwap reads the frontbuffer (texture fetch 0) from guest memory.
++  virtual void OnBeforeSwap() {}
++  // MakeGpuWritesVisibleToCpu(physical range) was served (after the backend's ReadbackGpuWrittenRange), on the
++  // GPU command processor thread: a CPU reader is about to read this range.
++  virtual void OnCpuVisibility(uint32_t physical_base, uint32_t length) {
++    (void)physical_base;
++    (void)length;
++  }
+ };
+ 
+ // Request a compare window for the next frame (thread-safe; a no-op unless
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index ec7e6663..ce2fcb4c 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -125,6 +125,10 @@ REXCVAR_DEFINE_BOOL(async_shader_compilation, true, "GPU",
+ 
+ namespace rex::graphics {
+ 
++namespace {
++CommandProcessor* g_nr_command_processor = nullptr;  // set on the CP thread before observer calls
++}  // namespace
++
+ using namespace rex::graphics::xenos;
+ 
+ namespace {
+@@ -314,7 +318,12 @@ bool CommandProcessor::MakeGpuWritesVisibleToCpu(uint32_t guest_address, uint32_
+   uint32_t physical_address =
+       static_cast<memory::PhysicalHeap*>(heap)->GetPhysicalAddress(guest_address);
+   if (system::XThread::IsInThread(worker_thread_.get())) {
+-    return ReadbackGpuWrittenRange(physical_address, length);
++    const bool result = ReadbackGpuWrittenRange(physical_address, length);
++    if (DrawObserver* observer = GetDrawObserver()) {
++      g_nr_command_processor = this;
++      observer->OnCpuVisibility(physical_address, length);
++    }
++    return result;
+   }
+   std::lock_guard<std::mutex> caller_lock(cpu_visibility_caller_mutex_);
+   std::unique_lock<std::mutex> lock(cpu_visibility_mutex_);
+@@ -343,6 +352,10 @@ void CommandProcessor::ServiceCpuVisibilityRequest() {
+     length = cpu_visibility_length_;
+   }
+   bool result = ReadbackGpuWrittenRange(start, length);
++  if (DrawObserver* observer = GetDrawObserver()) {
++    g_nr_command_processor = this;
++    observer->OnCpuVisibility(start, length);
++  }
+   {
+     std::lock_guard<std::mutex> lock(cpu_visibility_mutex_);
+     cpu_visibility_pending_.store(false, std::memory_order_release);
+@@ -1350,6 +1363,10 @@ bool CommandProcessor::ExecutePacketType3_XE_SWAP(memory::RingBuffer* reader, ui
+   uint32_t frontbuffer_height = reader->ReadAndSwap<uint32_t>();
+   reader->AdvanceRead((count - 4) * sizeof(uint32_t));
+ 
++  if (DrawObserver* observer = GetDrawObserver()) {
++    g_nr_command_processor = this;
++    observer->OnBeforeSwap();
++  }
+   IssueSwap(frontbuffer_ptr, frontbuffer_width, frontbuffer_height);
+ 
+   ++counter_;
+@@ -1869,9 +1886,6 @@ std::string NrCompareSdkDir() {
+ }
+ }  // namespace
+ 
+-namespace {
+-CommandProcessor* g_nr_command_processor = nullptr;  // set on the CP thread before observer calls
+-}  // namespace
+ 
+ void NrInvalidateGuestRange(uint32_t physical_base, uint32_t length) {
+   if (g_nr_command_processor && length) {
+-- 
+2.43.0
+

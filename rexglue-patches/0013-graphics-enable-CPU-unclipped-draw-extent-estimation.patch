@@ -1,7 +1,7 @@
 From 0b67292185cfe1a779cc1f5971ef9dc7dc3f560e Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 20:41:36 -0700
-Subject: [PATCH 13/97] graphics: enable CPU unclipped-draw extent estimation
+Subject: [PATCH 013/149] graphics: enable CPU unclipped-draw extent estimation
  (match upstream Xenia); fixes 4x depth surface EDRAM wrap
 
 ---
@@ -9,7 +9,7 @@ Subject: [PATCH 13/97] graphics: enable CPU unclipped-draw extent estimation
  1 file changed, 1 insertion(+), 1 deletion(-)
 
 diff --git a/src/graphics/util/draw_extent_estimator.cpp b/src/graphics/util/draw_extent_estimator.cpp
-index 47d40f7..07debab 100644
+index 47d40f74..07debab3 100644
 --- a/src/graphics/util/draw_extent_estimator.cpp
 +++ b/src/graphics/util/draw_extent_estimator.cpp
 @@ -24,7 +24,7 @@

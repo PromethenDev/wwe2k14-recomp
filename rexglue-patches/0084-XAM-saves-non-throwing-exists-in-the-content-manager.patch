@@ -1,7 +1,7 @@
 From 063a1cce30be13b8f02bfdc4aa0265c5cc153e9a Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 23:23:54 -0700
-Subject: [PATCH 84/97] XAM saves: non-throwing exists() in the content
+Subject: [PATCH 084/149] XAM saves: non-throwing exists() in the content
  manager; log a failed content header write
 
 Review v2-sdk.md (bug hunt 2026-10-02): std::filesystem::exists(path) throws on permission-denied status lookups,
@@ -13,7 +13,7 @@ logs when the header write fails (the package itself was created and stays open,
  2 files changed, 23 insertions(+), 9 deletions(-)
 
 diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
-index 4289c96..47378e4 100644
+index 4289c962..47378e43 100644
 --- a/src/kernel/xam/xam_content.cpp
 +++ b/src/kernel/xam/xam_content.cpp
 @@ -224,7 +224,12 @@ ppc_u32_result_t xeXamContentCreate(const char* api_name, ppc_u32_t user_index,
@@ -31,7 +31,7 @@ index 4289c96..47378e4 100644
      } else if (disposition == kDispositionState::Open) {
        result = content_manager->OpenContent(root_name, xuid, content_data, content_license);
 diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
-index ea5b9bf..50c7d6b 100644
+index ea5b9bfb..50c7d6bc 100644
 --- a/src/system/xam/content_manager.cpp
 +++ b/src/system/xam/content_manager.cpp
 @@ -24,6 +24,15 @@

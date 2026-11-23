@@ -1,7 +1,7 @@
 From 30422f3c820b45f99dcb37b87df36e83e90dec20 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sun, 27 Sep 2026 13:37:15 -0700
-Subject: [PATCH 54/97] graphics: an empty resolve region is a successful
+Subject: [PATCH 054/149] graphics: an empty resolve region is a successful
  zero-pixel no-op (was a failed draw + error per call); bounded diagnostic of
  the inputs
 
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 220 insertions(+), 13 deletions(-)
 
 diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
-index 200afc0..70c8a7e 100644
+index 200afc09..70c8a7e3 100644
 --- a/src/graphics/util/draw.cpp
 +++ b/src/graphics/util/draw.cpp
 @@ -10,7 +10,13 @@

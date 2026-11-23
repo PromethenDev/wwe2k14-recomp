@@ -7,6 +7,7 @@
 #include <cassert>
 #include <chrono>
 #include <filesystem>
+#include <fstream>
 #include <iostream>
 #include <thread>
 
@@ -54,6 +55,49 @@ int main() {
   request_cancel.join();
   assert(cancelled.ok);
   assert(elapsed < std::chrono::seconds(2));
+#ifndef _WIN32
+  {
+    // GitHub #107: leftover guest memory files from forced closes are removed; mapped and fresh ones stay.
+    namespace fs = std::filesystem;
+    const fs::path root = fs::temp_directory_path() / "k14-stale-shm-test";
+    fs::remove_all(root);
+    fs::create_directories(root / "shm");
+    fs::create_directories(root / "proc" / "4242");
+    fs::create_directories(root / "proc" / "self-ish");
+    auto make = [&](const char* name, bool old) {
+      std::ofstream(root / "shm" / name) << std::string(8192, 'x');
+      if (old) fs::last_write_time(root / "shm" / name, fs::file_time_type::clock::now() - std::chrono::hours(2));
+    };
+    make("xenia_memory_111", true);   // stale: must go
+    make("xenia_memory_222", true);   // mapped by pid 4242: must stay
+    make("xenia_memory_333", false);  // just created: must stay
+    make("other_file", true);         // not ours: must stay
+    std::ofstream(root / "proc" / "4242" / "maps")
+        << "7f0000000000-7f0100000000 rw-s 00000000 00:1a 123 /dev/shm/xenia_memory_222\n";
+    const wwe2k14::launcher::StaleMemoryCleanup cleaned =
+        wwe2k14::launcher::RemoveStaleGuestMemoryFiles(root / "shm", 30.0, root / "proc");
+    assert(cleaned.files == 1);
+    assert(!fs::exists(root / "shm" / "xenia_memory_111"));
+    assert(fs::exists(root / "shm" / "xenia_memory_222"));
+    assert(fs::exists(root / "shm" / "xenia_memory_333"));
+    assert(fs::exists(root / "shm" / "other_file"));
+    // V152 review: a process of this user whose maps cannot be read blocks the whole cleanup (fail closed).
+    make("xenia_memory_444", true);
+    fs::create_directories(root / "proc" / "5151");
+    std::ofstream(root / "proc" / "5151" / "maps") << "unreadable\n";
+    fs::permissions(root / "proc" / "5151" / "maps", fs::perms::none);
+    const bool can_read_anyway = static_cast<bool>(std::ifstream(root / "proc" / "5151" / "maps"));  // root ignores modes
+    const wwe2k14::launcher::StaleMemoryCleanup blocked =
+        wwe2k14::launcher::RemoveStaleGuestMemoryFiles(root / "shm", 30.0, root / "proc");
+    if (!can_read_anyway) {
+      assert(blocked.files == 0);
+      assert(fs::exists(root / "shm" / "xenia_memory_444"));
+    }
+    fs::permissions(root / "proc" / "5151" / "maps", fs::perms::owner_all);
+    fs::remove_all(root);
+    std::cout << "PASS stale guest memory cleanup (fail closed on an unreadable process)\n";
+  }
+#endif
   std::cout << "PASS startup watch reports an unsuccessful early exit, accepts exit code 0, and observes cancellation promptly\n";
   return 0;
 }

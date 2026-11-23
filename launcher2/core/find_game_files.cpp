@@ -146,6 +146,19 @@ std::vector<fs::path> SearchRoots(const fs::path& exe_dir, const fs::path& home)
 
 }  // namespace
 
+std::vector<fs::path> InstallationSearchRoots(const Paths& paths) {
+  const fs::path home = HomeDirectory();
+  std::vector<fs::path> roots = SearchRoots(paths.exe_dir, home);
+  if (!HasTestSearchRootOverride()) {
+    // The home directory is already a search root. Add the usual personal folders as roots too,
+    // so installations nested several folders below Downloads/Desktop/Documents remain in range.
+    AddUnique(roots, home / "Downloads");
+    AddUnique(roots, home / "Desktop");
+    AddUnique(roots, home / "Documents");
+  }
+  return roots;
+}
+
 std::vector<FoundGame> FindGameFiles(const Paths& paths, const ProgressFn& progress,
                                      const CancelFlag& cancel) {
   try {

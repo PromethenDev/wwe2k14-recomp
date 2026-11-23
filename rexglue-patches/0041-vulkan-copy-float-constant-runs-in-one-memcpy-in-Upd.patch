@@ -1,7 +1,7 @@
 From abf13330cc42c3e33553330b93511580b0683200 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 22:55:25 -0700
-Subject: [PATCH 41/97] vulkan: copy float-constant runs in one memcpy in
+Subject: [PATCH 041/149] vulkan: copy float-constant runs in one memcpy in
  UpdateBindings
 
 Live in-ring profile (Linux, 4-man tag match): 37% of UpdateBindings samples
@@ -13,6 +13,7 @@ Deterministic A/B (same F9 trace replayed 400x, binaries alternated, 3 rounds):
 25.907 -> 25.659 ms/frame (-1.0%; before spread 0.03 ms); ~half of replay time
 is trace decompression, so ~2% of real GPU-thread work. Live in-ring runs were
 too content-dependent to resolve it (287k-416k draws/s between runs).
+Implemented by the Luna builder; reviewed and measured by Claude.
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -20,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 83 insertions(+), 20 deletions(-)
 
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 21890d1..cc366fa 100644
+index 21890d1e..cc366fa8 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -122,6 +122,75 @@ bool DescriptorImageInfosEqual(const std::vector<VkDescriptorImageInfo>& left,

@@ -1,0 +1,168 @@
+--- a/vendor/nihav/nihav-rad/src/codecs/bink2.rs	2026-11-17 07:24:03.615660951 -0800
++++ b/vendor/nihav/nihav-rad/src/codecs/bink2.rs	2026-11-17 07:41:02.043433809 -0800
+@@ -128,7 +128,7 @@
+ }
+ 
+ macro_rules! chroma_interp {
+-    ($dst: expr, $dstride: expr, $h: expr, $ty: tt, $src: expr, $sstride: expr, $step: expr, $mode: expr, $shift: expr) => {
++    ($dst: expr, $dstride: expr, $h: expr, $ty: tt, $src: expr, $sstride: expr, $step: expr, $mode: expr, $shift: expr, $add: expr) => {
+         let mut soff = 0;
+         for out in $dst.chunks_mut($dstride).take($h) {
+             for i in 0..8 {
+@@ -136,9 +136,9 @@
+                 let e1 = el!($src, soff + i + $step);
+                 out[i] = match $mode {
+                         0 => e0,
+-                        1 => (e0 * 3 + e1     + $shift) >> $shift,
+-                        2 => (e0 * 2 + e1 * 2 + $shift) >> $shift,
+-                        _ => (e0     + e1 * 3 + $shift) >> $shift,
++                        1 => (e0 * 3 + e1     + $add) >> $shift,
++                        2 => (e0 * 2 + e1 * 2 + $add) >> $shift,
++                        _ => (e0     + e1 * 3 + $add) >> $shift,
+                     } as $ty;
+             }
+             soff += $sstride;
+@@ -349,7 +349,9 @@
+         };
+         Ok(())
+     }
+-    fn mc_chroma(dst: &mut [u8], stride: usize, ref_pic: &NAVideoBuffer<u8>, xoff: usize, yoff: usize, mv: MV, plane: usize) -> DecoderResult<()> {
++    // kb2i_round: KB2i rounds the second (vertical) pass of the 2D chroma interpolation to nearest (+8 of 16);
++    // the older versions (and the original NihAV code) add only 4, which biases chroma low by 1/4 per moving block.
++    fn mc_chroma(dst: &mut [u8], stride: usize, ref_pic: &NAVideoBuffer<u8>, xoff: usize, yoff: usize, mv: MV, plane: usize, kb2i_round: bool) -> DecoderResult<()> {
+         let sx = (xoff as isize) + ((mv.x >> 2) as isize);
+         let sy = (yoff as isize) + ((mv.y >> 2) as isize);
+         let mx = mv.x & 3;
+@@ -374,13 +376,13 @@
+                 out[..8].copy_from_slice(&src[..8]);
+             }
+         } else if my == 0 {
+-            chroma_interp!(dst, stride, 8, u8, &ppix[poff..], pstride, 1, mx, 2);
++            chroma_interp!(dst, stride, 8, u8, &ppix[poff..], pstride, 1, mx, 2, 2);
+         } else if mx == 0 {
+-            chroma_interp!(dst, stride, 8, u8, &ppix[poff..], pstride, pstride, my, 2);
++            chroma_interp!(dst, stride, 8, u8, &ppix[poff..], pstride, pstride, my, 2, 2);
+         } else {
+             let mut tmp = [0u16; 9 * 8];
+-            chroma_interp!(tmp, 8, 9, u16, &ppix[poff..], pstride, 1, mx, 0);
+-            chroma_interp!(dst, stride, 8, u8, &tmp, 8, 8, my, 4);
++            chroma_interp!(tmp, 8, 9, u16, &ppix[poff..], pstride, 1, mx, 0, 0);
++            chroma_interp!(dst, stride, 8, u8, &tmp, 8, 8, my, 4, if kb2i_round { 8 } else { 4 });
+         }
+         Ok(())
+     }
+@@ -1038,6 +1040,7 @@
+ 
+     version:    u32,
+     is_kb2d:    bool,
++    is_kb2i:    bool, // KB2i or newer
+     has_alpha:  bool,
+     slice_h:    [usize; 8],
+     num_slices: usize,
+@@ -1069,6 +1072,7 @@
+         let (mut off_y, mut off_u, mut off_v, mut off_a) = (buf.get_offset(0), buf.get_offset(1), buf.get_offset(2), buf.get_offset(3));
+         let (ooff_y, ooff_u, ooff_v, ooff_a) = (off_y, off_u, off_v, off_a);
+         let (width, height) = buf.get_dimensions(0);
++        let kb2i = self.is_kb2i;
+         let data = buf.get_data_mut().unwrap();
+         let dst = data.as_mut_slice();
+         let bw = (width  + 31) >> 5;
+@@ -1276,8 +1280,8 @@
+                                     let xoff = bx * 32 + (blk_no & 1) * 16;
+                                     let yoff = by * 32 + (blk_no & 2) * 8;
+                                     Bink2DSP::mc_luma(&mut dst[off_y..], stride_y, ref_pic, xoff, yoff, ZERO_MV, 0)?;
+-                                    Bink2DSP::mc_chroma(&mut dst[off_u..], stride_u, ref_pic, xoff >> 1, yoff >> 1, ZERO_MV, 1)?;
+-                                    Bink2DSP::mc_chroma(&mut dst[off_v..], stride_v, ref_pic, xoff >> 1, yoff >> 1, ZERO_MV, 2)?;
++                                    Bink2DSP::mc_chroma(&mut dst[off_u..], stride_u, ref_pic, xoff >> 1, yoff >> 1, ZERO_MV, 1, kb2i)?;
++                                    Bink2DSP::mc_chroma(&mut dst[off_v..], stride_v, ref_pic, xoff >> 1, yoff >> 1, ZERO_MV, 2, kb2i)?;
+                                     if do_alpha {
+                                         Bink2DSP::mc_luma(&mut dst[off_a..], stride_a, ref_pic, xoff, yoff, ZERO_MV, 3)?;
+                                     }
+@@ -1299,8 +1303,8 @@
+                                     let yoff = by * 32 + (blk_no & 2) * 8;
+                                     let mv = self.mvs.get_mv(bx, blk_no);
+                                     Bink2DSP::mc_luma(&mut dst[off_y..], stride_y, ref_pic, xoff, yoff, mv, 0)?;
+-                                    Bink2DSP::mc_chroma(&mut dst[off_u..], stride_u, ref_pic, xoff >> 1, yoff >> 1, mv, 1)?;
+-                                    Bink2DSP::mc_chroma(&mut dst[off_v..], stride_v, ref_pic, xoff >> 1, yoff >> 1, mv, 2)?;
++                                    Bink2DSP::mc_chroma(&mut dst[off_u..], stride_u, ref_pic, xoff >> 1, yoff >> 1, mv, 1, kb2i)?;
++                                    Bink2DSP::mc_chroma(&mut dst[off_v..], stride_v, ref_pic, xoff >> 1, yoff >> 1, mv, 2, kb2i)?;
+                                     if do_alpha {
+                                         Bink2DSP::mc_luma(&mut dst[off_a..], stride_a, ref_pic, xoff, yoff, mv, 3)?;
+                                     }
+@@ -1321,8 +1325,8 @@
+                                     let yoff = by * 32 + (blk_no & 2) * 8;
+                                     let mv = self.mvs.get_mv(bx, blk_no);
+                                     Bink2DSP::mc_luma(&mut dst[off_y..], stride_y, ref_pic, xoff, yoff, mv, 0)?;
+-                                    Bink2DSP::mc_chroma(&mut dst[off_u..], stride_u, ref_pic, xoff >> 1, yoff >> 1, mv, 1)?;
+-                                    Bink2DSP::mc_chroma(&mut dst[off_v..], stride_v, ref_pic, xoff >> 1, yoff >> 1, mv, 2)?;
++                                    Bink2DSP::mc_chroma(&mut dst[off_u..], stride_u, ref_pic, xoff >> 1, yoff >> 1, mv, 1, kb2i)?;
++                                    Bink2DSP::mc_chroma(&mut dst[off_v..], stride_v, ref_pic, xoff >> 1, yoff >> 1, mv, 2, kb2i)?;
+                                     if do_alpha {
+                                         Bink2DSP::mc_luma(&mut dst[off_a..], stride_a, ref_pic, xoff, yoff, mv, 3)?;
+                                     }
+@@ -1336,17 +1340,17 @@
+                                 let mut vblk: [[i32; 64]; 4] = [[0; 64]; 4];
+                                 let q = get_new_quant(br, self.qinfo.pred_quant(bx * 2 + 1, is_top))?;
+                                 self.qinfo.set_quant(bx * 2 + 1, q);
+-                                cbp_y_p = decode_luma_inter(br, &self.codes, cbp_y_p, q, &mut yblk, edge_state_y, &mut self.y_dcs)?;
++                                cbp_y_p = decode_luma_inter(br, &self.codes, cbp_y_p, q, &mut yblk, edge_state_y, &mut self.y_dcs, kb2i)?;
+                                 if br.read_bool()? {
+-                                    cbp_v_p = decode_chroma_inter(br, &self.codes, cbp_v_p, q, &mut vblk, edge_state_y, &mut self.v_dcs)?;
+-                                    cbp_u_p = decode_chroma_inter(br, &self.codes, cbp_u_p, q, &mut ublk, edge_state_y, &mut self.u_dcs)?;
++                                    cbp_v_p = decode_chroma_inter(br, &self.codes, cbp_v_p, q, &mut vblk, edge_state_y, &mut self.v_dcs, kb2i)?;
++                                    cbp_u_p = decode_chroma_inter(br, &self.codes, cbp_u_p, q, &mut ublk, edge_state_y, &mut self.u_dcs, kb2i)?;
+                                 } else {
+                                     cbp_v_p = 0;
+                                     cbp_u_p = 0;
+                                 }
+                                 if do_alpha {
+                                     let mut ablk: [[[i32; 64]; 4]; 4] = [[[0; 64]; 4]; 4];
+-                                    cbp_a_p = decode_luma_inter(br, &self.codes, cbp_a_p, q, &mut ablk, edge_state_y, &mut self.a_dcs)?;
++                                    cbp_a_p = decode_luma_inter(br, &self.codes, cbp_a_p, q, &mut ablk, edge_state_y, &mut self.a_dcs, kb2i)?;
+                                     Bink2DSP::add_mb4(dst, off_a + bx * 32 +  0 +  0 * stride_a, stride_a, &mut ablk[0]);
+                                     Bink2DSP::add_mb4(dst, off_a + bx * 32 + 16 +  0 * stride_a, stride_a, &mut ablk[1]);
+                                     Bink2DSP::add_mb4(dst, off_a + bx * 32 +  0 + 16 * stride_a, stride_a, &mut ablk[2]);
+@@ -1534,7 +1538,10 @@
+     Ok(cbp)
+ }
+ 
+-fn decode_luma_inter(br: &mut BitReader, codes: &Bink2Codes, prev_cbp: u32, q: u8, dst: &mut [[[i32; 64]; 4]; 4], edge_state: u32, dcinfo: &mut YDCInfo) -> DecoderResult<u32> {
++// kb2i: KB2i adds the +32 rounding term to the inter DC coefficient as well (like intra); without it every inter
++// block floors its residual (-0.5 per frame) and the picture drifts dark/green over a few dozen P frames.
++fn decode_luma_inter(br: &mut BitReader, codes: &Bink2Codes, prev_cbp: u32, q: u8, dst: &mut [[[i32; 64]; 4]; 4], edge_state: u32, dcinfo: &mut YDCInfo, kb2i: bool) -> DecoderResult<u32> {
++    let dc_bias = if kb2i { 32 } else { 0 };
+     let cbp = decode_cbp_luma(br, prev_cbp, edge_state)?;
+     let (min_dc, max_dc) = if (edge_state & 0x40000) != 0 { (-0x7FF, 0x7FF) } else { (-0x3FF, 0x3FF) };
+     let _coded = dcinfo.decode_dcs(br, q)?;
+@@ -1542,19 +1549,20 @@
+     let dcs = &dcinfo.dcs;
+     for i in 0..4 {
+         decode_acs_4blocks(br, codes, &mut dst[i], BINK2_QUANT_INTER, q, cbp >> (i * 4))?;
+-        for j in 0..4 { dst[i][j][0] = dcs[i * 4 + j] * 8; }
++        for j in 0..4 { dst[i][j][0] = dcs[i * 4 + j] * 8 + dc_bias; }
+     }
+     Ok(cbp)
+ }
+ 
+-fn decode_chroma_inter(br: &mut BitReader, codes: &Bink2Codes, prev_cbp: u32, q: u8, dst: &mut [[i32; 64]; 4], edge_state: u32, dcinfo: &mut CDCInfo) -> DecoderResult<u32> {
++fn decode_chroma_inter(br: &mut BitReader, codes: &Bink2Codes, prev_cbp: u32, q: u8, dst: &mut [[i32; 64]; 4], edge_state: u32, dcinfo: &mut CDCInfo, kb2i: bool) -> DecoderResult<u32> {
++    let dc_bias = if kb2i { 32 } else { 0 };
+     let cbp = decode_cbp_chroma(br, prev_cbp)?;
+     let (min_dc, max_dc) = if (edge_state & 0x40000) != 0 { (-0x7FF, 0x7FF) } else { (-0x3FF, 0x3FF) };
+     let _coded = dcinfo.decode_dcs(br, q)?;
+     dcinfo.predict_inter(min_dc, max_dc);
+     let dcs = &dcinfo.dcs;
+     decode_acs_4blocks(br, codes, dst, BINK2_QUANT_INTER, q, cbp)?;
+-    for i in 0..4 { dst[i][0] = dcs[i] * 8; }
++    for i in 0..4 { dst[i][0] = dcs[i] * 8 + dc_bias; }
+     Ok(cbp)
+ }
+ 
+@@ -2003,6 +2011,7 @@
+ 
+             self.version = magic;
+             self.is_kb2d = magic == mktag!(b"KB2d");
++            self.is_kb2i = magic >= mktag!(b"KB2i");
+             self.has_alpha = (flags & 0x100000) != 0;
+ 
+             let height_a = (h + 31) & !31;

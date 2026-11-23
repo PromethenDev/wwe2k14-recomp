@@ -1,8 +1,8 @@
 From be5187b2867bbf81734e6710f623f65a451deb4d Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 18:31:14 -0700
-Subject: [PATCH 38/97] memory: rate-limit guest allocation-failure logs; time
- failed searches
+Subject: [PATCH 038/149] memory: rate-limit guest allocation-failure logs;
+ time failed searches
 
 Owner laptop: the game probes for physical memory in bursts (~1000 failed
 requests/s, same on Linux); each failure logged 2-3 error lines, each
@@ -18,7 +18,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 57 insertions(+), 5 deletions(-)
 
 diff --git a/src/system/xmemory.cpp b/src/system/xmemory.cpp
-index dceec3c..75f8a94 100644
+index dceec3ce..75f8a944 100644
 --- a/src/system/xmemory.cpp
 +++ b/src/system/xmemory.cpp
 @@ -10,6 +10,8 @@

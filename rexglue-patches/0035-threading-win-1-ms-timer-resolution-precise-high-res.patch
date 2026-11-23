@@ -1,7 +1,7 @@
 From 702bcb41d81f5e400ba74bbae0eb5aac88ae73d2 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 14:44:59 -0700
-Subject: [PATCH 35/97] threading(win): 1 ms timer resolution + precise
+Subject: [PATCH 035/149] threading(win): 1 ms timer resolution + precise
  high-resolution Sleep
 
 First Windows run: Sleep(us) called ::Sleep(us/1000) - truncated to whole
@@ -19,7 +19,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 120 insertions(+), 2 deletions(-)
 
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index c30c5e7..363192a 100644
+index c30c5e7c..363192a0 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
 @@ -76,6 +76,8 @@ target_include_directories(rexcore PRIVATE
@@ -32,7 +32,7 @@ index c30c5e7..363192a 100644
  
  target_link_libraries(rexcore
 diff --git a/src/core/threading_win.cpp b/src/core/threading_win.cpp
-index 896dfec..1cb2cd2 100644
+index 896dfec4..1cb2cd2e 100644
 --- a/src/core/threading_win.cpp
 +++ b/src/core/threading_win.cpp
 @@ -13,16 +13,120 @@ static_assert(REX_PLATFORM_WIN32, "This file is Windows-only");

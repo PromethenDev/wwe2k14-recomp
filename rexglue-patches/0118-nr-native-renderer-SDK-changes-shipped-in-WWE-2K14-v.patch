@@ -1,0 +1,1084 @@
+From fd268ef74256cd32dc178f3a751ec1ad7db389c7 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 00:01:50 -0700
+Subject: [PATCH 118/149] nr: native-renderer SDK changes shipped in WWE 2K14
+ v1.2.0 (draw observer, presenter, Vulkan device/command processor)
+
+Uncommitted work from earlier sessions, recorded as shipped.
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/draw_observer.h          |  60 +++-
+ .../rex/graphics/vulkan/command_processor.h   |  23 ++
+ include/rex/ui/presenter.h                    |   6 +
+ include/rex/ui/vulkan/device.h                |   4 +
+ src/graphics/command_processor.cpp            |  37 ++
+ src/graphics/graphics_system.cpp              |   3 +
+ .../pipeline/shader/translator_disasm.cpp     |  51 ++-
+ src/graphics/vulkan/command_processor.cpp     | 336 +++++++++++++++++-
+ src/ui/presenter.cpp                          |  15 +
+ src/ui/vulkan/vulkan_device.cpp               |  48 +++
+ 10 files changed, 545 insertions(+), 38 deletions(-)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 49a7c1c0..00479468 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -32,6 +32,9 @@ struct ObservedDraw {
+   Shader* vertex_shader;  // ucode analysed (texture_bindings / vertex_bindings valid); may be null
+   Shader* pixel_shader;   // may be null
+   memory::Memory* memory;
++  // WP3 (decision 0006, diagnostic only): physical guest address (mask 0x1FFFFFFF) of the executing draw packet's
++  // header dword (ring or indirect buffer), or 0xFFFFFFFF if the packet is not inside the physical mapping.
++  uint32_t packet_guest_address = 0xFFFFFFFFu;
+ };
+ 
+ class DrawObserver {
+@@ -56,6 +59,9 @@ class DrawObserver {
+   }
+   // XE_SWAP packet, before IssueSwap reads the frontbuffer (texture fetch 0) from guest memory.
+   virtual void OnBeforeSwap() {}
++  // PM4_INTERRUPT packet, on the GPU command processor thread, before the guest interrupt callback is dispatched
++  // (no SDK lock held). `cpu_mask` = the packet's CPU mask. (2K14 native card S3-8, owner OK 2026-10-15.)
++  virtual void OnBeforeInterrupt(uint32_t cpu_mask) { (void)cpu_mask; }
+   // MakeGpuWritesVisibleToCpu(physical range) was served (after the backend's ReadbackGpuWrittenRange), on the
+   // GPU command processor thread: a CPU reader is about to read this range.
+   virtual void OnCpuVisibility(uint32_t physical_base, uint32_t length) {
+@@ -94,18 +100,64 @@ struct NrVulkanDevice {
+   bool scalar_block_layout = false, null_descriptor = false, sampler_mirror_clamp_to_edge = false;
+   bool geometry_shader = false;
+   bool shader_stencil_export = false;  // VK_EXT_shader_stencil_export enabled on the device
++  // Enabled only for WWE2K14_NR_D3D12_SHARED_PRESENT=1 with the D3D12 NR backend.
++  bool external_memory_win32 = false, external_semaphore_win32 = false, timeline_semaphore = false;
++  bool device_luid_valid = false;
++  uint8_t device_luid[8] = {};
++  // WWE2K14 D3D12 shared-present ring: wait for one prior external-image submit. Null for callers
++  // that do not opt into the shared-present path.
++  bool (*wait_external_present_slot)(void* context, uint64_t slot_key, uint64_t* wait_ns) = nullptr;
++  void* external_present_slot_context = nullptr;
+ };
+ bool GetNrVulkanDevice(NrVulkanDevice* out);
+-// SetNrExternalSwap: the next IssueSwap presents this image view (an image on the device above, in
+-// SHADER_READ_ONLY_OPTIMAL layout, written by work submitted to the queue above before the swap) instead of the
+-// guest frontbuffer texture (texture fetch 0 from guest memory). Consumed by that one swap. width / height are the
+-// frontbuffer's guest size; needs_rb_swap as VulkanTextureCache::RequestSwapTexture reports it for the view.
++// SetNrExternalSwap: the next IssueSwap presents this image view instead of the guest frontbuffer texture (texture
++// fetch 0 from guest memory). A normal same-device view is already SHADER_READ_ONLY_OPTIMAL; an external_image is
++// acquired/released with queue-family/layout barriers during that swap. Consumed by that one swap. width / height are
++// the presented image's size, width_unscaled / height_unscaled the frontbuffer's guest size (0 = width / height);
++// needs_rb_swap as VulkanTextureCache::RequestSwapTexture reports it for the view.
+ struct NrExternalSwap {
+   uint64_t image_view = 0;  // VkImageView
+   uint32_t width = 0, height = 0;
++  // Card S3-47a: the image is a scaled snapshot presented at its own size; the swap pass samples it by pixel index,
++  // so it runs at width x height and maps its output to the unscaled region (0 = same as width / height).
++  uint32_t width_unscaled = 0, height_unscaled = 0;
+   bool needs_rb_swap = false;
++  // Opt-in WWE2K14 D3D12 shared-present transport. `image` is imported from
++  // D3D12, in GENERAL layout and owned by VK_QUEUE_FAMILY_EXTERNAL between presents. With
++  // external_cpu_sync, the presenter uses queue-family/layout ownership barriers and no semaphore;
++  // ring metadata supplies per-slot reuse and a CPU fence callback immediately before submit. All
++  // zero for existing callers.
++  uint64_t external_image = 0;  // VkImage
++  uint64_t external_wait_semaphore = 0;  // VkSemaphore
++  uint64_t external_wait_value = 0;
++  uint64_t external_signal_value = 0;
++  bool external_cpu_sync = false;
++  // Opt-in D3D12 shared-present ring metadata. The slot key identifies one image's Vulkan
++  // completion fence; the D3D12 fence callback is invoked immediately before the sampling submit.
++  uint64_t external_present_slot_key = 0;
++  uint32_t external_ring_depth = 0, external_ring_slot = 0;
++  bool (*external_wait_cpu_fence)(void* context, uint64_t value, uint64_t* wait_ns) = nullptr;
++  void* external_cpu_fence_context = nullptr;
++  uint64_t external_cpu_fence_value = 0;
+ };
+ void SetNrExternalSwap(const NrExternalSwap& swap);
++// [wwe2k14 nr] card S3-44: called on the guest thread for every CP_RB_WPTR write (the guest kicked the ring past
++// everything it wrote so far). Set before the title starts; null = off.
++using NrWritePointerHook = void (*)(uint32_t value);
++void SetNrWritePointerHook(NrWritePointerHook fn);
++NrWritePointerHook GetNrWritePointerHook();
++// [wwe2k14 nr] card DE-2 O0 (owner OK 2026-10-21): called on the CP execution thread for every type-3 NOP the CP
++// reaches (after the bin predicate), before its payload is skipped. Ordering/lifetime metadata only, never render
++// state. The event and first_payload_word are valid only during the call. Set before the title starts; null = off.
++struct NrNopEvent {
++  memory::Memory* memory = nullptr;
++  uint32_t packet_guest_address = 0xFFFFFFFFu;  // physical address of the NOP header (0xFFFFFFFF = not physical)
++  uint32_t payload_dwords = 0;                  // payload count, header excluded
++  const uint8_t* first_payload_word = nullptr;  // borrowed, guest byte order; do not dereference before ownership check
++  bool predicated = false;                      // type-3 predicate bit
++};
++using NrNopHook = void (*)(const NrNopEvent& event);
++void SetNrNopHook(NrNopHook fn);
+ 
+ // Not thread-safe to change while the GPU thread runs; set before the title or replay starts.
+ void SetDrawObserver(DrawObserver* observer);
+diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
+index c6692cc4..1fdbd711 100644
+--- a/include/rex/graphics/vulkan/command_processor.h
++++ b/include/rex/graphics/vulkan/command_processor.h
+@@ -276,6 +276,11 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // Returns the text to display in the GPU backend name in the window title.
+   std::string GetWindowTitleText() const;
+ 
++  // WWE2K14 D3D12 shared-present: wait for the previous Vulkan submission that sampled a ring slot.
++  // The slot fence is also retired from submission tracking before it can be reset for a later use.
++  bool WaitNrExternalPresentSlot(uint64_t slot_key, uint64_t* wait_ns);
++  bool IsNrExternalPresentFence(VkFence fence) const;
++
+  protected:
+   bool SetupContext() override;
+   void ShutdownContext() override;
+@@ -613,6 +618,24 @@ class VulkanCommandProcessor : public CommandProcessor {
+   // vkQueueBindSparse, to wait correctly on the next attempt.
+   std::vector<VkSemaphore> current_submission_wait_semaphores_;
+   std::vector<VkPipelineStageFlags> current_submission_wait_stage_masks_;
++#if defined(_WIN32)
++  // One imported D3D12 fence payload may protect a shared D3D12 image for a
++  // single guest swap. The imported semaphore remains owned by the producer.
++  VkSemaphore nr_external_present_semaphore_ = VK_NULL_HANDLE;
++  uint64_t nr_external_present_wait_value_ = 0;
++  uint64_t nr_external_present_signal_value_ = 0;
++  uint64_t nr_external_present_slot_key_ = 0;
++  uint32_t nr_external_ring_depth_ = 0, nr_external_ring_slot_ = 0;
++  bool (*nr_external_wait_cpu_fence_)(void* context, uint64_t value, uint64_t* wait_ns) = nullptr;
++  void* nr_external_cpu_fence_context_ = nullptr;
++  uint64_t nr_external_cpu_fence_value_ = 0;
++  struct NrExternalPresentFence {
++    VkFence fence = VK_NULL_HANDLE;
++    uint64_t submission = 0;
++    bool has_submission = false;
++  };
++  std::unordered_map<uint64_t, NrExternalPresentFence> nr_external_present_fences_;
++#endif
+   std::vector<VkFence> submissions_in_flight_fences_;
+   std::deque<std::pair<uint64_t, VkSemaphore>> submissions_in_flight_semaphores_;
+ 
+diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
+index c61ff45e..c40f6cad 100644
+--- a/include/rex/ui/presenter.h
++++ b/include/rex/ui/presenter.h
+@@ -51,6 +51,12 @@ namespace rex {
+ namespace ui {
+ 
+ class Presenter;
++// [wwe2k14 nr] owner pacing work 2026-10-17: minimum number of host presents (vblanks under FIFO) per new guest frame
++// when the guest output thread presents immediately (1 = default behaviour). The game sets 2 while its present interval
++// is 2 (30 fps), so every 30 fps frame stays on screen for exactly two refreshes, as on the console, instead of a late
++// frame being followed by a one-refresh catch-up frame.
++void SetGuestPresentRepeat(uint32_t presents_per_frame);
++uint32_t GetGuestPresentRepeat();
+ class Window;
+ class Win32Window;
+ 
+diff --git a/include/rex/ui/vulkan/device.h b/include/rex/ui/vulkan/device.h
+index 653e6f45..2cdd3cef 100644
+--- a/include/rex/ui/vulkan/device.h
++++ b/include/rex/ui/vulkan/device.h
+@@ -12,6 +12,7 @@
+ 
+ #include <memory>
+ #include <mutex>
++#include <cstdint>
+ #include <vector>
+ 
+ #include <rex/ui/vulkan/instance.h>
+@@ -27,6 +28,7 @@ struct NrSharedDeviceFeatures {
+   bool shader_int64 = false;
+   bool buffer_device_address = false;
+   bool descriptor_indexing = false;  // runtime arrays, partially bound, variable count, update after bind
++  bool external_memory_win32 = false, external_semaphore_win32 = false, timeline_semaphore = false;
+ };
+ const NrSharedDeviceFeatures& GetNrSharedDeviceFeatures();
+ 
+@@ -63,6 +65,8 @@ class VulkanDevice {
+     uint32_t vendorID = 0;
+     uint32_t deviceID = 0;
+     char deviceName[VK_MAX_PHYSICAL_DEVICE_NAME_SIZE] = {};
++    bool deviceLUIDValid = false;
++    uint8_t deviceLUID[VK_LUID_SIZE] = {};
+ 
+     uint32_t maxImageDimension2D = 4096;
+     uint32_t maxImageDimension3D = 256;
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index 45625d07..c9026def 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -1318,8 +1318,30 @@ bool CommandProcessor::ExecutePacketType3_ME_INIT(memory::RingBuffer* reader, ui
+   return true;
+ }
+ 
++namespace {
++NrNopHook g_nr_nop_hook = nullptr;  // [wwe2k14 nr] card DE-2 O0; set before the title starts
++}  // namespace
++void SetNrNopHook(NrNopHook fn) { g_nr_nop_hook = fn; }
++
+ bool CommandProcessor::ExecutePacketType3_NOP(memory::RingBuffer* reader, uint32_t packet,
+                                               uint32_t count) {
++  if (const NrNopHook hook = g_nr_nop_hook) {
++    // ExecutePacketType3 already validated count >= 1 payload words. The header may have been the last ring word,
++    // so recover its offset modulo the ring (read_ptr()-4 would be wrong after a wrap).
++    const uint32_t payload_offset = uint32_t(reader->read_offset());
++    const uint32_t header_offset =
++        payload_offset != 0 ? payload_offset - uint32_t(sizeof(uint32_t)) : uint32_t(reader->capacity()) - 4u;
++    const uintptr_t header = reinterpret_cast<uintptr_t>(reader->buffer()) + header_offset;
++    const uintptr_t phys_base = reinterpret_cast<uintptr_t>(memory_->physical_membase());
++    NrNopEvent event;
++    event.memory = memory_;
++    if (header >= phys_base && header - phys_base < 0x20000000u) event.packet_guest_address = uint32_t(header - phys_base);
++    event.payload_dwords = count;
++    event.predicated = (packet & 1u) != 0;
++    event.first_payload_word = reader->buffer() + payload_offset;
++    g_nr_command_processor = this;
++    hook(event);
++  }
+   // skip N 32-bit words to get to the next packet
+   // No-op, ignore some data.
+   reader->AdvanceRead(count * sizeof(uint32_t));
+@@ -1332,6 +1354,7 @@ bool CommandProcessor::ExecutePacketType3_INTERRUPT(memory::RingBuffer* reader,
+ 
+   // generate interrupt from the command stream
+   uint32_t cpu_mask = reader->ReadAndSwap<uint32_t>();
++  if (DrawObserver* observer = GetDrawObserver()) observer->OnBeforeInterrupt(cpu_mask);
+   for (int n = 0; n < 6; n++) {
+     if (cpu_mask & (1 << n)) {
+       if (graphics_system_) {
+@@ -1751,6 +1774,10 @@ namespace {
+ DrawObserver* g_draw_observer = nullptr;
+ }  // namespace
+ void SetDrawObserver(DrawObserver* observer) { g_draw_observer = observer; }
++// [wwe2k14 nr] card S3-44: guest CP_RB_WPTR writes (ring kicks).
++static void (*g_nr_wptr_hook)(uint32_t) = nullptr;
++void SetNrWritePointerHook(void (*fn)(uint32_t)) { g_nr_wptr_hook = fn; }
++NrWritePointerHook GetNrWritePointerHook() { return g_nr_wptr_hook; }
+ DrawObserver* GetDrawObserver() { return g_draw_observer; }
+ 
+ void CommandProcessor::DumpEdramAfterDraw(uint32_t ordinal) {
+@@ -1999,6 +2026,10 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+   // when true, render conditionally based on query result
+   // uint32_t viz_use = viz_query_condition & 0x100;
+ 
++  // WP3: header dword address (see below).
++  // PM4_DRAW_INDX also consumed its viz-query token before this call, so its header is two dwords back.
++  const uintptr_t packet_header_host =
++      reader->read_ptr() - (((packet >> 8) & 0x7F) == PM4_DRAW_INDX ? 2 : 1) * sizeof(uint32_t);
+   assert_not_zero(count_remaining);
+   if (!count_remaining) {
+     REXGPU_ERROR("{}: Packet too small, can't read VGT_DRAW_INITIATOR", opcode_name);
+@@ -2100,6 +2131,12 @@ bool CommandProcessor::ExecutePacketType3Draw(memory::RingBuffer* reader, uint32
+       draw.vertex_shader = vs;
+       draw.pixel_shader = ps;
+       draw.memory = memory_;
++      {
++        const uintptr_t phys_base = reinterpret_cast<uintptr_t>(memory_->physical_membase());
++        draw.packet_guest_address = (packet_header_host >= phys_base && packet_header_host - phys_base < 0x20000000u)
++                                        ? uint32_t(packet_header_host - phys_base)
++                                        : 0xFFFFFFFFu;
++      }
+       observer->OnDraw(draw);
+     }
+   }
+diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
+index a56393f9..e8abbf7e 100644
+--- a/src/graphics/graphics_system.cpp
++++ b/src/graphics/graphics_system.cpp
+@@ -9,6 +9,7 @@
+  * @modified    Tom Clay, 2026 - Adapted for ReXGlue runtime
+  */
+ 
++#include <rex/graphics/draw_observer.h>
+ #include <rex/graphics/graphics_system.h>
+ 
+ #include <algorithm>
+@@ -374,6 +375,8 @@ void GraphicsSystem::WriteRegister(uint32_t addr, uint32_t value) {
+ 
+   switch (r) {
+     case 0x01C5:  // CP_RB_WPTR
++      // [wwe2k14 nr] card S3-44: the guest kicked the ring (called on the guest thread that wrote the register).
++      if (auto hook = GetNrWritePointerHook()) hook(value);
+       command_processor_->UpdateWritePointer(value);
+       break;
+     case 0x1844:  // AVIVO_D1GRPH_PRIMARY_SURFACE_ADDRESS
+diff --git a/src/graphics/pipeline/shader/translator_disasm.cpp b/src/graphics/pipeline/shader/translator_disasm.cpp
+index c4030109..1335a575 100644
+--- a/src/graphics/pipeline/shader/translator_disasm.cpp
++++ b/src/graphics/pipeline/shader/translator_disasm.cpp
+@@ -20,6 +20,17 @@ namespace rex::graphics {
+ 
+ using namespace ucode;
+ 
++namespace {
++// Name tables are indexed by microcode fields; invalid microcode must print "?" instead of dereferencing a null or
++// out-of-range entry (k14-nr S1; see docs/cards/S1-sdk-disasm-null-guard.md in the game workspace).
++inline const char* NameOrQ(const char* name) { return name ? name : "?"; }
++template <size_t N>
++inline std::string TableName(const char* const (&table)[N], int index) {
++  if (index >= 0 && size_t(index) < N && table[index]) return table[index];
++  return "?(" + std::to_string(index) + ")";
++}
++}  // namespace
++
+ void DisassembleResultOperand(const InstructionResult& result, string::StringBuffer* out) {
+   bool uses_storage_index = false;
+   switch (result.storage_target) {
+@@ -139,14 +150,14 @@ void DisassembleSourceOperand(const InstructionOperand& op, string::StringBuffer
+ void ParsedExecInstruction::Disassemble(string::StringBuffer* out) const {
+   switch (type) {
+     case Type::kUnconditional:
+-      out->AppendFormat("      {}", opcode_name);
++      out->AppendFormat("      {}", NameOrQ(opcode_name));
+       break;
+     case Type::kPredicated:
+       out->Append(condition ? " (p0) " : "(!p0) ");
+-      out->AppendFormat("{}", opcode_name);
++      out->AppendFormat("{}", NameOrQ(opcode_name));
+       break;
+     case Type::kConditional:
+-      out->AppendFormat("      {} {}b{}", opcode_name, condition ? "" : "!", bool_constant_index);
++      out->AppendFormat("      {} {}b{}", NameOrQ(opcode_name), condition ? "" : "!", bool_constant_index);
+       break;
+   }
+   if (is_yield) {
+@@ -322,7 +333,7 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const
+   } else {
+     out->Append("      ");
+   }
+-  out->Append(opcode_name);
++  out->Append(NameOrQ(opcode_name));
+   out->Append(' ');
+   DisassembleResultOperand(result, out);
+   if (!is_mini_fetch) {
+@@ -341,8 +352,14 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const
+     out->AppendFormat(", Offset={}", attributes.offset);
+   }
+   if (attributes.data_format != xenos::VertexFormat::kUndefined) {
+-    out->AppendFormat(", DataFormat={}",
+-                      kVertexFetchDataFormats[static_cast<int>(attributes.data_format)].name);
++    const int data_format = static_cast<int>(attributes.data_format);
++    const char* data_format_name =
++        data_format >= 0 && data_format < 0xff ? kVertexFetchDataFormats[data_format].name : nullptr;
++    if (data_format_name) {
++      out->AppendFormat(", DataFormat={}", data_format_name);
++    } else {
++      out->AppendFormat(", DataFormat=?({})", data_format);
++    }
+   }
+   if (!is_mini_fetch && attributes.stride) {
+     out->AppendFormat(", Stride={}", attributes.stride);
+@@ -361,13 +378,13 @@ void ParsedVertexFetchInstruction::Disassemble(string::StringBuffer* out) const
+ }
+ 
+ void ParsedTextureFetchInstruction::Disassemble(string::StringBuffer* out) const {
+-  static const char* kTextureFilterNames[] = {
++  static const char* const kTextureFilterNames[] = {
+       "point",
+       "linear",
+       "basemap",
+       "keep",
+   };
+-  static const char* kAnisoFilterNames[] = {
++  static const char* const kAnisoFilterNames[] = {
+       "disabled", "max1to1", "max2to1", "max4to1", "max8to1", "max16to1", "keep",
+   };
+ 
+@@ -377,7 +394,7 @@ void ParsedTextureFetchInstruction::Disassemble(string::StringBuffer* out) const
+   } else {
+     out->Append("      ");
+   }
+-  out->Append(opcode_name);
++  out->Append(NameOrQ(opcode_name));
+   out->Append(' ');
+   bool needs_comma = false;
+   if (has_result()) {
+@@ -403,27 +420,27 @@ void ParsedTextureFetchInstruction::Disassemble(string::StringBuffer* out) const
+   }
+   if (attributes.mag_filter != xenos::TextureFilter::kUseFetchConst) {
+     out->AppendFormat(", MagFilter={}",
+-                      kTextureFilterNames[static_cast<int>(attributes.mag_filter)]);
++                      TableName(kTextureFilterNames, static_cast<int>(attributes.mag_filter)));
+   }
+   if (attributes.min_filter != xenos::TextureFilter::kUseFetchConst) {
+     out->AppendFormat(", MinFilter={}",
+-                      kTextureFilterNames[static_cast<int>(attributes.min_filter)]);
++                      TableName(kTextureFilterNames, static_cast<int>(attributes.min_filter)));
+   }
+   if (attributes.mip_filter != xenos::TextureFilter::kUseFetchConst) {
+     out->AppendFormat(", MipFilter={}",
+-                      kTextureFilterNames[static_cast<int>(attributes.mip_filter)]);
++                      TableName(kTextureFilterNames, static_cast<int>(attributes.mip_filter)));
+   }
+   if (attributes.aniso_filter != xenos::AnisoFilter::kUseFetchConst) {
+     out->AppendFormat(", AnisoFilter={}",
+-                      kAnisoFilterNames[static_cast<int>(attributes.aniso_filter)]);
++                      TableName(kAnisoFilterNames, static_cast<int>(attributes.aniso_filter)));
+   }
+   if (attributes.vol_mag_filter != xenos::TextureFilter::kUseFetchConst) {
+     out->AppendFormat(", VolMagFilter={}",
+-                      kTextureFilterNames[static_cast<int>(attributes.vol_mag_filter)]);
++                      TableName(kTextureFilterNames, static_cast<int>(attributes.vol_mag_filter)));
+   }
+   if (attributes.vol_min_filter != xenos::TextureFilter::kUseFetchConst) {
+     out->AppendFormat(", VolMinFilter={}",
+-                      kTextureFilterNames[static_cast<int>(attributes.vol_min_filter)]);
++                      TableName(kTextureFilterNames, static_cast<int>(attributes.vol_min_filter)));
+   }
+   if (!attributes.use_computed_lod) {
+     out->Append(", UseComputedLOD=false");
+@@ -471,7 +488,7 @@ void ParsedAluInstruction::Disassemble(string::StringBuffer* out) const {
+     } else {
+       out->Append("      ");
+     }
+-    out->Append(vector_opcode_name);
++    out->Append(NameOrQ(vector_opcode_name));
+     if (vector_and_constant_result.is_clamped) {
+       out->Append("_sat");
+     }
+@@ -490,7 +507,7 @@ void ParsedAluInstruction::Disassemble(string::StringBuffer* out) const {
+     } else {
+       out->Append("      ");
+     }
+-    out->Append(scalar_opcode_name);
++    out->Append(NameOrQ(scalar_opcode_name));
+     if (scalar_result.is_clamped) {
+       out->Append("_sat");
+     }
+diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
+index 63330f32..7724d102 100644
+--- a/src/graphics/vulkan/command_processor.cpp
++++ b/src/graphics/vulkan/command_processor.cpp
+@@ -95,7 +95,8 @@ REXCVAR_DEFINE_BOOL(vulkan_dynamic_rendering, true, "GPU/Vulkan",
+     .lifecycle(rex::cvar::Lifecycle::kHotReload);
+ 
+ namespace rex::graphics {
+-void NrSetVulkanDevice(ui::vulkan::VulkanDevice* device);
++void NrSetVulkanDevice(ui::vulkan::VulkanDevice* device,
++                       vulkan::VulkanCommandProcessor* command_processor);
+ bool NrTakeExternalSwap(NrExternalSwap* out);
+ }  // namespace rex::graphics
+ 
+@@ -1506,7 +1507,7 @@ bool VulkanCommandProcessor::SetupContext() {
+   const VkDevice device = vulkan_device->device();
+   const ui::vulkan::VulkanDevice::Properties& device_properties = vulkan_device->properties();
+   gpu_timing_->Initialize(vulkan_device, vulkan_device->queue_family_graphics_compute());
+-  NrSetVulkanDevice(GetVulkanDevice());  // [wwe13 nr] direct GPU presentation (GetNrVulkanDevice)
++  NrSetVulkanDevice(GetVulkanDevice(), this);  // [wwe13 nr] direct GPU presentation (GetNrVulkanDevice)
+ 
+   // The unconditional inclusion of the vertex shader stage also covers the case
+   // of manual index / factor buffer fetch (the system constants and the shared
+@@ -2626,6 +2627,7 @@ bool VulkanCommandProcessor::SetupContext() {
+ }
+ 
+ void VulkanCommandProcessor::ShutdownContext() {
++  NrSetVulkanDevice(nullptr, nullptr);
+   AwaitAllQueueOperationsCompletion();
+   StopSubmissionWorker();
+   gpu_timing_->ProcessCompleted(submission_completed_);
+@@ -2831,14 +2833,22 @@ void VulkanCommandProcessor::ShutdownContext() {
+   }
+   submissions_in_flight_semaphores_.clear();
+   for (VkFence& fence : submissions_in_flight_fences_) {
+-    dfn.vkDestroyFence(device, fence, nullptr);
++    if (!IsNrExternalPresentFence(fence)) dfn.vkDestroyFence(device, fence, nullptr);
+   }
+   submissions_in_flight_fences_.clear();
++#if defined(_WIN32)
++  nr_external_present_fences_.clear();
++#endif
+   current_submission_wait_stage_masks_.clear();
+   for (VkSemaphore semaphore : current_submission_wait_semaphores_) {
+     dfn.vkDestroySemaphore(device, semaphore, nullptr);
+   }
+   current_submission_wait_semaphores_.clear();
++#if defined(_WIN32)
++  nr_external_present_semaphore_ = VK_NULL_HANDLE;
++  nr_external_present_wait_value_ = 0;
++  nr_external_present_signal_value_ = 0;
++#endif
+   submission_completed_ = 0;
+   submission_open_ = false;
+ 
+@@ -3072,6 +3082,60 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+     return;
+   }
+ 
++  NrExternalSwap nr_swap;
++  bool have_nr_swap = NrTakeExternalSwap(&nr_swap);
++#if defined(_WIN32)
++  nr_external_present_semaphore_ = VK_NULL_HANDLE;
++  nr_external_present_wait_value_ = 0;
++  nr_external_present_signal_value_ = 0;
++  nr_external_present_slot_key_ = 0;
++  nr_external_ring_depth_ = nr_external_ring_slot_ = 0;
++  nr_external_wait_cpu_fence_ = nullptr;
++  nr_external_cpu_fence_context_ = nullptr;
++  nr_external_cpu_fence_value_ = 0;
++  const bool has_nr_external_metadata = nr_swap.external_image || nr_swap.external_wait_semaphore ||
++                                        nr_swap.external_wait_value || nr_swap.external_signal_value ||
++                                        nr_swap.external_cpu_sync || nr_swap.external_present_slot_key ||
++                                        nr_swap.external_ring_depth || nr_swap.external_ring_slot ||
++                                        nr_swap.external_wait_cpu_fence || nr_swap.external_cpu_fence_context ||
++                                        nr_swap.external_cpu_fence_value;
++  const bool nr_external_ring_metadata = nr_swap.external_present_slot_key || nr_swap.external_ring_depth ||
++                                        nr_swap.external_ring_slot || nr_swap.external_wait_cpu_fence ||
++                                        nr_swap.external_cpu_fence_context || nr_swap.external_cpu_fence_value;
++  const bool nr_external_ring_valid = !nr_external_ring_metadata ||
++                                     (nr_swap.external_present_slot_key && nr_swap.external_ring_depth == 3 &&
++                                      nr_swap.external_ring_slot < nr_swap.external_ring_depth &&
++                                      nr_swap.external_wait_cpu_fence && nr_swap.external_cpu_fence_context &&
++                                      nr_swap.external_cpu_fence_value);
++  const bool nr_external_sync_valid = nr_swap.external_wait_semaphore && nr_swap.external_wait_value &&
++                                      nr_swap.external_signal_value > nr_swap.external_wait_value;
++  const bool nr_external_cpu_sync_valid = nr_swap.external_cpu_sync && nr_swap.external_image &&
++                                          !nr_swap.external_wait_semaphore && !nr_swap.external_wait_value &&
++                                          !nr_swap.external_signal_value && nr_external_ring_valid;
++  if (has_nr_external_metadata && (nr_external_sync_valid || nr_external_cpu_sync_valid)) {
++    if (nr_external_sync_valid) {
++      nr_external_present_semaphore_ = reinterpret_cast<VkSemaphore>(nr_swap.external_wait_semaphore);
++      nr_external_present_wait_value_ = nr_swap.external_wait_value;
++      nr_external_present_signal_value_ = nr_swap.external_signal_value;
++    } else if (nr_external_ring_metadata) {
++      nr_external_present_slot_key_ = nr_swap.external_present_slot_key;
++      nr_external_ring_depth_ = nr_swap.external_ring_depth;
++      nr_external_ring_slot_ = nr_swap.external_ring_slot;
++      nr_external_wait_cpu_fence_ = nr_swap.external_wait_cpu_fence;
++      nr_external_cpu_fence_context_ = nr_swap.external_cpu_fence_context;
++      nr_external_cpu_fence_value_ = nr_swap.external_cpu_fence_value;
++    }
++  }
++  if (has_nr_external_metadata && !nr_external_sync_valid && !nr_external_cpu_sync_valid) {
++    static bool invalid_nr_external_swap_logged = false;
++    if (!invalid_nr_external_swap_logged) {
++      invalid_nr_external_swap_logged = true;
++      REXGPU_ERROR("Discarding D3D12 shared-present image without a valid semaphore or CPU-fence handoff");
++    }
++    have_nr_swap = false;
++  }
++#endif
++
+   bool skip_present_due_async_placeholder = REXCVAR_GET(async_shader_compilation) &&
+                                             REXCVAR_GET(vulkan_async_skip_incomplete_frames) &&
+                                             frame_used_async_placeholder_pipeline_;
+@@ -3083,6 +3147,15 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+           "Skipping Vulkan frame presentation due to async placeholder draw "
+           "usage in this frame");
+     }
++    // This frame will not sample the external image, so do not wait its producer fence or attach
++    // a ring-slot completion fence to the command-only submission.
++#if defined(_WIN32)
++    nr_external_present_slot_key_ = 0;
++    nr_external_ring_depth_ = nr_external_ring_slot_ = 0;
++    nr_external_wait_cpu_fence_ = nullptr;
++    nr_external_cpu_fence_context_ = nullptr;
++    nr_external_cpu_fence_value_ = 0;
++#endif
+     EndSubmission(true);
+     return;
+   }
+@@ -3096,15 +3169,34 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   xenos::TextureFormat frontbuffer_format;
+   bool swap_source_needs_rb_swap = false;
+   VkImageView swap_texture_view = VK_NULL_HANDLE;
+-  NrExternalSwap nr_swap;
+-  if (NrTakeExternalSwap(&nr_swap)) {
+-    // [wwe13 nr] Direct GPU presentation: the native renderer's image of the frontbuffer (same device and queue,
+-    // already in SHADER_READ_ONLY_OPTIMAL) replaces the guest frontbuffer texture; guest memory is not read.
++  VkImage external_swap_image = VK_NULL_HANDLE;
++#if defined(_WIN32)
++  VkSemaphore external_swap_semaphore = VK_NULL_HANDLE;
++  uint64_t external_swap_wait_value = 0;
++  uint64_t external_swap_signal_value = 0;
++#endif
++  if (have_nr_swap) {
++    // Direct GPU presentation: the native renderer's image of the frontbuffer replaces the guest frontbuffer texture;
++    // guest memory is not read. A D3D12-imported image is externally owned in GENERAL until the barriers below.
+     swap_texture_view = reinterpret_cast<VkImageView>(nr_swap.image_view);
+-    frontbuffer_width_scaled = frontbuffer_width_unscaled = nr_swap.width;
+-    frontbuffer_height_scaled = frontbuffer_height_unscaled = nr_swap.height;
++    frontbuffer_width_scaled = nr_swap.width;
++    frontbuffer_height_scaled = nr_swap.height;
++    // Card S3-47a: a scaled snapshot is presented at its own size; the unscaled size is the guest present size
++    // (get_active_swap_dimension then runs the swap pass at the scaled size and maps it to the unscaled region).
++    frontbuffer_width_unscaled = nr_swap.width_unscaled ? nr_swap.width_unscaled : nr_swap.width;
++    frontbuffer_height_unscaled = nr_swap.height_unscaled ? nr_swap.height_unscaled : nr_swap.height;
+     frontbuffer_format = xenos::TextureFormat::k_8_8_8_8;
+     swap_source_needs_rb_swap = nr_swap.needs_rb_swap;
++#if defined(_WIN32)
++    if (nr_swap.external_image && (nr_external_sync_valid || nr_external_cpu_sync_valid)) {
++      external_swap_image = reinterpret_cast<VkImage>(nr_swap.external_image);
++      if (nr_external_sync_valid) {
++        external_swap_semaphore = nr_external_present_semaphore_;
++        external_swap_wait_value = nr_external_present_wait_value_;
++        external_swap_signal_value = nr_external_present_signal_value_;
++      }
++    }
++#endif
+   } else {
+     swap_texture_view = texture_cache_->RequestSwapTexture(
+         frontbuffer_width_scaled, frontbuffer_height_scaled, frontbuffer_format,
+@@ -3206,7 +3298,10 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+   presenter->RefreshGuestOutput(
+       guest_output_width, guest_output_height, display_width, display_height,
+       [this, guest_output_width, guest_output_height, frontbuffer_format, swap_texture_view,
+-       swap_post_effect,
++       swap_post_effect, external_swap_image,
++#if defined(_WIN32)
++       external_swap_semaphore, external_swap_wait_value, external_swap_signal_value,
++#endif
+        swap_source_needs_rb_swap, presenter](ui::Presenter::GuestOutputRefreshContext& context) -> bool {
+         // In case the swap command is the only one in the frame.
+         if (!BeginSubmission(true)) {
+@@ -3401,6 +3496,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+         VkImageSubresourceRange guest_output_subresource_range =
+             ui::vulkan::util::InitializeSubresourceRange();
+         if (use_compute_gamma) {
++          if (external_swap_image != VK_NULL_HANDLE) {
++            VkImageSubresourceRange external_image_range = {};
++            external_image_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            external_image_range.levelCount = 1;
++            external_image_range.layerCount = 1;
++            PushImageMemoryBarrier(external_swap_image, external_image_range,
++                                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, 0,
++                                   VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
++                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                   VK_QUEUE_FAMILY_EXTERNAL,
++                                   vulkan_device->queue_family_graphics_compute());
++          }
+           // Transition the destination image for compute writes. Contents are
+           // fully overwritten, so old layout can always be UNDEFINED.
+           PushImageMemoryBarrier(vulkan_context.image(), guest_output_subresource_range,
+@@ -3556,6 +3664,20 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                  VK_IMAGE_LAYOUT_GENERAL,
+                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
++          if (external_swap_image != VK_NULL_HANDLE) {
++            VkImageSubresourceRange external_image_range = {};
++            external_image_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            external_image_range.levelCount = 1;
++            external_image_range.layerCount = 1;
++            PushImageMemoryBarrier(external_swap_image, external_image_range,
++                                   VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                                   VK_ACCESS_SHADER_READ_BIT, 0,
++                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                   VK_IMAGE_LAYOUT_GENERAL,
++                                   vulkan_device->queue_family_graphics_compute(),
++                                   VK_QUEUE_FAMILY_EXTERNAL);
++          }
+         } else {
+           // Make sure a framebuffer is available for the current guest output
+           // image version.
+@@ -3635,6 +3757,19 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+ 
+           // End the current render pass before inserting barriers and starting
+           // a new one, and insert the barrier.
++          if (external_swap_image != VK_NULL_HANDLE) {
++            VkImageSubresourceRange external_image_range = {};
++            external_image_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            external_image_range.levelCount = 1;
++            external_image_range.layerCount = 1;
++            PushImageMemoryBarrier(external_swap_image, external_image_range,
++                                   VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
++                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT, 0,
++                                   VK_ACCESS_SHADER_READ_BIT, VK_IMAGE_LAYOUT_GENERAL,
++                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                   VK_QUEUE_FAMILY_EXTERNAL,
++                                   vulkan_device->queue_family_graphics_compute());
++          }
+           SubmitBarriers(true);
+ 
+           SwapFramebuffer& swap_framebuffer = swap_framebuffers_[swap_framebuffer_index];
+@@ -3711,7 +3846,21 @@ void VulkanCommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontb
+                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalAccessMask,
+                                  VK_IMAGE_LAYOUT_COLOR_ATTACHMENT_OPTIMAL,
+                                  ui::vulkan::VulkanPresenter::kGuestOutputInternalLayout);
+-         }
++          if (external_swap_image != VK_NULL_HANDLE) {
++            VkImageSubresourceRange external_image_range = {};
++            external_image_range.aspectMask = VK_IMAGE_ASPECT_COLOR_BIT;
++            external_image_range.levelCount = 1;
++            external_image_range.layerCount = 1;
++            PushImageMemoryBarrier(external_swap_image, external_image_range,
++                                   VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
++                                   VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
++                                   VK_ACCESS_SHADER_READ_BIT, 0,
++                                   VK_IMAGE_LAYOUT_SHADER_READ_ONLY_OPTIMAL,
++                                   VK_IMAGE_LAYOUT_GENERAL,
++                                   vulkan_device->queue_family_graphics_compute(),
++                                   VK_QUEUE_FAMILY_EXTERNAL);
++          }
++        }
+ 
+          // Need to submit all the commands before giving the image back to the
+          // presenter so it can submit its own commands for displaying it to the
+@@ -6658,6 +6807,38 @@ void VulkanCommandProcessor::InitializeTrace() {
+   InvalidateAllVertexBufferResidency();
+ }
+ 
++bool VulkanCommandProcessor::WaitNrExternalPresentSlot(uint64_t slot_key, uint64_t* wait_ns) {
++#if defined(_WIN32)
++  const auto wait_start = std::chrono::steady_clock::now();
++  if (wait_ns) *wait_ns = 0;
++  if (!slot_key || device_lost_ || submission_failed_) return false;
++  auto it = nr_external_present_fences_.find(slot_key);
++  if (it == nr_external_present_fences_.end() || !it->second.has_submission) return true;
++  const uint64_t target_submission = it->second.submission;
++  if (target_submission > submission_completed_) CheckSubmissionFenceAndDeviceLoss(target_submission);
++  const auto wait_end = std::chrono::steady_clock::now();
++  if (wait_ns) {
++    *wait_ns = uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(wait_end - wait_start).count());
++  }
++  return !device_lost_ && !submission_failed_ && submission_completed_ >= target_submission;
++#else
++  (void)slot_key;
++  if (wait_ns) *wait_ns = 0;
++  return false;
++#endif
++}
++
++bool VulkanCommandProcessor::IsNrExternalPresentFence(VkFence fence) const {
++#if defined(_WIN32)
++  for (const auto& entry : nr_external_present_fences_) {
++    if (entry.second.fence == fence) return true;
++  }
++#else
++  (void)fence;
++#endif
++  return false;
++}
++
+ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_submission) {
+   // Only report once, no need to retry a wait that won't succeed anyway.
+   ObserveSubmissionWorkerFailure();
+@@ -6746,8 +6927,9 @@ void VulkanCommandProcessor::CheckSubmissionFenceAndDeviceLoss(uint64_t await_su
+   fences_free_.reserve(fences_free_.size() + fences_awaited);
+   auto submissions_in_flight_fences_awaited_end = submissions_in_flight_fences_.cbegin();
+   std::advance(submissions_in_flight_fences_awaited_end, fences_awaited);
+-  fences_free_.insert(fences_free_.cend(), submissions_in_flight_fences_.cbegin(),
+-                      submissions_in_flight_fences_awaited_end);
++  for (auto it = submissions_in_flight_fences_.cbegin(); it != submissions_in_flight_fences_awaited_end; ++it) {
++    if (!IsNrExternalPresentFence(*it)) fences_free_.push_back(*it);
++  }
+   submissions_in_flight_fences_.erase(submissions_in_flight_fences_.cbegin(),
+                                       submissions_in_flight_fences_awaited_end);
+   submission_completed_ += fences_awaited;
+@@ -7227,25 +7409,112 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+       VkSubmitInfo submit_info;
+       submit_info.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+       submit_info.pNext = nullptr;
++#if defined(_WIN32)
++      std::vector<VkSemaphore> nr_external_wait_semaphores;
++      std::vector<VkPipelineStageFlags> nr_external_wait_stages;
++      std::vector<uint64_t> nr_external_wait_values;
++      VkD3D12FenceSubmitInfoKHR nr_d3d12_fence_submit_info = {
++          VK_STRUCTURE_TYPE_D3D12_FENCE_SUBMIT_INFO_KHR};
++      uint64_t nr_external_signal_value = 0;
++      const bool use_nr_external_present_sync =
++          nr_external_present_semaphore_ != VK_NULL_HANDLE && is_swap;
++      if (use_nr_external_present_sync) {
++        nr_external_wait_semaphores = current_submission_wait_semaphores_;
++        nr_external_wait_stages = current_submission_wait_stage_masks_;
++        nr_external_wait_semaphores.push_back(nr_external_present_semaphore_);
++        nr_external_wait_stages.push_back(VK_PIPELINE_STAGE_ALL_COMMANDS_BIT);
++        nr_external_wait_values.resize(nr_external_wait_semaphores.size(), 0);
++        nr_external_wait_values.back() = nr_external_present_wait_value_;
++        nr_external_signal_value = nr_external_present_signal_value_;
++        nr_d3d12_fence_submit_info.waitSemaphoreValuesCount =
++            uint32_t(nr_external_wait_values.size());
++        nr_d3d12_fence_submit_info.pWaitSemaphoreValues = nr_external_wait_values.data();
++        nr_d3d12_fence_submit_info.signalSemaphoreValuesCount = 1;
++        nr_d3d12_fence_submit_info.pSignalSemaphoreValues = &nr_external_signal_value;
++        submit_info.pNext = &nr_d3d12_fence_submit_info;
++      }
++#endif
+       if (!current_submission_wait_semaphores_.empty()) {
++#if defined(_WIN32)
++        if (use_nr_external_present_sync) {
++          submit_info.waitSemaphoreCount = uint32_t(nr_external_wait_semaphores.size());
++          submit_info.pWaitSemaphores = nr_external_wait_semaphores.data();
++          submit_info.pWaitDstStageMask = nr_external_wait_stages.data();
++        } else
++#endif
++        {
+         submit_info.waitSemaphoreCount = uint32_t(current_submission_wait_semaphores_.size());
+         submit_info.pWaitSemaphores = current_submission_wait_semaphores_.data();
+         submit_info.pWaitDstStageMask = current_submission_wait_stage_masks_.data();
++        }
+       } else {
++#if defined(_WIN32)
++        if (use_nr_external_present_sync) {
++          submit_info.waitSemaphoreCount = uint32_t(nr_external_wait_semaphores.size());
++          submit_info.pWaitSemaphores = nr_external_wait_semaphores.data();
++          submit_info.pWaitDstStageMask = nr_external_wait_stages.data();
++        } else
++#endif
++        {
+         submit_info.waitSemaphoreCount = 0;
+         submit_info.pWaitSemaphores = nullptr;
+         submit_info.pWaitDstStageMask = nullptr;
++        }
+       }
+       submit_info.commandBufferCount = 1;
+       submit_info.pCommandBuffers = &command_buffer.buffer;
++#if defined(_WIN32)
++      if (use_nr_external_present_sync) {
++        submit_info.signalSemaphoreCount = 1;
++        submit_info.pSignalSemaphores = &nr_external_present_semaphore_;
++      } else
++#endif
++      {
+       submit_info.signalSemaphoreCount = 0;
+       submit_info.pSignalSemaphores = nullptr;
+-      assert_false(fences_free_.empty());
+-      VkFence fence = fences_free_.back();
++      }
++      VkFence fence = VK_NULL_HANDLE;
++#if defined(_WIN32)
++      NrExternalPresentFence* nr_external_present_fence = nullptr;
++      const bool use_nr_external_present_fence = is_swap && nr_external_present_slot_key_ &&
++                                                 nr_external_ring_depth_ == 3;
++      if (use_nr_external_present_fence) {
++        NrExternalPresentFence& slot = nr_external_present_fences_[nr_external_present_slot_key_];
++        if (slot.fence == VK_NULL_HANDLE) {
++          VkFenceCreateInfo fence_create_info = {};
++          fence_create_info.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
++          if (dfn.vkCreateFence(device, &fence_create_info, nullptr, &slot.fence) != VK_SUCCESS) {
++            REXGPU_ERROR("Failed to create a Vulkan D3D12 shared-present ring fence");
++            return false;
++          }
++        }
++        fence = slot.fence;
++        nr_external_present_fence = &slot;
++      }
++#endif
++      if (fence == VK_NULL_HANDLE) {
++        assert_false(fences_free_.empty());
++        fence = fences_free_.back();
++      }
+       if (dfn.vkResetFences(device, 1, &fence) != VK_SUCCESS) {
+         REXGPU_ERROR("Failed to reset a Vulkan submission fence");
+         return false;
+       }
++#if defined(_WIN32)
++      // The D3D12 producer has already submitted its copy and fence signal. Wait only here, after
++      // presenter commands are recorded and immediately before queue submission, so the producer
++      // never waits for the current frame's D3D12 copy.
++      if (is_swap && nr_external_present_slot_key_ && nr_external_wait_cpu_fence_) {
++        uint64_t wait_ns = 0;
++        if (!nr_external_wait_cpu_fence_(nr_external_cpu_fence_context_, nr_external_cpu_fence_value_,
++                                         &wait_ns)) {
++          gpu_timing_->SubmissionCancelled(frame_current_, submission_current);
++          REXGPU_ERROR("D3D12 shared-present producer fence wait failed before Vulkan submit (slot={} value={} wait_ms={:.3f})",
++                       nr_external_ring_slot_, nr_external_cpu_fence_value_, double(wait_ns) * 1e-6);
++          return false;
++        }
++      }
++#endif
+       VkResult submit_result;
+       {
+         ui::vulkan::VulkanDevice::Queue::Acquisition queue_acquisition =
+@@ -7272,11 +7541,27 @@ bool VulkanCommandProcessor::EndSubmission(bool is_swap) {
+         submissions_in_flight_semaphores_.emplace_back(submission_current, semaphore);
+       }
+       current_submission_wait_semaphores_.clear();
++#if defined(_WIN32)
++      if (use_nr_external_present_sync) {
++        nr_external_present_semaphore_ = VK_NULL_HANDLE;
++        nr_external_present_wait_value_ = 0;
++        nr_external_present_signal_value_ = 0;
++      }
++      if (nr_external_present_fence) {
++        nr_external_present_fence->submission = submission_current;
++        nr_external_present_fence->has_submission = true;
++      }
++      nr_external_present_slot_key_ = 0;
++      nr_external_ring_depth_ = nr_external_ring_slot_ = 0;
++      nr_external_wait_cpu_fence_ = nullptr;
++      nr_external_cpu_fence_context_ = nullptr;
++      nr_external_cpu_fence_value_ = 0;
++#endif
+       command_buffers_submitted_.emplace_back(submission_current, command_buffer);
+       command_buffers_writable_.pop_back();
+       // Increments the current submission number, going to the next submission.
+       submissions_in_flight_fences_.push_back(fence);
+-      fences_free_.pop_back();
++      if (!IsNrExternalPresentFence(fence)) fences_free_.pop_back();
+ 
+       submission_open_ = false;
+     }
+@@ -8871,11 +9156,21 @@ namespace rex::graphics {
+ namespace {
+ // [wwe13 nr] Direct GPU presentation state (GPU command processor thread only).
+ ui::vulkan::VulkanDevice* g_nr_vulkan_device = nullptr;  // set by VulkanCommandProcessor::SetupContext
++vulkan::VulkanCommandProcessor* g_nr_vulkan_command_processor = nullptr;
+ NrExternalSwap g_nr_external_swap;
+ bool g_nr_external_swap_set = false;
++
++bool NrWaitExternalPresentSlot(void* context, uint64_t slot_key, uint64_t* wait_ns) {
++  auto* command_processor = static_cast<vulkan::VulkanCommandProcessor*>(context);
++  return command_processor && command_processor->WaitNrExternalPresentSlot(slot_key, wait_ns);
++}
+ }  // namespace
+ 
+-void NrSetVulkanDevice(ui::vulkan::VulkanDevice* device) { g_nr_vulkan_device = device; }
++void NrSetVulkanDevice(ui::vulkan::VulkanDevice* device,
++                       vulkan::VulkanCommandProcessor* command_processor) {
++  g_nr_vulkan_device = device;
++  g_nr_vulkan_command_processor = command_processor;
++}
+ 
+ bool GetNrVulkanDevice(NrVulkanDevice* out) {
+   const ui::vulkan::VulkanDevice* d = g_nr_vulkan_device;
+@@ -8902,6 +9197,13 @@ bool GetNrVulkanDevice(NrVulkanDevice* out) {
+   out->sampler_mirror_clamp_to_edge = p.samplerMirrorClampToEdge;
+   out->geometry_shader = p.geometryShader;
+   out->shader_stencil_export = d->extensions().ext_EXT_shader_stencil_export;
++  out->external_memory_win32 = nr.external_memory_win32;
++  out->external_semaphore_win32 = nr.external_semaphore_win32;
++  out->timeline_semaphore = nr.timeline_semaphore;
++  out->device_luid_valid = p.deviceLUIDValid;
++  std::memcpy(out->device_luid, p.deviceLUID, sizeof(out->device_luid));
++  out->wait_external_present_slot = NrWaitExternalPresentSlot;
++  out->external_present_slot_context = g_nr_vulkan_command_processor;
+   return nr.shader_int64 && nr.buffer_device_address && nr.descriptor_indexing;
+ }
+ 
+diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
+index 5192d785..e97d7e98 100644
+--- a/src/ui/presenter.cpp
++++ b/src/ui/presenter.cpp
+@@ -280,6 +280,14 @@ GuestOutputPaintConfig BuildGuestOutputPaintConfigFromCVar() {
+ 
+ namespace rex {
+ namespace ui {
++namespace {
++std::atomic<uint32_t> g_guest_present_repeat{1};
++}  // namespace
++void SetGuestPresentRepeat(uint32_t presents_per_frame) {
++  g_guest_present_repeat.store(presents_per_frame < 1 ? 1 : (presents_per_frame > 4 ? 4 : presents_per_frame),
++                               std::memory_order_relaxed);
++}
++uint32_t GetGuestPresentRepeat() { return g_guest_present_repeat.load(std::memory_order_relaxed); }
+ 
+ void Presenter::FatalErrorHostGpuLossCallback([[maybe_unused]] bool is_responsible,
+                                               [[maybe_unused]] bool statically_from_ui_thread) {
+@@ -633,6 +641,13 @@ bool Presenter::RefreshGuestOutput(
+         // Both painting and window paint requesting are accessible.
+         if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable) {
+           paint_result = PaintAndPresent(false);
++          // [wwe2k14 nr] present the same guest frame again for the extra refreshes it must stay on screen.
++          for (uint32_t r = 1; r < GetGuestPresentRepeat() &&
++                               (paint_result == PaintResult::kPresented || paint_result == PaintResult::kPresentedSuboptimal) &&
++                               surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedPaintable;
++               ++r) {
++            paint_result = PaintAndPresent(false);
++          }
+           if (surface_paint_connection_state_ == SurfacePaintConnectionState::kConnectedOutdated) {
+             RequestPaintOrConnectionRecoveryViaWindow(true);
+           }
+diff --git a/src/ui/vulkan/vulkan_device.cpp b/src/ui/vulkan/vulkan_device.cpp
+index 75e6cde7..1b415713 100644
+--- a/src/ui/vulkan/vulkan_device.cpp
++++ b/src/ui/vulkan/vulkan_device.cpp
+@@ -10,6 +10,7 @@
+  */
+ 
+ #include <algorithm>
++#include <cstdlib>
+ #include <cstring>
+ #include <string>
+ #include <unordered_map>
+@@ -50,6 +51,16 @@ namespace vulkan {
+ 
+ namespace {
+ NrSharedDeviceFeatures g_nr_shared_device_features;
++
++bool NrD3D12SharedPresentRequested() {
++#if defined(_WIN32)
++  const char* present = std::getenv("WWE2K14_NR_D3D12_SHARED_PRESENT");
++  const char* backend = std::getenv("WWE2K14_NR_BACKEND");
++  return present && std::strcmp(present, "1") == 0 && backend && std::strcmp(backend, "d3d12") == 0;
++#else
++  return false;
++#endif
++}
+ }  // namespace
+ const NrSharedDeviceFeatures& GetNrSharedDeviceFeatures() { return g_nr_shared_device_features; }
+ 
+@@ -179,6 +190,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+ 
+   bool ext_KHR_portability_subset = false;
+   bool ext_1_2_KHR_driver_properties = false;
++  bool ext_KHR_external_memory = false;
++  bool ext_KHR_external_semaphore = false;
++  bool ext_KHR_external_memory_win32 = false;
++  bool ext_KHR_external_semaphore_win32 = false;
++  const bool nr_d3d12_shared_present_requested = NrD3D12SharedPresentRequested();
+   if (get_physical_device_properties2_supported) {
+     // #164. Must be enabled according to the specification if the physical
+     // device is a portability subset one.
+@@ -206,6 +222,17 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     XE_UI_VULKAN_STRUCT_PROMOTED_EXTENSION(KHR_dynamic_rendering, 1, 3)
+   }
+ 
++  // D3D12 -> Vulkan external-present is an opt-in on the shared emulator device. It is enabled
++  // only when the selected native-renderer backend is D3D12; unsupported devices retain the
++  // ordinary Vulkan device and the native renderer reports/follows its readback transport.
++  if (nr_d3d12_shared_present_requested && get_physical_device_properties2_supported &&
++      properties.apiVersion >= VK_MAKE_API_VERSION(0, 1, 2, 0)) {
++    request_promoted_extension("VK_KHR_external_memory", 1, 1, &ext_KHR_external_memory);
++    request_promoted_extension("VK_KHR_external_semaphore", 1, 1, &ext_KHR_external_semaphore);
++    requested_extensions.emplace("VK_KHR_external_memory_win32", &ext_KHR_external_memory_win32);
++    requested_extensions.emplace("VK_KHR_external_semaphore_win32", &ext_KHR_external_semaphore_win32);
++  }
++
+   if (with_swapchain) {
+     // #2.
+     XE_UI_VULKAN_STRUCT_EXTENSION(KHR_swapchain)
+@@ -309,6 +336,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+   // VK_KHR_get_physical_device_properties2.
+ 
+   VkPhysicalDeviceProperties2 properties_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_PROPERTIES_2};
++  VkPhysicalDeviceIDProperties properties_id = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ID_PROPERTIES};
++  if (nr_d3d12_shared_present_requested && get_physical_device_properties2_supported) {
++    properties_id.pNext = properties_2.pNext;
++    properties_2.pNext = &properties_id;
++  }
+ 
+   VkPhysicalDeviceFeatures2 supported_features_2 = {VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_FEATURES_2};
+ 
+@@ -388,6 +420,11 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+     }
+     ifn.vkGetPhysicalDeviceProperties2(physical_device, &properties_2);
+     ifn.vkGetPhysicalDeviceFeatures2(physical_device, &supported_features_2);
++    if (nr_d3d12_shared_present_requested) {
++      device->properties_.deviceLUIDValid = properties_id.deviceLUIDValid != VK_FALSE;
++      std::memcpy(device->properties_.deviceLUID, properties_id.deviceLUID,
++                  sizeof(device->properties_.deviceLUID));
++    }
+   }
+ 
+   uint32_t queue_family_count = 0;
+@@ -783,8 +820,19 @@ std::unique_ptr<VulkanDevice> VulkanDevice::CreateIfSupported(
+                              s.descriptorBindingVariableDescriptorCount &&
+                              s.descriptorBindingSampledImageUpdateAfterBind &&
+                              s.descriptorBindingStorageBufferUpdateAfterBind;
++    if (nr_d3d12_shared_present_requested) {
++      nr.external_memory_win32 = ext_KHR_external_memory && ext_KHR_external_memory_win32;
++      nr.external_semaphore_win32 = ext_KHR_external_semaphore && ext_KHR_external_semaphore_win32;
++      e.timelineSemaphore = s.timelineSemaphore;
++      nr.timeline_semaphore = s.timelineSemaphore != VK_FALSE;
++    }
+     REXLOG_INFO("[nr] shared device features: shaderInt64={} bufferDeviceAddress={} descriptorIndexing={}",
+                 nr.shader_int64, nr.buffer_device_address, nr.descriptor_indexing);
++    if (nr_d3d12_shared_present_requested) {
++      REXLOG_INFO("[nr] D3D12 shared-present Vulkan support: memoryWin32={} semaphoreWin32={} timeline={} LUID={}",
++                  nr.external_memory_win32, nr.external_semaphore_win32, nr.timeline_semaphore,
++                  device->properties_.deviceLUIDValid);
++    }
+   }
+ 
+ #undef XE_UI_VULKAN_LIMIT
+-- 
+2.43.0
+

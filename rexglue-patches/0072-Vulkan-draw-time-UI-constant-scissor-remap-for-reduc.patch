@@ -1,8 +1,8 @@
 From 8aac55421508046560221ec15096117cba778892 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 15:49:52 -0700
-Subject: [PATCH 72/97] Vulkan: draw-time UI constant/scissor remap for reduced
- internal resolutions (WWE13 480p/576p menus)
+Subject: [PATCH 072/149] Vulkan: draw-time UI constant/scissor remap for
+ reduced internal resolutions (WWE13 480p/576p menus)
 
 Configured by the game (vertex-shader ucode hashes + from/to c0 pair + scene size); inactive when unset.
 For matching draws only: VS c0.xy 2/(scene) -> 2/(1280,720) and the window scissor scaled from UI units to
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 286 insertions(+), 8 deletions(-)
 
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 0c2a3e3..1ebc02a 100644
+index 0c2a3e35..1ebc02a1 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -559,14 +559,17 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -49,7 +49,7 @@ index 0c2a3e3..1ebc02a 100644
    // System shader constants.
    SpirvShaderTranslator::SystemConstants system_constants_;
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 1ef1bb6..364a51b 100644
+index 1ef1bb61..364a51bc 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -12,7 +12,10 @@

@@ -1,7 +1,7 @@
 From 402c04b8adc5ebb7b39d119fcb49b4657d948958 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Sat, 26 Sep 2026 18:27:44 -0700
-Subject: [PATCH 48/97] display pacing: count distinct guest frames consumed
+Subject: [PATCH 048/149] display pacing: count distinct guest frames consumed
  per display vblank, not host presents
 
 On the laptop the presenter presents on every display refresh (60/s) even at 30 guest frames/s, so presents
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 14 insertions(+), 6 deletions(-)
 
 diff --git a/include/rex/ui/presenter.h b/include/rex/ui/presenter.h
-index 45f45d5..c61ff45 100644
+index 45f45d56..c61ff45e 100644
 --- a/include/rex/ui/presenter.h
 +++ b/include/rex/ui/presenter.h
 @@ -362,9 +362,13 @@ class Presenter {
@@ -34,7 +34,7 @@ index 45f45d5..c61ff45 100644
    enum class PaintResult {
      kPresented,
 diff --git a/src/graphics/graphics_system.cpp b/src/graphics/graphics_system.cpp
-index 173495a..20c9dd3 100644
+index 173495a6..20c9dd30 100644
 --- a/src/graphics/graphics_system.cpp
 +++ b/src/graphics/graphics_system.cpp
 @@ -414,7 +414,7 @@ void GraphicsSystem::DisplayPacingThread() {
@@ -72,7 +72,7 @@ index 173495a..20c9dd3 100644
        max_gap_ms = 0.0;
        window_start = now;
 diff --git a/src/ui/presenter.cpp b/src/ui/presenter.cpp
-index 4ee2811..5192d78 100644
+index 4ee28110..5192d785 100644
 --- a/src/ui/presenter.cpp
 +++ b/src/ui/presenter.cpp
 @@ -844,6 +844,10 @@ std::unique_lock<std::mutex> Presenter::ConsumeGuestOutput(

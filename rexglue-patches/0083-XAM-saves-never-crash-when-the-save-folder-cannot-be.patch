@@ -1,7 +1,7 @@
 From 5df1281a1e8ceb01086ba9b7e6410c24afd890ec Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 1 Oct 2026 21:44:17 -0700
-Subject: [PATCH 83/97] XAM saves: never crash when the save folder cannot be
+Subject: [PATCH 083/149] XAM saves: never crash when the save folder cannot be
  written
 
 Unchecked OpenFile results (fseek/fwrite on a null FILE*) and the throwing std::filesystem::create_directories
@@ -14,7 +14,7 @@ with a warning). Release bug hunt 2026-10-02, review logs/bughunt-20261002/r2-ho
  2 files changed, 23 insertions(+), 5 deletions(-)
 
 diff --git a/src/system/xam/content_manager.cpp b/src/system/xam/content_manager.cpp
-index 6fd8baf..ea5b9bf 100644
+index 6fd8baf8..ea5b9bfb 100644
 --- a/src/system/xam/content_manager.cpp
 +++ b/src/system/xam/content_manager.cpp
 @@ -12,6 +12,7 @@
@@ -74,7 +74,7 @@ index 6fd8baf..ea5b9bf 100644
      fclose(file);
      return X_ERROR_SUCCESS;
 diff --git a/src/system/xam/user_profile.cpp b/src/system/xam/user_profile.cpp
-index a77f5e6..02c133d 100644
+index a77f5e6e..02c133d9 100644
 --- a/src/system/xam/user_profile.cpp
 +++ b/src/system/xam/user_profile.cpp
 @@ -10,9 +10,11 @@

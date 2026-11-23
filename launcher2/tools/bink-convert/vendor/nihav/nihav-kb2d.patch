@@ -1,0 +1,147 @@
+--- a/nihav-rad/src/codecs/bink2.rs
++++ b/nihav-rad/src/codecs/bink2.rs
+@@ -1037,6 +1037,7 @@
+     ips:        IPShuffler,
+ 
+     version:    u32,
++    is_kb2d:    bool,
+     has_alpha:  bool,
+     slice_h:    [usize; 8],
+     num_slices: usize,
+@@ -1241,9 +1242,15 @@
+                                 let mut yblk: [[[f32; 64]; 4]; 4] = [[[0.0; 64]; 4]; 4];
+                                 let mut ublk: [[f32; 64]; 4] = [[0.0; 64]; 4];
+                                 let mut vblk: [[f32; 64]; 4] = [[0.0; 64]; 4];
++                                if self.is_kb2d {
++                                    decode_luma_intra_kb2d(br, &mut yblk, edge_state_y, &mut self.y_dcs, bx)?;
++                                    decode_chroma_intra_kb2d(br, &mut vblk, edge_state_c, &mut self.v_dcs, bx)?;
++                                    decode_chroma_intra_kb2d(br, &mut ublk, edge_state_c, &mut self.u_dcs, bx)?;
++                                } else {
+                                 cbp_y = decode_luma_intra_old(br, &self.codes, cbp_y, &mut yblk, edge_state_y, &mut self.y_dcs, bx, &mut q_y)?;
+                                 cbp_v = decode_chroma_intra_old(br, &self.codes, cbp_v, &mut vblk, edge_state_c, &mut self.v_dcs, bx, &mut q_v)?;
+                                 cbp_u = decode_chroma_intra_old(br, &self.codes, cbp_u, &mut ublk, edge_state_c, &mut self.u_dcs, bx, &mut q_u)?;
++                                }
+                                 if do_alpha {
+                                     let mut ablk: [[[f32; 64]; 4]; 4] = [[[0.0; 64]; 4]; 4];
+                                     cbp_a = decode_luma_intra_old(br, &self.codes, cbp_a, &mut ablk, edge_state_y, &mut self.a_dcs, bx, &mut q_a)?;
+@@ -1355,9 +1362,14 @@
+                                 let mut yblk: [[[f32; 64]; 4]; 4] = [[[0.0; 64]; 4]; 4];
+                                 let mut ublk: [[f32; 64]; 4] = [[0.0; 64]; 4];
+                                 let mut vblk: [[f32; 64]; 4] = [[0.0; 64]; 4];
++                                if self.is_kb2d {
++                                    decode_luma_inter_kb2d(br, &mut yblk, &mut self.y_dcs)?;
++                                    decode_chroma_inter_kb2d(br, &mut vblk, &mut ublk, &mut self.v_dcs, &mut self.u_dcs)?;
++                                } else {
+                                 cbp_y_p = decode_luma_inter_old(br, &self.codes, cbp_y_p, &mut yblk, edge_state_y, &mut self.y_dcs, &mut q_y_p)?;
+                                 cbp_v_p = decode_chroma_inter_old(br, &self.codes, cbp_v_p, &mut vblk, edge_state_y, &mut self.v_dcs, &mut q_v_p)?;
+                                 cbp_u_p = decode_chroma_inter_old(br, &self.codes, cbp_u_p, &mut ublk, edge_state_y, &mut self.u_dcs, &mut q_u_p)?;
++                                }
+                                 if do_alpha {
+                                     let mut ablk: [[[f32; 64]; 4]; 4] = [[[0.0; 64]; 4]; 4];
+                                     cbp_a_p = decode_luma_inter_old(br, &self.codes, cbp_a_p, &mut ablk, edge_state_y, &mut self.a_dcs, &mut q_a_p)?;
+@@ -1649,6 +1661,97 @@
+     Ok(())
+ }
+ 
++// --- KB2d (WWE '13 Bink 2 library, BINK section 0x8334F000; reverse-engineered 2026-11-04 for this converter) ---
++// Macroblock: q = 4 raw bits (no CBP, no delta quant), then the old DC stage, then 4 coefficient groups (0x83364328).
++// Coefficient group (4 blocks): position 1..63 in scan order, split into bands (end positions in KB2D_BANDS_*). Per band:
++// 1 bit "rest zero" (stop), else width w = 3 bits (+2 if 7, i.e. 0..10). Width 0: band is zero. Otherwise per position:
++// four w-bit magnitudes (block 0 first, LSB-first), then for each block in order with magnitude != 0 one sign bit
++// (1 = negative). Dequantisation as the old path (the dequant/IDCT function is byte-identical between KB2d and KB2f).
++const KB2D_BANDS_LUMA_INTRA: [usize; 8] = [ 2, 4, 8, 13, 19, 24, 41, 63 ];
++const KB2D_BANDS_LUMA_INTER: [usize; 8] = [ 2, 4, 8, 13, 19, 24, 44, 63 ];
++const KB2D_BANDS_CHROMA: [usize; 6] = [ 2, 5, 7, 9, 12, 63 ];
++
++fn decode_acs_4blocks_kb2d(br: &mut BitReader, dst: &mut [[f32; 64]; 4], quant_mat: &[f32; 64], q: u8, bands: &[usize], scan: &[usize; 64]) -> DecoderResult<()> {
++    let quant = BINK2_OLD_QUANTS[q as usize];
++    let mut idx = 1;
++    for &band_end in bands.iter() {
++        if idx >= 64 { break; }
++        if br.read_bool()? { break; } // rest of the coefficients are zero
++        let mut w = br.read(3)? as u8;
++        if w == 7 { w += br.read(2)? as u8; }
++        while idx <= band_end && idx < 64 {
++            if w > 0 {
++                let mut mags = [0u32; 4];
++                for m in mags.iter_mut() { *m = br.read(w)?; }
++                let pos = scan[idx];
++                for (blk, &m) in mags.iter().enumerate() {
++                    if m == 0 { continue; }
++                    let mut level = m as i32;
++                    if br.read_bool()? { level = -level; }
++                    dst[blk][pos] = (level as f32) * quant_mat[(pos & 7) * 8 + (pos >> 3)] * quant;
++                }
++            }
++            idx += 1;
++        }
++    }
++    Ok(())
++}
++
++fn decode_luma_intra_kb2d(br: &mut BitReader, dst: &mut [[[f32; 64]; 4]; 4], edge_state: u32, dcinfo: &mut YDCInfo, bx: usize) -> DecoderResult<()> {
++    let q = br.read(4)? as u8;
++    let is_top = (edge_state & 0x88) != 0;
++    let is_left = (edge_state & 0x20) != 0;
++    decode_dcs_old(br, &mut dcinfo.dc_buf, q, is_top && is_left)?;
++    dcinfo.predict(bx, is_top, is_left, 0, 0x7FF);
++    let dcs = &dcinfo.dcs;
++    for i in 0..4 {
++        decode_acs_4blocks_kb2d(br, &mut dst[i], BINK2_QMAT_INTRA_LUMA_OLD, q, &KB2D_BANDS_LUMA_INTRA, BINK2_LUMA_SCAN_OLD)?;
++        for j in 0..4 { dst[i][j][0] = (dcs[i * 4 + j] as f32) * 0.125; }
++    }
++    Ok(())
++}
++
++fn decode_chroma_intra_kb2d(br: &mut BitReader, dst: &mut [[f32; 64]; 4], edge_state: u32, dcinfo: &mut CDCInfo, bx: usize) -> DecoderResult<()> {
++    let q = br.read(4)? as u8;
++    let is_top = (edge_state & 0x88) != 0;
++    let is_left = (edge_state & 0x20) != 0;
++    decode_dcs_old(br, &mut dcinfo.dc_buf, q, is_top && is_left)?;
++    dcinfo.predict(bx, is_top, is_left, 0, 0x7FF);
++    decode_acs_4blocks_kb2d(br, dst, BINK2_QMAT_CHROMA_OLD, q, &KB2D_BANDS_CHROMA, BINK2_CHROMA_SCAN_OLD)?;
++    let dcs = &dcinfo.dcs;
++    for i in 0..4 { dst[i][0] = (dcs[i] as f32) * 0.125; }
++    Ok(())
++}
++
++fn decode_luma_inter_kb2d(br: &mut BitReader, dst: &mut [[[f32; 64]; 4]; 4], dcinfo: &mut YDCInfo) -> DecoderResult<()> {
++    let q = br.read(4)? as u8;
++    decode_dcs_old(br, &mut dcinfo.dc_buf, q, false)?;
++    dcinfo.predict_inter(-1023, 1023);
++    let dcs = &dcinfo.dcs;
++    for i in 0..4 {
++        decode_acs_4blocks_kb2d(br, &mut dst[i], BINK2_QMAT_INTER_LUMA_OLD, q, &KB2D_BANDS_LUMA_INTER, BINK2_LUMA_SCAN_OLD)?;
++        for j in 0..4 { dst[i][j][0] = (dcs[i * 4 + j] as f32) * 0.125; }
++    }
++    Ok(())
++}
++
++// KB2d inter chroma (0x8336C550): ONE call for both planes: q = 4 bits, one DC set of 8 values (0x833693C8: shared
++// bit width, two chunks of 4, no bias in inter), then coefficients of the first plane, then of the second.
++fn decode_chroma_inter_kb2d(br: &mut BitReader, dst1: &mut [[f32; 64]; 4], dst2: &mut [[f32; 64]; 4], dc1: &mut CDCInfo, dc2: &mut CDCInfo) -> DecoderResult<()> {
++    let q = br.read(4)? as u8;
++    let mut dcs8 = [0i32; 8];
++    decode_dcs_old(br, &mut dcs8, q, false)?;
++    dc1.dc_buf.copy_from_slice(&dcs8[..4]);
++    dc2.dc_buf.copy_from_slice(&dcs8[4..]);
++    dc1.predict_inter(-1023, 1023);
++    dc2.predict_inter(-1023, 1023);
++    decode_acs_4blocks_kb2d(br, dst1, BINK2_QMAT_CHROMA_OLD, q, &KB2D_BANDS_CHROMA, BINK2_CHROMA_SCAN_OLD)?;
++    decode_acs_4blocks_kb2d(br, dst2, BINK2_QMAT_CHROMA_OLD, q, &KB2D_BANDS_CHROMA, BINK2_CHROMA_SCAN_OLD)?;
++    for i in 0..4 { dst1[i][0] = (dc1.dcs[i] as f32) * 0.125; }
++    for i in 0..4 { dst2[i][0] = (dc2.dcs[i] as f32) * 0.125; }
++    Ok(())
++}
++
+ fn decode_luma_intra_old(br: &mut BitReader, codes: &Bink2Codes, prev_cbp: u32, dst: &mut [[[f32; 64]; 4]; 4], edge_state: u32, dcinfo: &mut YDCInfo, bx: usize, old_q: &mut u8) -> DecoderResult<u32> {
+     let cbp = decode_cbp_luma_old(br, prev_cbp)?;
+     let q = decode_quant_old(br, &codes.quant_cb, *old_q)?;
+@@ -1899,6 +2002,7 @@
+             let flags                   = br.read_u32le()?;
+ 
+             self.version = magic;
++            self.is_kb2d = magic == mktag!(b"KB2d");
+             self.has_alpha = (flags & 0x100000) != 0;
+ 
+             let height_a = (h + 31) & !31;

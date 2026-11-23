@@ -1,7 +1,7 @@
 From 77ca72ba7f0e932f4029f37249a90d21e1f2d656 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 2 Oct 2026 00:55:28 -0700
-Subject: [PATCH 85/97] Resolve: rate-limit the 'outside the surface pitch'
+Subject: [PATCH 085/149] Resolve: rate-limit the 'outside the surface pitch'
  error (first 16, then every 4096th)
 
 WWE '13 at internal 480p issues one 1280x720 resolve from a 640-pitch surface every frame; its consumer only samples
@@ -12,7 +12,7 @@ clamp is harmless but the log grew by ~60 lines per second.
  1 file changed, 11 insertions(+), 3 deletions(-)
 
 diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
-index db2eaeb..676fe26 100644
+index db2eaeb5..676fe261 100644
 --- a/src/graphics/util/draw.cpp
 +++ b/src/graphics/util/draw.cpp
 @@ -10,6 +10,7 @@

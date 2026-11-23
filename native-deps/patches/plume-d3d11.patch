@@ -1,0 +1,2517 @@
+diff --git a/plume_render_interface_types.h b/plume_render_interface_types.h
+index be1c5c3..c8eb2d2 100644
+--- a/plume_render_interface_types.h
++++ b/plume_render_interface_types.h
+@@ -382,7 +382,8 @@ namespace plume {
+         UNKNOWN,
+         DXIL,
+         SPIRV,
+-        METAL
++        METAL,
++        DXBC  // WWE '12: Direct3D 11 (Shader Model 5), from the SvR 2011 PC port (KaikoClanworth1)
+     };
+ 
+     enum class RenderRaytracingPipelineLibrarySymbolType {
+diff --git a/plume_d3d11.h b/plume_d3d11.h
+new file mode 100644
+index 0000000..58c77cd
+--- /dev/null
++++ b/plume_d3d11.h
+@@ -0,0 +1,329 @@
++//
++// plume
++//
++// [svr2011] Direct3D 11 backend - only what a renderer written for the
++// D3D12 backend's model needs on GPUs without Direct3D 12 / Vulkan (feature
++// level 10_0+): one direct queue, recorded command lists replayed on one
++// immediate context, descriptor sets as slot arrays (each range at fixed
++// registers: t/s/b = binding + index), root constant buffers, upload and
++// readback buffers emulated in CPU memory, no compute, MSAA resolves, queries,
++// swap chains or ray tracing (those log once and do nothing).
++//
++// The immediate context is shared with its creator (the app's presenter):
++// every use holds `contextMutex`, and each replay starts from ClearState.
++//
++
++#pragma once
++
++#include "plume_render_interface.h"
++
++#include <atomic>
++#include <condition_variable>
++#include <deque>
++#include <mutex>
++#include <thread>
++#include <unordered_map>
++#include <vector>
++
++#include <d3d11_1.h>
++#include <wrl/client.h>
++
++namespace plume {
++    struct D3D11Device;
++    struct D3D11Texture;
++
++    struct D3D11Buffer : RenderBuffer {
++        D3D11Device *device = nullptr;
++        RenderBufferDesc desc;
++        // DEFAULT heap: the buffer itself.
++        Microsoft::WRL::ComPtr<ID3D11Buffer> d3d;
++        // UPLOAD / READBACK heaps: CPU memory (16-byte aligned).
++        uint8_t *cpu = nullptr;
++        // UPLOAD: the GPU copies, made at first use - vertex / index data and
++        // constants (D3D11.0 forbids combining CONSTANT with other bind flags).
++        Microsoft::WRL::ComPtr<ID3D11Buffer> gpuGeometry;
++        Microsoft::WRL::ComPtr<ID3D11Buffer> gpuConstants;
++        bool gpuGeometryDynamic = false;
++        // gpuGeometry is bound as constants too (D3D11.1 runtimes allow it).
++        bool combined = false;
++        // Rings: bytes already on each GPU copy (geometry, constants) for the
++        // list being replayed (its generation) - the next submission of the
++        // same list appends.
++        uint64_t uploadedEnd[2] = {};
++        uint64_t uploadedGeneration[2] = {};
++        bool gpuConstantsDynamic = false;
++        // Mapped and not unmapped (a persistently mapped ring): uploaded at every
++        // submission that uses it. Unmapped since the last upload: dirty.
++        std::atomic<bool> mapped = false;
++        std::atomic<bool> geometryDirty = true;
++        std::atomic<bool> constantsDirty = true;
++        // The GPU copies exist (set by the replay, read when recording).
++        std::atomic<bool> geometryReady = false;
++        std::atomic<bool> constantsReady = false;
++        // READBACK: texture copies waiting to be read into `cpu` (at map).
++        struct PendingReadback {
++            Microsoft::WRL::ComPtr<ID3D11Resource> staging;
++            uint32_t subresource = 0;
++            uint64_t offset = 0;
++            uint32_t rowPitch = 0;     // (the buffer's: the footprint's padded row)
++            uint32_t rows = 0;
++            uint32_t depth = 1;
++            uint32_t rowBytes = 0;     // the staging texture's data per row (its width; the
++            uint32_t stagingRows = 0;  // footprint row can be wider) and its rows
++        };
++        std::mutex readbackMutex;
++        std::vector<PendingReadback> readbacks;
++
++        D3D11Buffer(D3D11Device *device, const RenderBufferDesc &desc);
++        ~D3D11Buffer() override;
++        void *map(uint32_t subresource, const RenderRange *readRange) override;
++        void unmap(uint32_t subresource, const RenderRange *writtenRange) override;
++        std::unique_ptr<RenderBufferFormattedView> createBufferFormattedView(RenderFormat format) override;
++        void setName(const std::string &name) override;
++        uint64_t getDeviceAddress() const override { return 0; }
++        // The GPU buffer to bind for `constants` or vertex / index use, uploaded
++        // to `end` bytes (context lock held).
++        ID3D11Buffer *gpu(bool constants, uint64_t end, uint64_t generation = 0);
++    };
++
++    struct D3D11TextureView : RenderTextureView {
++        const D3D11Texture *texture = nullptr;
++        RenderTextureViewDesc desc;
++        Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> srv;
++
++        D3D11TextureView(const D3D11Texture *texture, const RenderTextureViewDesc &desc);
++    };
++
++    struct D3D11Texture : RenderTexture {
++        D3D11Device *device = nullptr;
++        RenderTextureDesc desc;
++        Microsoft::WRL::ComPtr<ID3D11Resource> d3d;
++        mutable std::mutex viewMutex;
++        mutable Microsoft::WRL::ComPtr<ID3D11ShaderResourceView> defaultSrv;
++
++        D3D11Texture(D3D11Device *device, const RenderTextureDesc &desc);
++        // WWE '12: wraps an existing resource (a swap chain's back buffer).
++        D3D11Texture(D3D11Device *device, const RenderTextureDesc &desc, ID3D11Resource *existing);
++        std::unique_ptr<RenderTextureView> createTextureView(const RenderTextureViewDesc &desc) const override;
++        void setName(const std::string &name) override;
++        ID3D11ShaderResourceView *getDefaultSrv() const;
++    };
++
++    struct D3D11Shader : RenderShader {
++        D3D11Device *device = nullptr;
++        std::vector<uint8_t> code;  // DXBC
++        bool isVertex = false;
++        Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
++        Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
++
++        D3D11Shader(D3D11Device *device, const void *data, uint64_t size);
++        void setName(const std::string &name) override {}
++    };
++
++    struct D3D11Sampler : RenderSampler {
++        Microsoft::WRL::ComPtr<ID3D11SamplerState> d3d;
++    };
++
++    // Each descriptor's register (t#, s# or b#: the range's binding plus the
++    // index in it) and what it holds.
++    struct D3D11DescriptorSet : RenderDescriptorSet {
++        enum class Kind : uint8_t { NONE, SRV, SAMPLER, CBV };
++        struct Entry {
++            Kind kind = Kind::NONE;
++            uint8_t reg = 0;
++        };
++        std::vector<Entry> entries;
++        std::vector<ID3D11ShaderResourceView *> srvs;   // (AddRef'd)
++        std::vector<ID3D11SamplerState *> samplers;     // (AddRef'd)
++        std::vector<RenderComponentMapping> mappings;   // the views' swizzles (D3D11 has none)
++        std::vector<const D3D11Buffer *> buffers;
++        uint32_t version = 0;
++        // WWE '12: a bindless set (more entries than registers): never bound whole, its
++        // entries go to registers one by one (D3D11SetSlotTexture / D3D11SetSlotSampler).
++        bool bindless = false;
++
++        D3D11DescriptorSet(const RenderDescriptorSetDesc &desc);
++        ~D3D11DescriptorSet() override;
++        void setBuffer(uint32_t descriptorIndex, const RenderBuffer *buffer, uint64_t bufferSize, const RenderBufferStructuredView *bufferStructuredView, const RenderBufferFormattedView *bufferFormattedView) override;
++        void setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) override;
++        void setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) override;
++        void setAccelerationStructure(uint32_t descriptorIndex, const RenderAccelerationStructure *accelerationStructure) override {}
++    };
++
++    struct D3D11PipelineLayout : RenderPipelineLayout {
++        // Root descriptor i -> b register.
++        std::vector<uint8_t> rootRegisters;
++        // WWE '12: push constant range i -> b register and size (a constant buffer of its own).
++        struct PushRange {
++            uint8_t reg = 0;
++            uint32_t size = 0;
++        };
++        std::vector<PushRange> pushRanges;
++    };
++
++    // WWE '12: semaphores order nothing on one immediate context.
++    struct D3D11CommandSemaphore : RenderCommandSemaphore {};
++
++    struct D3D11GraphicsPipeline : RenderPipeline {
++        Microsoft::WRL::ComPtr<ID3D11VertexShader> vs;
++        Microsoft::WRL::ComPtr<ID3D11PixelShader> ps;
++        Microsoft::WRL::ComPtr<ID3D11InputLayout> inputLayout;
++        Microsoft::WRL::ComPtr<ID3D11BlendState> blend;
++        Microsoft::WRL::ComPtr<ID3D11RasterizerState> rasterizer;
++        Microsoft::WRL::ComPtr<ID3D11DepthStencilState> depthStencil;
++        D3D11_PRIMITIVE_TOPOLOGY topology = D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
++        uint32_t stencilReference = 0;
++        bool dynamicStencilReference = false;
++        bool dynamicBlendFactor = false;
++        // Vertex slot strides (from the input slots).
++        uint32_t strides[D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT] = {};
++        bool valid = false;
++
++        void setName(const std::string &name) override {}
++        RenderPipelineProgram getProgram(const std::string &name) const override { return {}; }
++    };
++
++    struct D3D11Framebuffer : RenderFramebuffer {
++        uint32_t width = 0;
++        uint32_t height = 0;
++        std::vector<Microsoft::WRL::ComPtr<ID3D11RenderTargetView>> rtvs;
++        Microsoft::WRL::ComPtr<ID3D11DepthStencilView> dsv;
++
++        uint32_t getWidth() const override { return width; }
++        uint32_t getHeight() const override { return height; }
++    };
++
++    struct D3D11CommandFence : RenderCommandFence {
++        std::mutex mutex;
++        Microsoft::WRL::ComPtr<ID3D11Query> query;  // the last signal (null: none)
++        uint64_t submission = 0;  // the submission that signals it (0: none)
++    };
++
++    struct D3D11CommandList;
++
++    // Submissions are replayed on the queue's own thread (D3D11AsyncReplay):
++    // the thread recording the next frame doesn't wait for the driver calls.
++    struct D3D11CommandQueue : RenderCommandQueue {
++        D3D11Device *device = nullptr;
++        struct Submission {
++            std::vector<const RenderCommandList *> lists;
++            D3D11CommandFence *fence = nullptr;
++            uint64_t number = 0;
++        };
++        std::mutex mutex;
++        std::condition_variable work, done;
++        std::deque<Submission> pending;
++        std::atomic<uint64_t> submitted = 0;
++        std::atomic<uint64_t> replayed = 0;
++        bool stop = false;
++        std::thread thread;
++
++        explicit D3D11CommandQueue(D3D11Device *device);
++        ~D3D11CommandQueue() override;
++        // Replays a submission on the context (lock taken here).
++        void replay(const Submission &submission);
++        void worker();
++        // Waits until submission `number` has been replayed.
++        bool waitReplayed(uint64_t number, uint32_t timeoutMs);
++        std::unique_ptr<RenderCommandList> createCommandList() override;
++        std::unique_ptr<RenderSwapChain> createSwapChain(const RenderSwapChainDesc &desc) override;
++        void executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **waitSemaphores, uint32_t waitSemaphoreCount, RenderCommandSemaphore **signalSemaphores, uint32_t signalSemaphoreCount, RenderCommandFence *signalFence) override;
++        void waitForCommandFence(RenderCommandFence *fence) override;
++        bool waitForCommandFenceTimeout(RenderCommandFence *fence, uint32_t timeoutMs);
++    };
++
++    struct D3D11Device : RenderDevice {
++        Microsoft::WRL::ComPtr<ID3D11Device> d3d;
++        ID3D11DeviceContext *context = nullptr;
++        Microsoft::WRL::ComPtr<ID3D11DeviceContext1> context1;
++        std::recursive_mutex *contextMutex = nullptr;
++        D3D_FEATURE_LEVEL featureLevel = D3D_FEATURE_LEVEL_11_0;
++        bool constantBufferOffsetting = false;
++        // Dynamic constant buffers can be mapped NO_OVERWRITE (D3D11.1).
++        bool mapNoOverwriteConstants = false;
++        // A buffer can't be constants and vertices / indices at once here
++        // (found at the first try: the runtime refuses it).
++        std::atomic<bool> noCombinedBuffers = false;
++        RenderDeviceCapabilities capabilities;
++        RenderDeviceDescription description;
++        // Stats since they were last read (exchange(0)): draws replayed, bytes
++        // and time uploading upload buffers, time replaying the commands.
++        std::atomic<uint64_t> statDraws = 0;
++        std::atomic<uint64_t> statUploadBytes = 0;
++        std::atomic<uint64_t> statUploadNs = 0;
++        std::atomic<uint64_t> statReplayNs = 0;
++        std::atomic<uint64_t> statLockWaitNs = 0;  // (the presenter holding the context)
++        std::atomic<uint64_t> statFlushNs = 0;
++        // The queue (one): what has been submitted and replayed so far.
++        D3D11CommandQueue *queue = nullptr;
++
++        D3D11Device(ID3D11Device *device, ID3D11DeviceContext *context, std::recursive_mutex *contextMutex, bool constantBufferOffsetting);
++        std::unique_ptr<RenderDescriptorSet> createDescriptorSet(const RenderDescriptorSetDesc &desc) override;
++        std::unique_ptr<RenderShader> createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) override;
++        std::unique_ptr<RenderSampler> createSampler(const RenderSamplerDesc &desc) override;
++        std::unique_ptr<RenderPipeline> createComputePipeline(const RenderComputePipelineDesc &desc) override;
++        std::unique_ptr<RenderPipeline> createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) override;
++        std::unique_ptr<RenderPipeline> createRaytracingPipeline(const RenderRaytracingPipelineDesc &desc, const RenderPipeline *previousPipeline) override;
++        std::unique_ptr<RenderCommandQueue> createCommandQueue(RenderCommandListType type) override;
++        std::unique_ptr<RenderBuffer> createBuffer(const RenderBufferDesc &desc) override;
++        std::unique_ptr<RenderTexture> createTexture(const RenderTextureDesc &desc) override;
++        std::unique_ptr<RenderAccelerationStructure> createAccelerationStructure(const RenderAccelerationStructureDesc &desc) override;
++        std::unique_ptr<RenderPool> createPool(const RenderPoolDesc &desc) override;
++        std::unique_ptr<RenderPipelineLayout> createPipelineLayout(const RenderPipelineLayoutDesc &desc) override;
++        std::unique_ptr<RenderCommandFence> createCommandFence() override;
++        std::unique_ptr<RenderCommandSemaphore> createCommandSemaphore() override;
++        std::unique_ptr<RenderFramebuffer> createFramebuffer(const RenderFramebufferDesc &desc) override;
++        std::unique_ptr<RenderQueryPool> createQueryPool(uint32_t queryCount) override;
++        void setBottomLevelASBuildInfo(RenderBottomLevelASBuildInfo &buildInfo, const RenderBottomLevelASMesh *meshes, uint32_t meshCount, bool preferFastBuild, bool preferFastTrace) override {}
++        void setTopLevelASBuildInfo(RenderTopLevelASBuildInfo &buildInfo, const RenderTopLevelASInstance *instances, uint32_t instanceCount, bool preferFastBuild, bool preferFastTrace) override {}
++        void setShaderBindingTableInfo(RenderShaderBindingTableInfo &tableInfo, const RenderShaderBindingGroups &groups, const RenderPipeline *pipeline, RenderDescriptorSet **descriptorSets, uint32_t descriptorSetCount) override {}
++        const RenderDeviceCapabilities &getCapabilities() const override { return capabilities; }
++        const RenderDeviceDescription &getDescription() const override { return description; }
++        RenderSampleCounts getSampleCountsSupported(RenderFormat format) const override { return RenderSampleCount::COUNT_1; }
++        bool beginCapture() override { return false; }
++        bool endCapture() override { return false; }
++    };
++
++    struct D3D11Interface : RenderInterface {
++        Microsoft::WRL::ComPtr<ID3D11Device> device;
++        ID3D11DeviceContext *context = nullptr;
++        std::recursive_mutex *contextMutex = nullptr;
++        bool constantBufferOffsetting = false;
++        std::vector<std::string> deviceNames;
++        RenderInterfaceCapabilities capabilities;
++
++        std::unique_ptr<RenderDevice> createDevice(const std::string &preferredDeviceName) override;
++        const std::vector<std::string> &getDeviceNames() const override { return deviceNames; }
++        const RenderInterfaceCapabilities &getCapabilities() const override { return capabilities; }
++    };
++
++    // The renderer draws on an existing device and immediate context (the
++    // presenter's), locking `contextMutex` for every use of the context.
++    std::unique_ptr<RenderInterface> CreateD3D11Interface(ID3D11Device *device, ID3D11DeviceContext *context,
++                                                          std::recursive_mutex *contextMutex, bool constantBufferOffsetting);
++
++    // WWE '12: a device of the backend's own (DXGI adapters, D3D11CreateDevice at feature level
++    // 11_0 or better, its own context lock), for a renderer that also presents through plume.
++    std::unique_ptr<RenderInterface> CreateD3D11Interface();
++
++    // WWE '12: bindless sets on D3D11. Entry `index` of `set` (a texture or sampler set made
++    // bindless) is bound to register t`reg` / s`reg` of the stages in `stages` (bit 0 vertex,
++    // bit 1 pixel) for the next draws of `list`.
++    void D3D11SetSlotTexture(RenderCommandList *list, uint32_t stages, uint32_t reg, const RenderDescriptorSet *set, uint32_t index);
++    void D3D11SetSlotSampler(RenderCommandList *list, uint32_t stages, uint32_t reg, const RenderDescriptorSet *set, uint32_t index);
++    // The swizzle of a set entry's view, 3 bits a component (0-3 xyzw, 4 zero, 5 one; 0x688 = xyzw):
++    // D3D11 views have none, the shaders apply it.
++    uint32_t D3D11SlotSwizzle(const RenderDescriptorSet *set, uint32_t index);
++
++    // The DXGI format of a plume format (TYPELESS where the D3D12 backend uses it).
++    DXGI_FORMAT D3D11FormatOf(RenderFormat format);
++
++    // Where the backend's notices go (calls it doesn't support, once each);
++    // null: stderr.
++    extern void (*D3D11LogFunction)(const char *message);
++
++    // Submissions with fewer draws than this are flushed at once (0: none).
++    extern uint32_t D3D11FlushDrawLimit;
++    // Submissions replayed on the queue's thread (false: in executeCommandLists).
++    extern bool D3D11AsyncReplay;
++};
+diff --git a/plume_d3d11.cpp b/plume_d3d11.cpp
+new file mode 100644
+index 0000000..e4d1a90
+--- /dev/null
++++ b/plume_d3d11.cpp
+@@ -0,0 +1,2162 @@
++//
++// plume
++//
++// [svr2011] Direct3D 11 backend (plume_d3d11.h).
++//
++
++#include "plume_d3d11.h"
++
++#include <algorithm>
++#include <cassert>
++#include <chrono>
++#include <cstdio>
++#include <cstdlib>
++#include <cstring>
++#include <thread>
++
++#include <d3d11_4.h>
++#include <dxgi1_5.h>
++
++namespace plume {
++    namespace {
++        DXGI_FORMAT toDXGI(RenderFormat format) {
++            switch (format) {
++            case RenderFormat::UNKNOWN:
++                return DXGI_FORMAT_UNKNOWN;
++            case RenderFormat::R32G32B32A32_TYPELESS:
++                return DXGI_FORMAT_R32G32B32A32_TYPELESS;
++            case RenderFormat::R32G32B32A32_FLOAT:
++                return DXGI_FORMAT_R32G32B32A32_FLOAT;
++            case RenderFormat::R32G32B32A32_UINT:
++                return DXGI_FORMAT_R32G32B32A32_UINT;
++            case RenderFormat::R32G32B32A32_SINT:
++                return DXGI_FORMAT_R32G32B32A32_SINT;
++            case RenderFormat::R32G32B32_TYPELESS:
++                return DXGI_FORMAT_R32G32B32_TYPELESS;
++            case RenderFormat::R32G32B32_FLOAT:
++                return DXGI_FORMAT_R32G32B32_FLOAT;
++            case RenderFormat::R32G32B32_UINT:
++                return DXGI_FORMAT_R32G32B32_UINT;
++            case RenderFormat::R32G32B32_SINT:
++                return DXGI_FORMAT_R32G32B32_SINT;
++            case RenderFormat::R16G16B16A16_TYPELESS:
++                return DXGI_FORMAT_R16G16B16A16_TYPELESS;
++            case RenderFormat::R16G16B16A16_FLOAT:
++                return DXGI_FORMAT_R16G16B16A16_FLOAT;
++            case RenderFormat::R16G16B16A16_UNORM:
++                return DXGI_FORMAT_R16G16B16A16_UNORM;
++            case RenderFormat::R16G16B16A16_UINT:
++                return DXGI_FORMAT_R16G16B16A16_UINT;
++            case RenderFormat::R16G16B16A16_SNORM:
++                return DXGI_FORMAT_R16G16B16A16_SNORM;
++            case RenderFormat::R16G16B16A16_SINT:
++                return DXGI_FORMAT_R16G16B16A16_SINT;
++            case RenderFormat::R32G32_TYPELESS:
++                return DXGI_FORMAT_R32G32_TYPELESS;
++            case RenderFormat::R32G32_FLOAT:
++                return DXGI_FORMAT_R32G32_FLOAT;
++            case RenderFormat::R32G32_UINT:
++                return DXGI_FORMAT_R32G32_UINT;
++            case RenderFormat::R32G32_SINT:
++                return DXGI_FORMAT_R32G32_SINT;
++            case RenderFormat::R8G8B8A8_TYPELESS:
++                return DXGI_FORMAT_R8G8B8A8_TYPELESS;
++            case RenderFormat::R8G8B8A8_UNORM:
++                return DXGI_FORMAT_R8G8B8A8_UNORM;
++            case RenderFormat::R8G8B8A8_UINT:
++                return DXGI_FORMAT_R8G8B8A8_UINT;
++            case RenderFormat::R8G8B8A8_SNORM:
++                return DXGI_FORMAT_R8G8B8A8_SNORM;
++            case RenderFormat::R8G8B8A8_SINT:
++                return DXGI_FORMAT_R8G8B8A8_SINT;
++            case RenderFormat::B8G8R8A8_UNORM:
++                return DXGI_FORMAT_B8G8R8A8_UNORM;
++            case RenderFormat::R16G16_TYPELESS:
++                return DXGI_FORMAT_R16G16_TYPELESS;
++            case RenderFormat::R16G16_FLOAT:
++                return DXGI_FORMAT_R16G16_FLOAT;
++            case RenderFormat::R16G16_UNORM:
++                return DXGI_FORMAT_R16G16_UNORM;
++            case RenderFormat::R16G16_UINT:
++                return DXGI_FORMAT_R16G16_UINT;
++            case RenderFormat::R16G16_SNORM:
++                return DXGI_FORMAT_R16G16_SNORM;
++            case RenderFormat::R16G16_SINT:
++                return DXGI_FORMAT_R16G16_SINT;
++            case RenderFormat::R32_TYPELESS:
++                return DXGI_FORMAT_R32_TYPELESS;
++            case RenderFormat::D32_FLOAT:
++                return DXGI_FORMAT_D32_FLOAT;
++            case RenderFormat::D32_FLOAT_S8_UINT:
++                // In order to be able to create both depth-stencil and shader resource views,
++                // we must use R32G8X24_TYPELESS as the base type and specialize later.
++                return DXGI_FORMAT_R32G8X24_TYPELESS;
++            // [svr2011]
++            case RenderFormat::D24_UNORM_S8_UINT:
++                // As D32_FLOAT_S8_UINT: typeless, specialized into depth-stencil and shader resource views.
++                return DXGI_FORMAT_R24G8_TYPELESS;
++            case RenderFormat::R32_FLOAT:
++                return DXGI_FORMAT_R32_FLOAT;
++            case RenderFormat::R32_UINT:
++                return DXGI_FORMAT_R32_UINT;
++            case RenderFormat::R32_SINT:
++                return DXGI_FORMAT_R32_SINT;
++            case RenderFormat::R8G8_TYPELESS:
++                return DXGI_FORMAT_R8G8_TYPELESS;
++            case RenderFormat::R8G8_UNORM:
++                return DXGI_FORMAT_R8G8_UNORM;
++            case RenderFormat::R8G8_UINT:
++                return DXGI_FORMAT_R8G8_UINT;
++            case RenderFormat::R8G8_SNORM:
++                return DXGI_FORMAT_R8G8_SNORM;
++            case RenderFormat::R8G8_SINT:
++                return DXGI_FORMAT_R8G8_SINT;
++            case RenderFormat::R16_TYPELESS:
++                return DXGI_FORMAT_R16_TYPELESS;
++            case RenderFormat::R16_FLOAT:
++                return DXGI_FORMAT_R16_FLOAT;
++            case RenderFormat::D16_UNORM:
++                return DXGI_FORMAT_D16_UNORM;
++            case RenderFormat::R16_UNORM:
++                return DXGI_FORMAT_R16_UNORM;
++            case RenderFormat::R16_UINT:
++                return DXGI_FORMAT_R16_UINT;
++            case RenderFormat::R16_SNORM:
++                return DXGI_FORMAT_R16_SNORM;
++            case RenderFormat::R16_SINT:
++                return DXGI_FORMAT_R16_SINT;
++            case RenderFormat::R8_TYPELESS:
++                return DXGI_FORMAT_R8_TYPELESS;
++            case RenderFormat::R8_UNORM:
++                return DXGI_FORMAT_R8_UNORM;
++            case RenderFormat::R8_UINT:
++                return DXGI_FORMAT_R8_UINT;
++            case RenderFormat::R8_SNORM:
++                return DXGI_FORMAT_R8_SNORM;
++            case RenderFormat::R8_SINT:
++                return DXGI_FORMAT_R8_SINT;
++            case RenderFormat::BC1_TYPELESS:
++                return DXGI_FORMAT_BC1_TYPELESS;
++            case RenderFormat::BC1_UNORM:
++                return DXGI_FORMAT_BC1_UNORM;
++            case RenderFormat::BC1_UNORM_SRGB:
++                return DXGI_FORMAT_BC1_UNORM_SRGB;
++            case RenderFormat::BC2_TYPELESS:
++                return DXGI_FORMAT_BC2_TYPELESS;
++            case RenderFormat::BC2_UNORM:
++                return DXGI_FORMAT_BC2_UNORM;
++            case RenderFormat::BC2_UNORM_SRGB:
++                return DXGI_FORMAT_BC2_UNORM_SRGB;
++            case RenderFormat::BC3_TYPELESS:
++                return DXGI_FORMAT_BC3_TYPELESS;
++            case RenderFormat::BC3_UNORM:
++                return DXGI_FORMAT_BC3_UNORM;
++            case RenderFormat::BC3_UNORM_SRGB:
++                return DXGI_FORMAT_BC3_UNORM_SRGB;
++            case RenderFormat::BC4_TYPELESS:
++                return DXGI_FORMAT_BC4_TYPELESS;
++            case RenderFormat::BC4_UNORM:
++                return DXGI_FORMAT_BC4_UNORM;
++            case RenderFormat::BC4_SNORM:
++                return DXGI_FORMAT_BC4_SNORM;
++            case RenderFormat::BC5_TYPELESS:
++                return DXGI_FORMAT_BC5_TYPELESS;
++            case RenderFormat::BC5_UNORM:
++                return DXGI_FORMAT_BC5_UNORM;
++            case RenderFormat::BC5_SNORM:
++                return DXGI_FORMAT_BC5_SNORM;
++            case RenderFormat::BC6H_TYPELESS:
++                return DXGI_FORMAT_BC6H_TYPELESS;
++            case RenderFormat::BC6H_UF16:
++                return DXGI_FORMAT_BC6H_UF16;
++            case RenderFormat::BC6H_SF16:
++                return DXGI_FORMAT_BC6H_SF16;
++            case RenderFormat::BC7_TYPELESS:
++                return DXGI_FORMAT_BC7_TYPELESS;
++            case RenderFormat::BC7_UNORM:
++                return DXGI_FORMAT_BC7_UNORM;
++            case RenderFormat::BC7_UNORM_SRGB:
++                return DXGI_FORMAT_BC7_UNORM_SRGB;
++            default:
++                assert(false && "Unknown format.");
++                return DXGI_FORMAT_FORCE_UINT;
++            }
++        }
++
++        DXGI_FORMAT toDXGITextureView(RenderFormat format) {
++            const DXGI_FORMAT dxgiFormat = toDXGI(format);
++            if (dxgiFormat == DXGI_FORMAT_D32_FLOAT) {
++                // D3D12 and Vulkan disagree on whether D32 is usable as a texture view format.
++                // We just make D3D12 use R32 instead.
++                return DXGI_FORMAT_R32_FLOAT;
++            }
++            if (dxgiFormat == DXGI_FORMAT_R32G8X24_TYPELESS) {
++                // Specialize into depth view of depth-stencil texture.
++                return DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS;
++            }
++            if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {  // [svr2011]
++                return DXGI_FORMAT_R24_UNORM_X8_TYPELESS;
++            }
++            return dxgiFormat;
++        }
++
++        DXGI_FORMAT toDXGIDepthStencilView(RenderFormat format) {
++            const DXGI_FORMAT dxgiFormat = toDXGI(format);
++            if (dxgiFormat == DXGI_FORMAT_R32G8X24_TYPELESS) {
++                // Specialize into full depth-stencil view.
++                return DXGI_FORMAT_D32_FLOAT_S8X24_UINT;
++            }
++            if (dxgiFormat == DXGI_FORMAT_R24G8_TYPELESS) {  // [svr2011]
++                return DXGI_FORMAT_D24_UNORM_S8_UINT;
++            }
++            return dxgiFormat;
++        }
++
++
++        // Logs an unsupported call once per kind.
++        void Unsupported(const char *what) {
++            static std::mutex mutex;
++            static std::vector<const char *> logged;
++            std::lock_guard lock(mutex);
++            if (std::find(logged.begin(), logged.end(), what) != logged.end()) {
++                return;
++            }
++            logged.push_back(what);
++            char message[256];
++            std::snprintf(message, sizeof(message), "plume D3D11: %s is not supported", what);
++            if (D3D11LogFunction) D3D11LogFunction(message);
++            else std::fprintf(stderr, "%s\n", message);
++        }
++
++        D3D11_BLEND toD3D11(RenderBlend blend) {
++            switch (blend) {
++            case RenderBlend::ZERO: return D3D11_BLEND_ZERO;
++            case RenderBlend::ONE: return D3D11_BLEND_ONE;
++            case RenderBlend::SRC_COLOR: return D3D11_BLEND_SRC_COLOR;
++            case RenderBlend::INV_SRC_COLOR: return D3D11_BLEND_INV_SRC_COLOR;
++            case RenderBlend::SRC_ALPHA: return D3D11_BLEND_SRC_ALPHA;
++            case RenderBlend::INV_SRC_ALPHA: return D3D11_BLEND_INV_SRC_ALPHA;
++            case RenderBlend::DEST_ALPHA: return D3D11_BLEND_DEST_ALPHA;
++            case RenderBlend::INV_DEST_ALPHA: return D3D11_BLEND_INV_DEST_ALPHA;
++            case RenderBlend::DEST_COLOR: return D3D11_BLEND_DEST_COLOR;
++            case RenderBlend::INV_DEST_COLOR: return D3D11_BLEND_INV_DEST_COLOR;
++            case RenderBlend::SRC_ALPHA_SAT: return D3D11_BLEND_SRC_ALPHA_SAT;
++            case RenderBlend::BLEND_FACTOR: return D3D11_BLEND_BLEND_FACTOR;
++            case RenderBlend::INV_BLEND_FACTOR: return D3D11_BLEND_INV_BLEND_FACTOR;
++            case RenderBlend::SRC1_COLOR: return D3D11_BLEND_SRC1_COLOR;
++            case RenderBlend::INV_SRC1_COLOR: return D3D11_BLEND_INV_SRC1_COLOR;
++            case RenderBlend::SRC1_ALPHA: return D3D11_BLEND_SRC1_ALPHA;
++            case RenderBlend::INV_SRC1_ALPHA: return D3D11_BLEND_INV_SRC1_ALPHA;
++            default: return D3D11_BLEND_ONE;
++            }
++        }
++
++        D3D11_BLEND_OP toD3D11(RenderBlendOperation op) {
++            switch (op) {
++            case RenderBlendOperation::SUBTRACT: return D3D11_BLEND_OP_SUBTRACT;
++            case RenderBlendOperation::REV_SUBTRACT: return D3D11_BLEND_OP_REV_SUBTRACT;
++            case RenderBlendOperation::MIN: return D3D11_BLEND_OP_MIN;
++            case RenderBlendOperation::MAX: return D3D11_BLEND_OP_MAX;
++            default: return D3D11_BLEND_OP_ADD;
++            }
++        }
++
++        D3D11_COMPARISON_FUNC toD3D11(RenderComparisonFunction f) {
++            switch (f) {
++            case RenderComparisonFunction::NEVER: return D3D11_COMPARISON_NEVER;
++            case RenderComparisonFunction::LESS: return D3D11_COMPARISON_LESS;
++            case RenderComparisonFunction::EQUAL: return D3D11_COMPARISON_EQUAL;
++            case RenderComparisonFunction::LESS_EQUAL: return D3D11_COMPARISON_LESS_EQUAL;
++            case RenderComparisonFunction::GREATER: return D3D11_COMPARISON_GREATER;
++            case RenderComparisonFunction::NOT_EQUAL: return D3D11_COMPARISON_NOT_EQUAL;
++            case RenderComparisonFunction::GREATER_EQUAL: return D3D11_COMPARISON_GREATER_EQUAL;
++            default: return D3D11_COMPARISON_ALWAYS;
++            }
++        }
++
++        D3D11_STENCIL_OP toD3D11(RenderStencilOp op) {
++            switch (op) {
++            case RenderStencilOp::ZERO: return D3D11_STENCIL_OP_ZERO;
++            case RenderStencilOp::REPLACE: return D3D11_STENCIL_OP_REPLACE;
++            case RenderStencilOp::INCREMENT_AND_CLAMP: return D3D11_STENCIL_OP_INCR_SAT;
++            case RenderStencilOp::DECREMENT_AND_CLAMP: return D3D11_STENCIL_OP_DECR_SAT;
++            case RenderStencilOp::INVERT: return D3D11_STENCIL_OP_INVERT;
++            case RenderStencilOp::INCREMENT_AND_WRAP: return D3D11_STENCIL_OP_INCR;
++            case RenderStencilOp::DECREMENT_AND_WRAP: return D3D11_STENCIL_OP_DECR;
++            default: return D3D11_STENCIL_OP_KEEP;
++            }
++        }
++
++        D3D11_TEXTURE_ADDRESS_MODE toD3D11(RenderTextureAddressMode mode) {
++            switch (mode) {
++            case RenderTextureAddressMode::MIRROR: return D3D11_TEXTURE_ADDRESS_MIRROR;
++            case RenderTextureAddressMode::CLAMP: return D3D11_TEXTURE_ADDRESS_CLAMP;
++            case RenderTextureAddressMode::BORDER: return D3D11_TEXTURE_ADDRESS_BORDER;
++            case RenderTextureAddressMode::MIRROR_ONCE: return D3D11_TEXTURE_ADDRESS_MIRROR_ONCE;
++            default: return D3D11_TEXTURE_ADDRESS_WRAP;
++            }
++        }
++
++        D3D11_PRIMITIVE_TOPOLOGY toD3D11(RenderPrimitiveTopology topology) {
++            switch (topology) {
++            case RenderPrimitiveTopology::POINT_LIST: return D3D11_PRIMITIVE_TOPOLOGY_POINTLIST;
++            case RenderPrimitiveTopology::LINE_LIST: return D3D11_PRIMITIVE_TOPOLOGY_LINELIST;
++            case RenderPrimitiveTopology::LINE_STRIP: return D3D11_PRIMITIVE_TOPOLOGY_LINESTRIP;
++            case RenderPrimitiveTopology::TRIANGLE_STRIP: return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLESTRIP;
++            default: return D3D11_PRIMITIVE_TOPOLOGY_TRIANGLELIST;
++            }
++        }
++
++        // The rows (of blocks) and the row pitch of a buffer-side texture copy.
++        void FootprintLayout(const RenderTextureCopyLocation &loc, uint32_t &rowPitch, uint32_t &rows) {
++            const uint32_t blockWidth = RenderFormatBlockWidth(loc.placedFootprint.format);
++            const uint32_t blockCount = (loc.placedFootprint.rowWidth + blockWidth - 1) / blockWidth;
++            rowPitch = blockCount * RenderFormatSize(loc.placedFootprint.format);
++            rows = (loc.placedFootprint.height + blockWidth - 1) / blockWidth;
++        }
++
++        uint32_t SubresourceOf(const D3D11Texture *texture, uint32_t mipLevel, uint32_t arrayIndex) {
++            return D3D11CalcSubresource(mipLevel, arrayIndex, std::max(texture->desc.mipLevels, 1u));
++        }
++
++        // What a shader's DXBC binds (its RDEF chunk): texture (t#), sampler
++        // (s#) and constant buffer (b#) registers.
++        struct ShaderBindings {
++            uint64_t textures = 0;
++            uint32_t samplers = 0;
++            uint32_t constantBuffers = 0;
++        };
++
++        ShaderBindings ReadBindings(const std::vector<uint8_t> &code) {
++            ShaderBindings out;
++            if (code.size() < 32 || std::memcmp(code.data(), "DXBC", 4) != 0) {
++                out.textures = ~0ull;
++                out.samplers = 0xFFFF;
++                out.constantBuffers = 0x3FFF;
++                return out;
++            }
++            uint32_t chunkCount;
++            std::memcpy(&chunkCount, code.data() + 28, 4);
++            for (uint32_t c = 0; c < chunkCount && 32 + 4 * (c + 1) <= code.size(); ++c) {
++                uint32_t chunkOffset;
++                std::memcpy(&chunkOffset, code.data() + 32 + 4 * c, 4);
++                if (chunkOffset + 8 > code.size() || std::memcmp(code.data() + chunkOffset, "RDEF", 4) != 0) {
++                    continue;
++                }
++                const uint8_t *rdef = code.data() + chunkOffset + 8;
++                uint32_t bindingCount, bindingOffset;
++                std::memcpy(&bindingCount, rdef + 8, 4);
++                std::memcpy(&bindingOffset, rdef + 12, 4);
++                for (uint32_t i = 0; i < bindingCount; ++i) {
++                    // Name, type, return type, dimension, samples, bind point, bind count, flags.
++                    uint32_t b[8];
++                    std::memcpy(b, rdef + bindingOffset + 32 * i, 32);
++                    const uint32_t type = b[1], point = b[5], count = std::max(b[6], 1u);
++                    for (uint32_t r = point; r < point + count; ++r) {
++                        if (type == 2 /* D3D_SIT_TEXTURE */ && r < 64) out.textures |= 1ull << r;
++                        else if (type == 3 /* D3D_SIT_SAMPLER */ && r < 16) out.samplers |= 1u << r;
++                        else if (type == 0 /* D3D_SIT_CBUFFER */ && r < 14) out.constantBuffers |= 1u << r;
++                    }
++                }
++                return out;
++            }
++            // No reflection (stripped): everything.
++            out.textures = ~0ull;
++            out.samplers = 0xFFFF;
++            out.constantBuffers = 0x3FFF;
++            return out;
++        }
++
++        struct D3D11PipelineBindings {
++            ShaderBindings vs, ps;
++        };
++        std::mutex g_bindingsMutex;
++        std::unordered_map<const D3D11GraphicsPipeline *, D3D11PipelineBindings> g_bindings;
++    }
++
++    DXGI_FORMAT D3D11FormatOf(RenderFormat format) { return toDXGI(format); }
++
++    void (*D3D11LogFunction)(const char *message) = nullptr;
++    uint32_t D3D11FlushDrawLimit = 1000;
++    bool D3D11AsyncReplay = true;
++
++    // D3D11Buffer
++
++    D3D11Buffer::D3D11Buffer(D3D11Device *device, const RenderBufferDesc &desc) : device(device), desc(desc) {
++        if (desc.heapType == RenderHeapType::UPLOAD || desc.heapType == RenderHeapType::READBACK) {
++            cpu = static_cast<uint8_t *>(_aligned_malloc(size_t(std::max<uint64_t>(desc.size, 16)), 16));
++            if (cpu) std::memset(cpu, 0, size_t(desc.size));
++            return;
++        }
++        D3D11_BUFFER_DESC d = {};
++        d.ByteWidth = UINT((desc.size + 15) & ~15ull);
++        d.Usage = D3D11_USAGE_DEFAULT;
++        if (desc.flags & RenderBufferFlag::VERTEX) d.BindFlags |= D3D11_BIND_VERTEX_BUFFER;
++        if (desc.flags & RenderBufferFlag::INDEX) d.BindFlags |= D3D11_BIND_INDEX_BUFFER;
++        if (desc.flags & RenderBufferFlag::CONSTANT) d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++        device->d3d->CreateBuffer(&d, nullptr, &d3d);
++    }
++
++    D3D11Buffer::~D3D11Buffer() {
++        if (cpu) _aligned_free(cpu);
++    }
++
++    void *D3D11Buffer::map(uint32_t subresource, const RenderRange *readRange) {
++        if (desc.heapType == RenderHeapType::READBACK) {
++            std::vector<PendingReadback> pending;
++            {
++                std::lock_guard lock(readbackMutex);
++                pending.swap(readbacks);
++            }
++            if (!pending.empty()) {
++                std::lock_guard lock(*device->contextMutex);
++                for (const PendingReadback &p : pending) {
++                    D3D11_MAPPED_SUBRESOURCE mapped;
++                    if (FAILED(device->context->Map(p.staging.Get(), p.subresource, D3D11_MAP_READ, 0, &mapped))) {
++                        continue;
++                    }
++                    // Per row: the bytes the staging row holds (not the buffer's padded pitch - reading that
++                    // much ran past the staging copy's end on the last row).
++                    const uint32_t bytes = std::min({p.rowPitch, p.rowBytes ? p.rowBytes : p.rowPitch, uint32_t(mapped.RowPitch)});
++                    const uint32_t rows = p.stagingRows ? std::min(p.rows, p.stagingRows) : p.rows;
++                    for (uint32_t z = 0; z < p.depth; ++z) {
++                        for (uint32_t y = 0; y < rows; ++y) {
++                            const uint64_t dst = p.offset + (uint64_t(z) * p.rows + y) * p.rowPitch;
++                            if (dst + bytes > desc.size) break;
++                            std::memcpy(cpu + dst, static_cast<const uint8_t *>(mapped.pData) + size_t(z) * mapped.DepthPitch + size_t(y) * mapped.RowPitch, bytes);
++                        }
++                    }
++                    device->context->Unmap(p.staging.Get(), p.subresource);
++                }
++            }
++            return cpu;
++        }
++        if (cpu) {
++            mapped = true;
++            return cpu;
++        }
++        Unsupported("mapping a DEFAULT heap buffer");
++        return nullptr;
++    }
++
++    void D3D11Buffer::unmap(uint32_t subresource, const RenderRange *writtenRange) {
++        if (desc.heapType == RenderHeapType::UPLOAD) {
++            mapped = false;
++            geometryDirty = true;
++            constantsDirty = true;
++        }
++    }
++
++    std::unique_ptr<RenderBufferFormattedView> D3D11Buffer::createBufferFormattedView(RenderFormat format) {
++        Unsupported("formatted buffer views");
++        return nullptr;
++    }
++
++    void D3D11Buffer::setName(const std::string &name) {
++        ID3D11DeviceChild *child = d3d ? static_cast<ID3D11DeviceChild *>(d3d.Get()) : nullptr;
++        if (child) child->SetPrivateData(WKPDID_D3DDebugObjectName, UINT(name.size()), name.data());
++    }
++
++    ID3D11Buffer *D3D11Buffer::gpu(bool constants, uint64_t end, uint64_t generation) {
++        if (d3d) return d3d.Get();
++        if (!cpu) return nullptr;
++        if (constants && combined) return gpu(false, end, generation);
++        Microsoft::WRL::ComPtr<ID3D11Buffer> &target = constants ? gpuConstants : gpuGeometry;
++        bool &dynamic = constants ? gpuConstantsDynamic : gpuGeometryDynamic;
++        std::atomic<bool> &dirty = constants ? constantsDirty : geometryDirty;
++        const bool persistent = mapped.load();
++        end = std::min<uint64_t>(std::max<uint64_t>(end, 16), desc.size);
++        if (!target) {
++            // Rings (mapped for good) are rewritten every frame: dynamic,
++            // discarded at each upload. Others are written once: default.
++            dynamic = persistent;
++            D3D11_BUFFER_DESC d = {};
++            d.ByteWidth = UINT((desc.size + 15) & ~15ull);
++            d.Usage = dynamic ? D3D11_USAGE_DYNAMIC : D3D11_USAGE_DEFAULT;
++            d.CPUAccessFlags = dynamic ? D3D11_CPU_ACCESS_WRITE : 0;
++            d.BindFlags = constants ? D3D11_BIND_CONSTANT_BUFFER : (D3D11_BIND_VERTEX_BUFFER | D3D11_BIND_INDEX_BUFFER);
++            // A ring read as vertices, indices and constants (by offset, D3D11.1):
++            // one buffer for all three where the runtime takes it - one upload.
++            if (!constants && dynamic && device->constantBufferOffsetting && !device->noCombinedBuffers) {
++                d.BindFlags |= D3D11_BIND_CONSTANT_BUFFER;
++                combined = SUCCEEDED(device->d3d->CreateBuffer(&d, nullptr, &target));
++                if (!combined) {
++                    d.BindFlags &= ~UINT(D3D11_BIND_CONSTANT_BUFFER);
++                    device->noCombinedBuffers = true;
++                }
++            }
++            if (!target && FAILED(device->d3d->CreateBuffer(&d, nullptr, &target))) {
++                return nullptr;
++            }
++            dirty = true;
++            (constants ? constantsReady : geometryReady) = true;
++            if (combined) constantsReady = true;
++        }
++        if (dynamic) {
++            // A ring is reused only after its frame's fence (the GPU is done
++            // with it): its bytes are written without renaming (NO_OVERWRITE),
++            // and a list's later submissions add only what was appended since.
++            // DISCARD where constant buffers can't be mapped that way - a
++            // whole renamed copy of the ring each time.
++            const bool constantBound = constants || combined;
++            const bool noOverwrite = !constantBound || device->mapNoOverwriteConstants;
++            uint64_t begin = 0;
++            const int copy = constants ? 1 : 0;
++            if (noOverwrite && generation && generation == uploadedGeneration[copy] && end >= uploadedEnd[copy]) {
++                begin = uploadedEnd[copy];
++            }
++            if (end > begin || !noOverwrite) {
++                D3D11_MAPPED_SUBRESOURCE m;
++                if (SUCCEEDED(device->context->Map(target.Get(), 0, noOverwrite ? D3D11_MAP_WRITE_NO_OVERWRITE : D3D11_MAP_WRITE_DISCARD, 0, &m))) {
++                    if (!noOverwrite) begin = 0;
++                    std::memcpy(static_cast<uint8_t *>(m.pData) + begin, cpu + begin, size_t(end - begin));
++                    device->context->Unmap(target.Get(), 0);
++                }
++                device->statUploadBytes += end - begin;
++            }
++            uploadedEnd[copy] = end;
++            uploadedGeneration[copy] = generation;
++        } else if (dirty.exchange(false)) {
++            device->context->UpdateSubresource(target.Get(), 0, nullptr, cpu, 0, 0);
++        }
++        return target.Get();
++    }
++
++    // D3D11Texture
++
++    D3D11Texture::D3D11Texture(D3D11Device *device, const RenderTextureDesc &desc) : device(device), desc(desc) {
++        const DXGI_FORMAT format = toDXGI(desc.format);
++        UINT bind = 0;
++        if (desc.flags & RenderTextureFlag::RENDER_TARGET) bind |= D3D11_BIND_RENDER_TARGET;
++        if (desc.flags & RenderTextureFlag::DEPTH_TARGET) bind |= D3D11_BIND_DEPTH_STENCIL;
++        // Every texture is sampled (depth: through a typeless format).
++        const bool depthNoTypeless = format == DXGI_FORMAT_D32_FLOAT || format == DXGI_FORMAT_D16_UNORM;
++        if (!depthNoTypeless) bind |= D3D11_BIND_SHADER_RESOURCE;
++        const UINT mips = std::max(desc.mipLevels, 1u);
++        // D3D12's committed resources start zeroed and the renderer relies on
++        // it (targets read before being written, resolves filling part of a
++        // texture); D3D11 doesn't promise it (WARP leaves garbage): targets and
++        // committed textures get zeros as their initial data.
++        const bool zeroed = desc.committed || (desc.flags & (RenderTextureFlag::RENDER_TARGET | RenderTextureFlag::DEPTH_TARGET));
++        const uint32_t blockWidth = RenderFormatBlockWidth(desc.format);
++        const uint32_t texelBytes = std::max(RenderFormatSize(desc.format), 1u);
++        const UINT layers = desc.dimension == RenderTextureDimension::TEXTURE_3D ? 1 : std::max(desc.arraySize, 1u) * ((desc.flags & RenderTextureFlag::CUBE) && desc.arraySize < 6 ? 6 : 1);
++        std::vector<uint8_t> zeros;
++        std::vector<D3D11_SUBRESOURCE_DATA> initial;
++        if (zeroed) {
++            const UINT rowPitch = ((desc.width + blockWidth - 1) / blockWidth) * texelBytes;
++            const UINT slicePitch = rowPitch * ((std::max(desc.height, 1u) + blockWidth - 1) / blockWidth);
++            zeros.assign(size_t(slicePitch) * std::max(desc.depth, 1u), 0);
++            for (UINT layer = 0; layer < layers; ++layer) {
++                for (UINT mip = 0; mip < mips; ++mip) {
++                    const UINT w = std::max(desc.width >> mip, 1u), h = std::max(std::max(desc.height, 1u) >> mip, 1u);
++                    const UINT row = ((w + blockWidth - 1) / blockWidth) * texelBytes;
++                    initial.push_back({zeros.data(), row, row * ((h + blockWidth - 1) / blockWidth)});
++                }
++            }
++        }
++        if (desc.dimension == RenderTextureDimension::TEXTURE_3D) {
++            D3D11_TEXTURE3D_DESC d = {};
++            d.Width = desc.width;
++            d.Height = desc.height;
++            d.Depth = std::max(desc.depth, 1u);
++            d.MipLevels = mips;
++            d.Format = format;
++            d.Usage = D3D11_USAGE_DEFAULT;
++            d.BindFlags = bind;
++            Microsoft::WRL::ComPtr<ID3D11Texture3D> t;
++            if (SUCCEEDED(device->d3d->CreateTexture3D(&d, zeroed ? initial.data() : nullptr, &t))) d3d = t;
++            return;
++        }
++        D3D11_TEXTURE2D_DESC d = {};
++        d.Width = desc.width;
++        d.Height = std::max(desc.height, 1u);
++        d.MipLevels = mips;
++        const bool cube = (desc.flags & RenderTextureFlag::CUBE) != 0;
++        d.ArraySize = std::max(desc.arraySize, 1u);
++        if (cube && d.ArraySize < 6) d.ArraySize = 6;
++        d.Format = format;
++        d.SampleDesc.Count = 1;
++        d.Usage = D3D11_USAGE_DEFAULT;
++        d.BindFlags = bind;
++        d.MiscFlags = cube ? D3D11_RESOURCE_MISC_TEXTURECUBE : 0;
++        Microsoft::WRL::ComPtr<ID3D11Texture2D> t;
++        if (SUCCEEDED(device->d3d->CreateTexture2D(&d, zeroed ? initial.data() : nullptr, &t))) d3d = t;
++    }
++
++    std::unique_ptr<RenderTextureView> D3D11Texture::createTextureView(const RenderTextureViewDesc &desc) const {
++        return std::make_unique<D3D11TextureView>(this, desc);
++    }
++
++    void D3D11Texture::setName(const std::string &name) {
++        if (d3d) d3d->SetPrivateData(WKPDID_D3DDebugObjectName, UINT(name.size()), name.data());
++    }
++
++    ID3D11ShaderResourceView *D3D11Texture::getDefaultSrv() const {
++        std::lock_guard lock(viewMutex);
++        if (!defaultSrv && d3d) {
++            RenderTextureViewDesc v;
++            v.format = desc.format;
++            v.dimension = desc.dimension == RenderTextureDimension::TEXTURE_3D ? RenderTextureViewDimension::TEXTURE_3D
++                          : (desc.flags & RenderTextureFlag::CUBE)        ? RenderTextureViewDimension::TEXTURE_CUBE
++                                                                          : RenderTextureViewDimension::TEXTURE_2D;
++            D3D11TextureView view(this, v);
++            defaultSrv = view.srv;
++        }
++        return defaultSrv.Get();
++    }
++
++    // D3D11TextureView
++
++    D3D11TextureView::D3D11TextureView(const D3D11Texture *texture, const RenderTextureViewDesc &desc) : texture(texture), desc(desc) {
++        if (!texture->d3d) return;
++        D3D11_SHADER_RESOURCE_VIEW_DESC d = {};
++        d.Format = toDXGITextureView(desc.format != RenderFormat::UNKNOWN ? desc.format : texture->desc.format);
++        const UINT mips = desc.mipLevels == UINT32_MAX ? UINT(-1) : desc.mipLevels;
++        switch (desc.dimension) {
++        case RenderTextureViewDimension::TEXTURE_3D:
++            d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE3D;
++            d.Texture3D.MostDetailedMip = desc.mipSlice;
++            d.Texture3D.MipLevels = mips;
++            break;
++        case RenderTextureViewDimension::TEXTURE_CUBE:
++            d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURECUBE;
++            d.TextureCube.MostDetailedMip = desc.mipSlice;
++            d.TextureCube.MipLevels = mips;
++            break;
++        default:
++            if (texture->desc.arraySize > 1 || (texture->desc.flags & RenderTextureFlag::CUBE)) {
++                d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2DARRAY;
++                d.Texture2DArray.MostDetailedMip = desc.mipSlice;
++                d.Texture2DArray.MipLevels = mips;
++                d.Texture2DArray.FirstArraySlice = desc.arrayIndex;
++                d.Texture2DArray.ArraySize = desc.arraySize == UINT32_MAX ? 1 : desc.arraySize;
++            } else {
++                d.ViewDimension = D3D11_SRV_DIMENSION_TEXTURE2D;
++                d.Texture2D.MostDetailedMip = desc.mipSlice;
++                d.Texture2D.MipLevels = mips;
++            }
++            break;
++        }
++        texture->device->d3d->CreateShaderResourceView(texture->d3d.Get(), &d, &srv);
++    }
++
++    // D3D11Shader
++
++    D3D11Shader::D3D11Shader(D3D11Device *device, const void *data, uint64_t size) : device(device) {
++        const auto *bytes = static_cast<const uint8_t *>(data);
++        code.assign(bytes, bytes + size);
++        // The program type: the SHDR / SHEX chunk's version token (1: vertex).
++        if (code.size() >= 32 && std::memcmp(code.data(), "DXBC", 4) == 0) {
++            uint32_t chunkCount;
++            std::memcpy(&chunkCount, code.data() + 28, 4);
++            for (uint32_t c = 0; c < chunkCount && 32 + 4 * (c + 1) <= code.size(); ++c) {
++                uint32_t chunkOffset;
++                std::memcpy(&chunkOffset, code.data() + 32 + 4 * c, 4);
++                if (chunkOffset + 12 > code.size()) continue;
++                if (std::memcmp(code.data() + chunkOffset, "SHDR", 4) == 0 || std::memcmp(code.data() + chunkOffset, "SHEX", 4) == 0) {
++                    uint32_t version;
++                    std::memcpy(&version, code.data() + chunkOffset + 8, 4);
++                    isVertex = ((version >> 16) & 0xFFFF) == 1;
++                    break;
++                }
++            }
++        }
++        if (isVertex) {
++            device->d3d->CreateVertexShader(code.data(), code.size(), nullptr, &vs);
++        } else {
++            device->d3d->CreatePixelShader(code.data(), code.size(), nullptr, &ps);
++        }
++    }
++
++    // D3D11DescriptorSet
++
++    D3D11DescriptorSet::D3D11DescriptorSet(const RenderDescriptorSetDesc &desc) {
++        for (uint32_t i = 0; i < desc.descriptorRangesCount; ++i) {
++            const RenderDescriptorRange &range = desc.descriptorRanges[i];
++            Kind kind = Kind::NONE;
++            switch (range.type) {
++            case RenderDescriptorRangeType::TEXTURE:
++            case RenderDescriptorRangeType::FORMATTED_BUFFER:
++            case RenderDescriptorRangeType::STRUCTURED_BUFFER:
++            case RenderDescriptorRangeType::BYTE_ADDRESS_BUFFER:
++                kind = Kind::SRV;
++                break;
++            case RenderDescriptorRangeType::SAMPLER:
++                kind = Kind::SAMPLER;
++                break;
++            case RenderDescriptorRangeType::CONSTANT_BUFFER:
++                kind = Kind::CBV;
++                break;
++            default:
++                Unsupported("descriptor range type");
++                break;
++            }
++            const uint32_t count = (desc.lastRangeIsBoundless && i + 1 == desc.descriptorRangesCount) ? std::max(desc.boundlessRangeSize, range.count) : range.count;
++            for (uint32_t k = 0; k < count; ++k) {
++                Entry e;
++                e.kind = kind;
++                e.reg = uint8_t(std::min<uint32_t>(range.binding + k, 255));
++                entries.push_back(e);
++            }
++        }
++        bindless = entries.size() > 64;
++        srvs.resize(entries.size(), nullptr);
++        samplers.resize(entries.size(), nullptr);
++        mappings.resize(entries.size());
++        buffers.resize(entries.size(), nullptr);
++    }
++
++    D3D11DescriptorSet::~D3D11DescriptorSet() {
++        for (ID3D11ShaderResourceView *v : srvs) if (v) v->Release();
++        for (ID3D11SamplerState *s : samplers) if (s) s->Release();
++    }
++
++    void D3D11DescriptorSet::setBuffer(uint32_t descriptorIndex, const RenderBuffer *buffer, uint64_t bufferSize, const RenderBufferStructuredView *bufferStructuredView, const RenderBufferFormattedView *bufferFormattedView) {
++        if (descriptorIndex >= entries.size()) return;
++        buffers[descriptorIndex] = static_cast<const D3D11Buffer *>(buffer);
++        ++version;
++    }
++
++    void D3D11DescriptorSet::setTexture(uint32_t descriptorIndex, const RenderTexture *texture, RenderTextureLayout textureLayout, const RenderTextureView *textureView) {
++        if (descriptorIndex >= entries.size()) return;
++        ID3D11ShaderResourceView *srv = nullptr;
++        RenderComponentMapping mapping;
++        if (textureView) {
++            const auto *view = static_cast<const D3D11TextureView *>(textureView);
++            srv = view->srv.Get();
++            mapping = view->desc.componentMapping;
++        } else if (texture) {
++            srv = static_cast<const D3D11Texture *>(texture)->getDefaultSrv();
++        }
++        if (srv) srv->AddRef();
++        if (srvs[descriptorIndex]) srvs[descriptorIndex]->Release();
++        srvs[descriptorIndex] = srv;
++        mappings[descriptorIndex] = mapping;
++        ++version;
++    }
++
++    void D3D11DescriptorSet::setSampler(uint32_t descriptorIndex, const RenderSampler *sampler) {
++        if (descriptorIndex >= entries.size()) return;
++        ID3D11SamplerState *state = sampler ? static_cast<const D3D11Sampler *>(sampler)->d3d.Get() : nullptr;
++        if (state) state->AddRef();
++        if (samplers[descriptorIndex]) samplers[descriptorIndex]->Release();
++        samplers[descriptorIndex] = state;
++        ++version;
++    }
++
++    // D3D11CommandList: commands recorded on the CPU, replayed at submission.
++
++    struct D3D11CommandList : RenderCommandList {
++        enum class Op : uint8_t {
++            SET_FRAMEBUFFER,
++            SET_PIPELINE,
++            SET_LAYOUT,
++            SET_DESCRIPTOR_SET,
++            SET_ROOT_DESCRIPTOR,
++            SET_INDEX_BUFFER,
++            SET_VERTEX_BUFFERS,
++            SET_VIEWPORT,
++            SET_SCISSOR,
++            SET_STENCIL_REFERENCE,
++            SET_BLEND_FACTOR,
++            CLEAR_COLOR,
++            CLEAR_DEPTH_STENCIL,
++            DRAW,
++            DRAW_INDEXED,
++            COPY_TEXTURE_REGION,
++            UPLOAD_TEXTURE_REGION,
++            READBACK_TEXTURE_REGION,
++            COPY_TEXTURE,
++            // WWE '12
++            SET_PUSH_CONSTANTS,  // a = range, b = size, offset = in pushData
++            SET_SLOT_TEXTURE,    // a = register, b = index in the set p0
++            SET_SLOT_SAMPLER,
++        };
++
++        struct Cmd {
++            Op op;
++            uint32_t a = 0, b = 0, c = 0, d = 0, e = 0;
++            const void *p0 = nullptr;
++            const void *p1 = nullptr;
++            uint64_t offset = 0;
++            float f[6] = {};
++            RenderBox box;
++            bool hasBox = false;
++        };
++
++        D3D11Device *device = nullptr;
++        std::vector<Cmd> cmds;
++        // WWE '12: the push constants' bytes (Cmd::offset into it).
++        std::vector<uint8_t> pushData;
++        uint32_t drawCount = 0;
++        uint64_t generation = 0;  // (new at each begin(): device-wide unique)
++        // Upload buffers the list reads, and how far (geometry, constants).
++        std::unordered_map<D3D11Buffer *, std::pair<uint64_t, uint64_t>> uploads;
++        // (the last one noted: most calls repeat it)
++        const D3D11Buffer *lastUpload = nullptr;
++        bool lastUploadConstants = false;
++        uint64_t lastUploadEnd = 0;
++
++        explicit D3D11CommandList(D3D11Device *device) : device(device) { cmds.reserve(4096); }
++
++        void noteUpload(const RenderBuffer *buffer, uint64_t end, bool constants) {
++            auto *b = const_cast<D3D11Buffer *>(static_cast<const D3D11Buffer *>(buffer));
++            if (!b || !b->cpu || b->desc.heapType != RenderHeapType::UPLOAD) return;
++            // (written once and already on the GPU: nothing to upload)
++            if (!b->mapped && (constants ? b->constantsReady && !b->constantsDirty : b->geometryReady && !b->geometryDirty)) return;
++            if (b == lastUpload && constants == lastUploadConstants && end <= lastUploadEnd) return;
++            lastUpload = b;
++            lastUploadConstants = constants;
++            lastUploadEnd = end;
++            auto &range = uploads[b];
++            uint64_t &e = constants ? range.second : range.first;
++            e = std::max(e, end);
++        }
++
++        void begin() override {
++            static std::atomic<uint64_t> generations = 0;
++            generation = ++generations;
++            drawCount = 0;
++            cmds.clear();
++            pushData.clear();
++            uploads.clear();
++            lastUpload = nullptr;
++        }
++        void end() override {}
++        void barriers(RenderBarrierStages, const RenderBufferBarrier *, uint32_t, const RenderTextureBarrier *, uint32_t) override {}
++        void dispatch(uint32_t, uint32_t, uint32_t) override { Unsupported("dispatch"); }
++        void traceRays(uint32_t, uint32_t, uint32_t, RenderBufferReference, const RenderShaderBindingGroupsInfo &) override { Unsupported("traceRays"); }
++
++        void drawInstanced(uint32_t vertexCountPerInstance, uint32_t instanceCount, uint32_t startVertexLocation, uint32_t startInstanceLocation) override {
++            ++drawCount;
++            Cmd c{Op::DRAW};
++            c.a = vertexCountPerInstance;
++            c.b = instanceCount;
++            c.c = startVertexLocation;
++            c.d = startInstanceLocation;
++            cmds.push_back(c);
++        }
++
++        void drawIndexedInstanced(uint32_t indexCountPerInstance, uint32_t instanceCount, uint32_t startIndexLocation, int32_t baseVertexLocation, uint32_t startInstanceLocation) override {
++            ++drawCount;
++            Cmd c{Op::DRAW_INDEXED};
++            c.a = indexCountPerInstance;
++            c.b = instanceCount;
++            c.c = startIndexLocation;
++            c.d = uint32_t(baseVertexLocation);
++            c.e = startInstanceLocation;
++            cmds.push_back(c);
++        }
++
++        void setPipeline(const RenderPipeline *pipeline) override {
++            Cmd c{Op::SET_PIPELINE};
++            c.p0 = pipeline;
++            cmds.push_back(c);
++        }
++
++        void setComputePipelineLayout(const RenderPipelineLayout *) override { Unsupported("compute"); }
++        void setComputePushConstants(uint32_t, const void *, uint32_t, uint32_t) override { Unsupported("compute"); }
++        void setComputeDescriptorSet(RenderDescriptorSet *, uint32_t) override { Unsupported("compute"); }
++
++        void setGraphicsPipelineLayout(const RenderPipelineLayout *pipelineLayout) override {
++            Cmd c{Op::SET_LAYOUT};
++            c.p0 = pipelineLayout;
++            cmds.push_back(c);
++        }
++
++        // WWE '12: the range's bytes go to a constant buffer of its own at replay; `offset` and
++        // `size` update part of it, the rest keeps the last values.
++        void setGraphicsPushConstants(uint32_t rangeIndex, const void *data, uint32_t offset, uint32_t size) override {
++            if (!data || !size) return;
++            Cmd c{Op::SET_PUSH_CONSTANTS};
++            c.a = rangeIndex;
++            c.b = size;
++            c.c = offset;
++            c.offset = pushData.size();
++            pushData.insert(pushData.end(), static_cast<const uint8_t *>(data), static_cast<const uint8_t *>(data) + size);
++            cmds.push_back(c);
++        }
++
++        void setSlot(Op op, uint32_t stages, uint32_t reg, const RenderDescriptorSet *set, uint32_t index) {
++            Cmd c{op};
++            c.a = reg;
++            c.b = index;
++            c.c = stages;
++            c.p0 = set;
++            cmds.push_back(c);
++        }
++
++        void setGraphicsDescriptorSet(RenderDescriptorSet *descriptorSet, uint32_t setIndex) override {
++            Cmd c{Op::SET_DESCRIPTOR_SET};
++            c.p0 = descriptorSet;
++            c.a = setIndex;
++            cmds.push_back(c);
++        }
++
++        void setGraphicsRootDescriptor(RenderBufferReference bufferReference, uint32_t rootDescriptorIndex) override {
++            Cmd c{Op::SET_ROOT_DESCRIPTOR};
++            c.p0 = bufferReference.ref;
++            c.offset = bufferReference.offset;
++            c.a = rootDescriptorIndex;
++            cmds.push_back(c);
++            // (a constant buffer window: up to 4096 constants)
++            if (bufferReference.ref) noteUpload(bufferReference.ref, bufferReference.offset + 65536, true);
++        }
++
++        void setRaytracingPipelineLayout(const RenderPipelineLayout *) override { Unsupported("ray tracing"); }
++        void setRaytracingPushConstants(uint32_t, const void *, uint32_t, uint32_t) override { Unsupported("ray tracing"); }
++        void setRaytracingDescriptorSet(RenderDescriptorSet *, uint32_t) override { Unsupported("ray tracing"); }
++
++        void setIndexBuffer(const RenderIndexBufferView *view) override {
++            Cmd c{Op::SET_INDEX_BUFFER};
++            if (view) {
++                c.p0 = view->buffer.ref;
++                c.offset = view->buffer.offset;
++                c.a = uint32_t(toDXGI(view->format));
++                noteUpload(view->buffer.ref, view->buffer.offset + view->size, false);
++            }
++            cmds.push_back(c);
++        }
++
++        void setVertexBuffers(uint32_t startSlot, const RenderVertexBufferView *views, uint32_t viewCount, const RenderInputSlot *inputSlots) override {
++            for (uint32_t i = 0; i < viewCount; ++i) {
++                Cmd c{Op::SET_VERTEX_BUFFERS};
++                c.a = startSlot + i;
++                c.p0 = views[i].buffer.ref;
++                c.offset = views[i].buffer.offset;
++                c.b = inputSlots ? inputSlots[i].stride : 0;
++                cmds.push_back(c);
++                noteUpload(views[i].buffer.ref, views[i].buffer.offset + views[i].size, false);
++            }
++        }
++
++        void setViewports(const RenderViewport *viewports, uint32_t count) override {
++            if (!count) return;
++            Cmd c{Op::SET_VIEWPORT};
++            c.f[0] = viewports[0].x;
++            c.f[1] = viewports[0].y;
++            c.f[2] = viewports[0].width;
++            c.f[3] = viewports[0].height;
++            c.f[4] = viewports[0].minDepth;
++            c.f[5] = viewports[0].maxDepth;
++            cmds.push_back(c);
++        }
++
++        void setScissors(const RenderRect *scissorRects, uint32_t count) override {
++            if (!count) return;
++            Cmd c{Op::SET_SCISSOR};
++            c.box = RenderBox(scissorRects[0].left, scissorRects[0].top, scissorRects[0].right, scissorRects[0].bottom);
++            cmds.push_back(c);
++        }
++
++        void setFramebuffer(const RenderFramebuffer *framebuffer) override {
++            Cmd c{Op::SET_FRAMEBUFFER};
++            c.p0 = framebuffer;
++            cmds.push_back(c);
++        }
++
++        void setDepthBias(float, float, float) override {}  // (static in the pipeline)
++
++        void setStencilReference(uint32_t stencilReference) {
++            Cmd c{Op::SET_STENCIL_REFERENCE};
++            c.a = stencilReference;
++            cmds.push_back(c);
++        }
++
++        void setBlendFactor(const float blendFactor[4]) {
++            Cmd c{Op::SET_BLEND_FACTOR};
++            std::memcpy(c.f, blendFactor, 4 * sizeof(float));
++            cmds.push_back(c);
++        }
++
++        void clearColor(uint32_t attachmentIndex, RenderColor colorValue, const RenderRect *clearRects, uint32_t clearRectsCount) override {
++            if (clearRectsCount) Unsupported("clear rectangles (the whole target is cleared)");
++            Cmd c{Op::CLEAR_COLOR};
++            c.a = attachmentIndex;
++            std::memcpy(c.f, colorValue.rgba, 4 * sizeof(float));
++            cmds.push_back(c);
++        }
++
++        void clearDepthStencil(bool clearDepth, bool clearStencil, float depthValue, uint32_t stencilValue, const RenderRect *clearRects, uint32_t clearRectsCount) override {
++            if (clearRectsCount) Unsupported("clear rectangles (the whole target is cleared)");
++            Cmd c{Op::CLEAR_DEPTH_STENCIL};
++            c.a = (clearDepth ? D3D11_CLEAR_DEPTH : 0) | (clearStencil ? D3D11_CLEAR_STENCIL : 0);
++            c.b = stencilValue;
++            c.f[0] = depthValue;
++            cmds.push_back(c);
++        }
++
++        void copyBufferRegion(RenderBufferReference, RenderBufferReference, uint64_t) override { Unsupported("copyBufferRegion"); }
++
++        void copyTextureRegion(const RenderTextureCopyLocation &dstLocation, const RenderTextureCopyLocation &srcLocation, uint32_t dstX, uint32_t dstY, uint32_t dstZ, const RenderBox *srcBox) override {
++            Cmd c{Op::COPY_TEXTURE_REGION};
++            c.c = dstX;
++            c.d = dstY;
++            c.e = dstZ;
++            if (srcBox) {
++                c.box = *srcBox;
++                c.hasBox = true;
++            }
++            if (dstLocation.type == RenderTextureCopyType::SUBRESOURCE && srcLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) {
++                // Upload: buffer -> texture.
++                const auto *dst = static_cast<const D3D11Texture *>(dstLocation.texture);
++                uint32_t rowPitch, rows;
++                FootprintLayout(srcLocation, rowPitch, rows);
++                c.op = Op::UPLOAD_TEXTURE_REGION;
++                c.p0 = dst;
++                c.p1 = srcLocation.buffer;
++                c.offset = srcLocation.placedFootprint.offset;
++                c.a = SubresourceOf(dst, dstLocation.subresource.mipLevel, dstLocation.subresource.arrayIndex);
++                c.b = rowPitch;
++                // The destination box: the footprint's size (blocks rounded up).
++                const uint32_t blockWidth = RenderFormatBlockWidth(srcLocation.placedFootprint.format);
++                c.box = RenderBox(int32_t(dstX), int32_t(dstY),
++                                  int32_t(dstX + ((srcLocation.placedFootprint.width + blockWidth - 1) / blockWidth) * blockWidth),
++                                  int32_t(dstY + rows * blockWidth), int32_t(dstZ), int32_t(dstZ + std::max(srcLocation.placedFootprint.depth, 1u)));
++                c.f[0] = float(rows);  // (rows for the depth pitch)
++                c.hasBox = true;
++            } else if (dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT && srcLocation.type == RenderTextureCopyType::SUBRESOURCE) {
++                // Readback: texture -> buffer.
++                const auto *src = static_cast<const D3D11Texture *>(srcLocation.texture);
++                uint32_t rowPitch, rows;
++                FootprintLayout(dstLocation, rowPitch, rows);
++                c.op = Op::READBACK_TEXTURE_REGION;
++                c.p0 = dstLocation.buffer;
++                c.p1 = src;
++                c.offset = dstLocation.placedFootprint.offset;
++                c.a = SubresourceOf(src, srcLocation.subresource.mipLevel, srcLocation.subresource.arrayIndex);
++                c.b = rowPitch;
++                c.c = rows;
++                c.d = std::max(dstLocation.placedFootprint.depth, 1u);
++            } else if (dstLocation.type == RenderTextureCopyType::SUBRESOURCE && srcLocation.type == RenderTextureCopyType::SUBRESOURCE) {
++                const auto *dst = static_cast<const D3D11Texture *>(dstLocation.texture);
++                const auto *src = static_cast<const D3D11Texture *>(srcLocation.texture);
++                c.p0 = dst;
++                c.p1 = src;
++                c.a = SubresourceOf(dst, dstLocation.subresource.mipLevel, dstLocation.subresource.arrayIndex);
++                c.b = SubresourceOf(src, srcLocation.subresource.mipLevel, srcLocation.subresource.arrayIndex);
++            } else {
++                Unsupported("buffer to buffer texture copies");
++                return;
++            }
++            cmds.push_back(c);
++        }
++
++        void copyBuffer(const RenderBuffer *, const RenderBuffer *) override { Unsupported("copyBuffer"); }
++
++        void copyTexture(const RenderTexture *dstTexture, const RenderTexture *srcTexture) override {
++            Cmd c{Op::COPY_TEXTURE};
++            c.p0 = dstTexture;
++            c.p1 = srcTexture;
++            cmds.push_back(c);
++        }
++
++        void resolveTexture(const RenderTexture *, const RenderTexture *) override { Unsupported("resolveTexture"); }
++        void resolveTextureRegion(const RenderTexture *, uint32_t, uint32_t, const RenderTexture *, const RenderRect *, RenderResolveMode) override { Unsupported("resolveTextureRegion"); }
++        void buildBottomLevelAS(const RenderAccelerationStructure *, RenderBufferReference, const RenderBottomLevelASBuildInfo &) override { Unsupported("ray tracing"); }
++        void buildTopLevelAS(const RenderAccelerationStructure *, RenderBufferReference, RenderBufferReference, const RenderTopLevelASBuildInfo &) override { Unsupported("ray tracing"); }
++        void discardTexture(const RenderTexture *) override {}
++        void resetQueryPool(const RenderQueryPool *, uint32_t, uint32_t) override { Unsupported("query pools"); }
++        void writeTimestamp(const RenderQueryPool *, uint32_t) override { Unsupported("query pools"); }
++
++        // Replays the commands on the immediate context (lock held).
++        void replay() const;
++    };
++
++    namespace {
++        // The replay's view of the pipeline's bindings and what is bound, so
++        // only changed registers are set.
++        struct ReplayState {
++            ID3D11DeviceContext *context = nullptr;
++            ID3D11DeviceContext1 *context1 = nullptr;
++            bool offsetting = false;
++            const D3D11GraphicsPipeline *pipeline = nullptr;
++            ShaderBindings vsBindings, psBindings;
++            const D3D11PipelineLayout *layout = nullptr;
++            const D3D11Framebuffer *framebuffer = nullptr;
++            // Wanted (from the sets) and bound, per stage (0 VS, 1 PS).
++            // (per stage: WWE '12 binds the vertex and pixel shaders' slots apart)
++            ID3D11ShaderResourceView *srvWanted[2][64] = {};
++            ID3D11ShaderResourceView *srvBound[2][64] = {};
++            ID3D11SamplerState *samplerWanted[2][16] = {};
++            ID3D11SamplerState *samplerBound[2][16] = {};
++            bool texturesDirty = true;
++            // Root constant buffers by register: (buffer, offset).
++            const D3D11Buffer *cbBuffer[14] = {};
++            uint64_t cbOffset[14] = {};
++            uint32_t cbDirty = 0;
++            // Copies for constants without offsets (D3D11.0): one per register.
++            Microsoft::WRL::ComPtr<ID3D11Buffer> cbCopies[14];
++            uint32_t stencilReference = 0;
++            float blendFactor[4] = {1.0f, 1.0f, 1.0f, 1.0f};
++            bool outputMergerDirty = true;
++            // WWE '12: push constant ranges, by register (64 bytes each at most here).
++            Microsoft::WRL::ComPtr<ID3D11Buffer> pushBuffers[14];
++            uint8_t pushBytes[14][256] = {};
++            uint32_t draws = 0;
++        };
++
++        void BindSet(ReplayState &s, const D3D11DescriptorSet *set) {
++            if (!set || set->bindless) return;
++            for (size_t i = 0; i < set->entries.size(); ++i) {
++                const D3D11DescriptorSet::Entry &e = set->entries[i];
++                switch (e.kind) {
++                case D3D11DescriptorSet::Kind::SRV:
++                    if (e.reg < 64) s.srvWanted[0][e.reg] = s.srvWanted[1][e.reg] = set->srvs[i];
++                    break;
++                case D3D11DescriptorSet::Kind::SAMPLER:
++                    if (e.reg < 16) s.samplerWanted[0][e.reg] = s.samplerWanted[1][e.reg] = set->samplers[i];
++                    break;
++                default:
++                    break;
++                }
++            }
++            s.texturesDirty = true;
++        }
++
++        void FlushTextures(ReplayState &s) {
++            if (!s.texturesDirty) return;
++            s.texturesDirty = false;
++            for (int stage = 0; stage < 2; ++stage) {
++                const ShaderBindings &b = stage ? s.psBindings : s.vsBindings;
++                int first = -1, last = -1;
++                for (int r = 0; r < 64; ++r) {
++                    if (!(b.textures & (1ull << r)) || s.srvBound[stage][r] == s.srvWanted[stage][r]) continue;
++                    if (first < 0) first = r;
++                    last = r;
++                    s.srvBound[stage][r] = s.srvWanted[stage][r];
++                }
++                if (first >= 0) {
++                    // (registers in between the shader doesn't use get what's wanted too)
++                    for (int r = first; r <= last; ++r) s.srvBound[stage][r] = s.srvWanted[stage][r];
++                    if (stage) s.context->PSSetShaderResources(UINT(first), UINT(last - first + 1), &s.srvWanted[stage][first]);
++                    else s.context->VSSetShaderResources(UINT(first), UINT(last - first + 1), &s.srvWanted[stage][first]);
++                }
++                first = last = -1;
++                for (int r = 0; r < 16; ++r) {
++                    if (!(b.samplers & (1u << r)) || s.samplerBound[stage][r] == s.samplerWanted[stage][r]) continue;
++                    if (first < 0) first = r;
++                    last = r;
++                }
++                if (first >= 0) {
++                    for (int r = first; r <= last; ++r) s.samplerBound[stage][r] = s.samplerWanted[stage][r];
++                    if (stage) s.context->PSSetSamplers(UINT(first), UINT(last - first + 1), &s.samplerWanted[stage][first]);
++                    else s.context->VSSetSamplers(UINT(first), UINT(last - first + 1), &s.samplerWanted[stage][first]);
++                }
++            }
++        }
++
++        void FlushConstants(ReplayState &s, ID3D11Device *device) {
++            if (!s.cbDirty) return;
++            const uint32_t used = s.vsBindings.constantBuffers | s.psBindings.constantBuffers;
++            for (uint32_t r = 0; r < 14; ++r) {
++                if (!(s.cbDirty & used & (1u << r))) continue;
++                const D3D11Buffer *buffer = s.cbBuffer[r];
++                if (!buffer) continue;
++                ID3D11Buffer *bind = nullptr;
++                UINT first = 0, count = 4096;
++                if (buffer->d3d) {
++                    bind = buffer->d3d.Get();
++                } else if (s.offsetting && (buffer->combined ? buffer->gpuGeometry : buffer->gpuConstants)) {
++                    bind = buffer->combined ? buffer->gpuGeometry.Get() : buffer->gpuConstants.Get();
++                    first = UINT(s.cbOffset[r] / 16);
++                    const uint64_t remaining = (buffer->desc.size - std::min<uint64_t>(s.cbOffset[r], buffer->desc.size)) / 16;
++                    count = UINT(std::min<uint64_t>(4096, remaining & ~15ull));
++                    if (!count) continue;
++                } else if (buffer->cpu) {
++                    // A copy of the window (4 KB: the game's constants are 256 float4 at most).
++                    if (!s.cbCopies[r]) {
++                        D3D11_BUFFER_DESC d = {};
++                        d.ByteWidth = 4096;
++                        d.Usage = D3D11_USAGE_DYNAMIC;
++                        d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++                        d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++                        device->CreateBuffer(&d, nullptr, &s.cbCopies[r]);
++                    }
++                    D3D11_MAPPED_SUBRESOURCE m;
++                    if (!s.cbCopies[r] || FAILED(s.context->Map(s.cbCopies[r].Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) continue;
++                    const uint64_t n = std::min<uint64_t>(4096, buffer->desc.size - std::min<uint64_t>(s.cbOffset[r], buffer->desc.size));
++                    std::memcpy(m.pData, buffer->cpu + s.cbOffset[r], size_t(n));
++                    s.context->Unmap(s.cbCopies[r].Get(), 0);
++                    bind = s.cbCopies[r].Get();
++                    count = 256;
++                }
++                if (!bind) continue;
++                const bool window = s.offsetting && !buffer->d3d;
++                if (s.vsBindings.constantBuffers & (1u << r)) {
++                    if (window) s.context1->VSSetConstantBuffers1(r, 1, &bind, &first, &count);
++                    else s.context->VSSetConstantBuffers(r, 1, &bind);
++                }
++                if (s.psBindings.constantBuffers & (1u << r)) {
++                    if (window) s.context1->PSSetConstantBuffers1(r, 1, &bind, &first, &count);
++                    else s.context->PSSetConstantBuffers(r, 1, &bind);
++                }
++                s.cbDirty &= ~(1u << r);
++            }
++        }
++
++        void FlushOutputMerger(ReplayState &s) {
++            if (!s.outputMergerDirty || !s.pipeline) return;
++            s.outputMergerDirty = false;
++            s.context->OMSetBlendState(s.pipeline->blend.Get(), s.blendFactor, 0xFFFFFFFF);
++            s.context->OMSetDepthStencilState(s.pipeline->depthStencil.Get(), s.pipeline->dynamicStencilReference ? s.stencilReference : s.pipeline->stencilReference);
++        }
++    }
++
++    void D3D11CommandList::replay() const {
++        ReplayState s;
++        s.context = device->context;
++        s.context1 = device->context1.Get();
++        s.offsetting = device->constantBufferOffsetting && s.context1;
++        ID3D11DeviceContext *ctx = s.context;
++        ctx->ClearState();
++
++        // The upload buffers' bytes for this list's draws.
++        const auto t0 = std::chrono::steady_clock::now();
++        for (const auto &[buffer, range] : uploads) {
++            // (without offsets, constants are copied per draw from the CPU bytes)
++            const uint64_t constants = s.offsetting ? range.second : 0;
++            if (range.first || (constants && buffer->mapped && !buffer->gpuConstants)) {
++                // (a ring's first upload makes the combined buffer if it can)
++                buffer->gpu(false, std::max(range.first, constants), generation);
++            }
++            if (constants && !buffer->combined) buffer->gpu(true, constants, generation);
++        }
++
++        const auto t1 = std::chrono::steady_clock::now();
++        const D3D11PipelineLayout *layout = nullptr;
++        for (const Cmd &c : cmds) {
++            switch (c.op) {
++            case Op::SET_FRAMEBUFFER: {
++                const auto *fb = static_cast<const D3D11Framebuffer *>(c.p0);
++                s.framebuffer = fb;
++                if (!fb) {
++                    ctx->OMSetRenderTargets(0, nullptr, nullptr);
++                    break;
++                }
++                ID3D11RenderTargetView *rtvs[8] = {};
++                for (size_t i = 0; i < fb->rtvs.size() && i < 8; ++i) rtvs[i] = fb->rtvs[i].Get();
++                // A texture bound for sampling can't be a target too: drop it from the shader stages.
++                for (int stage = 0; stage < 2; ++stage) {
++                    std::fill(std::begin(s.srvBound[stage]), std::end(s.srvBound[stage]), nullptr);
++                }
++                ID3D11ShaderResourceView *none[64] = {};
++                ctx->VSSetShaderResources(0, 64, none);
++                ctx->PSSetShaderResources(0, 64, none);
++                s.texturesDirty = true;
++                ctx->OMSetRenderTargets(UINT(fb->rtvs.size()), rtvs, fb->dsv.Get());
++                break;
++            }
++            case Op::SET_PIPELINE: {
++                const auto *p = static_cast<const D3D11GraphicsPipeline *>(c.p0);
++                if (!p || !p->valid || p == s.pipeline) break;
++                s.pipeline = p;
++                ctx->VSSetShader(p->vs.Get(), nullptr, 0);
++                ctx->PSSetShader(p->ps.Get(), nullptr, 0);
++                ctx->IASetInputLayout(p->inputLayout.Get());
++                ctx->IASetPrimitiveTopology(p->topology);
++                ctx->RSSetState(p->rasterizer.Get());
++                {
++                    std::lock_guard lock(g_bindingsMutex);
++                    const D3D11PipelineBindings &b = g_bindings[p];
++                    const uint32_t oldConstants = s.vsBindings.constantBuffers | s.psBindings.constantBuffers;
++                    s.vsBindings = b.vs;
++                    s.psBindings = b.ps;
++                    // Stages that now read registers they didn't: rebind.
++                    if ((s.vsBindings.constantBuffers | s.psBindings.constantBuffers) != oldConstants) s.cbDirty = 0x3FFF;
++                }
++                s.texturesDirty = true;
++                s.cbDirty = 0x3FFF;
++                s.outputMergerDirty = true;
++                break;
++            }
++            case Op::SET_LAYOUT:
++                layout = static_cast<const D3D11PipelineLayout *>(c.p0);
++                break;
++            case Op::SET_DESCRIPTOR_SET:
++                BindSet(s, static_cast<const D3D11DescriptorSet *>(c.p0));
++                break;
++            case Op::SET_ROOT_DESCRIPTOR: {
++                const uint32_t reg = layout && c.a < layout->rootRegisters.size() ? layout->rootRegisters[c.a] : c.a;
++                if (reg >= 14) break;
++                s.cbBuffer[reg] = static_cast<const D3D11Buffer *>(c.p0);
++                s.cbOffset[reg] = c.offset;
++                s.cbDirty |= 1u << reg;
++                break;
++            }
++            case Op::SET_INDEX_BUFFER: {
++                auto *b = const_cast<D3D11Buffer *>(static_cast<const D3D11Buffer *>(c.p0));
++                ID3D11Buffer *gpu = b ? (b->d3d ? b->d3d.Get() : b->gpuGeometry.Get()) : nullptr;
++                ctx->IASetIndexBuffer(gpu, DXGI_FORMAT(c.a), UINT(c.offset));
++                break;
++            }
++            case Op::SET_VERTEX_BUFFERS: {
++                auto *b = const_cast<D3D11Buffer *>(static_cast<const D3D11Buffer *>(c.p0));
++                ID3D11Buffer *gpu = b ? (b->d3d ? b->d3d.Get() : b->gpuGeometry.Get()) : nullptr;
++                const UINT stride = c.b, offset = UINT(c.offset);
++                ctx->IASetVertexBuffers(c.a, 1, &gpu, &stride, &offset);
++                break;
++            }
++            case Op::SET_VIEWPORT: {
++                D3D11_VIEWPORT v = {c.f[0], c.f[1], c.f[2], c.f[3], c.f[4], c.f[5]};
++                ctx->RSSetViewports(1, &v);
++                break;
++            }
++            case Op::SET_SCISSOR: {
++                D3D11_RECT r = {c.box.left, c.box.top, c.box.right, c.box.bottom};
++                ctx->RSSetScissorRects(1, &r);
++                break;
++            }
++            case Op::SET_PUSH_CONSTANTS: {
++                if (!layout || c.a >= layout->pushRanges.size()) break;
++                const D3D11PipelineLayout::PushRange &range = layout->pushRanges[c.a];
++                if (range.reg >= 14 || c.c + c.b > sizeof(s.pushBytes[0])) break;
++                std::memcpy(s.pushBytes[range.reg] + c.c, pushData.data() + c.offset, c.b);
++                Microsoft::WRL::ComPtr<ID3D11Buffer> &cb = s.pushBuffers[range.reg];
++                if (!cb) {
++                    D3D11_BUFFER_DESC d = {};
++                    d.ByteWidth = UINT(sizeof(s.pushBytes[0]));
++                    d.Usage = D3D11_USAGE_DYNAMIC;
++                    d.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
++                    d.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
++                    if (FAILED(device->d3d->CreateBuffer(&d, nullptr, &cb))) break;
++                }
++                D3D11_MAPPED_SUBRESOURCE m = {};
++                if (FAILED(ctx->Map(cb.Get(), 0, D3D11_MAP_WRITE_DISCARD, 0, &m))) break;
++                std::memcpy(m.pData, s.pushBytes[range.reg], sizeof(s.pushBytes[0]));
++                ctx->Unmap(cb.Get(), 0);
++                // (the root constant buffers' flush skips a register a push range owns)
++                s.cbBuffer[range.reg] = nullptr;
++                ID3D11Buffer *b = cb.Get();
++                ctx->VSSetConstantBuffers(range.reg, 1, &b);
++                ctx->PSSetConstantBuffers(range.reg, 1, &b);
++                break;
++            }
++            case Op::SET_SLOT_TEXTURE: {
++                const auto *set = static_cast<const D3D11DescriptorSet *>(c.p0);
++                if (!set || c.a >= 64 || c.b >= set->srvs.size()) break;
++                for (int stage = 0; stage < 2; ++stage)
++                    if (c.c & (1u << stage)) s.srvWanted[stage][c.a] = set->srvs[c.b];
++                s.texturesDirty = true;
++                break;
++            }
++            case Op::SET_SLOT_SAMPLER: {
++                const auto *set = static_cast<const D3D11DescriptorSet *>(c.p0);
++                if (!set || c.a >= 16 || c.b >= set->samplers.size()) break;
++                for (int stage = 0; stage < 2; ++stage)
++                    if (c.c & (1u << stage)) s.samplerWanted[stage][c.a] = set->samplers[c.b];
++                s.texturesDirty = true;
++                break;
++            }
++            case Op::SET_STENCIL_REFERENCE:
++                s.stencilReference = c.a;
++                s.outputMergerDirty = true;
++                break;
++            case Op::SET_BLEND_FACTOR:
++                std::memcpy(s.blendFactor, c.f, sizeof(s.blendFactor));
++                s.outputMergerDirty = true;
++                break;
++            case Op::CLEAR_COLOR:
++                if (s.framebuffer && c.a < s.framebuffer->rtvs.size()) ctx->ClearRenderTargetView(s.framebuffer->rtvs[c.a].Get(), c.f);
++                break;
++            case Op::CLEAR_DEPTH_STENCIL:
++                if (s.framebuffer && s.framebuffer->dsv) ctx->ClearDepthStencilView(s.framebuffer->dsv.Get(), c.a, c.f[0], UINT8(c.b));
++                break;
++            case Op::DRAW:
++            case Op::DRAW_INDEXED:
++                if (!s.pipeline) break;
++                FlushTextures(s);
++                FlushConstants(s, device->d3d.Get());
++                FlushOutputMerger(s);
++                if (c.op == Op::DRAW) {
++                    if (c.b > 1 || c.d) ctx->DrawInstanced(c.a, c.b, c.c, c.d);
++                    else ctx->Draw(c.a, c.c);
++                } else {
++                    if (c.b > 1 || c.e) ctx->DrawIndexedInstanced(c.a, c.b, c.c, int32_t(c.d), c.e);
++                    else ctx->DrawIndexed(c.a, c.c, int32_t(c.d));
++                }
++                ++s.draws;
++                break;
++            case Op::COPY_TEXTURE_REGION: {
++                const auto *dst = static_cast<const D3D11Texture *>(c.p0);
++                const auto *src = static_cast<const D3D11Texture *>(c.p1);
++                if (!dst->d3d || !src->d3d) break;
++                // (Depth-stencil resources copy whole subresources only.)
++                const bool depth = (src->desc.flags & RenderTextureFlag::DEPTH_TARGET) || (dst->desc.flags & RenderTextureFlag::DEPTH_TARGET);
++                D3D11_BOX box = {UINT(c.box.left), UINT(c.box.top), UINT(c.box.front), UINT(c.box.right), UINT(c.box.bottom), UINT(c.box.back)};
++                ctx->CopySubresourceRegion(dst->d3d.Get(), c.a, depth ? 0 : c.c, depth ? 0 : c.d, depth ? 0 : c.e, src->d3d.Get(), c.b, (c.hasBox && !depth) ? &box : nullptr);
++                break;
++            }
++            case Op::UPLOAD_TEXTURE_REGION: {
++                const auto *dst = static_cast<const D3D11Texture *>(c.p0);
++                const auto *src = static_cast<const D3D11Buffer *>(c.p1);
++                if (!dst->d3d || !src || !src->cpu) break;
++                D3D11_BOX box = {UINT(c.box.left), UINT(c.box.top), UINT(c.box.front), UINT(c.box.right), UINT(c.box.bottom), UINT(c.box.back)};
++                // Clamp the box to the mip (block-rounded footprints of small mips).
++                const UINT mip = c.a % std::max(dst->desc.mipLevels, 1u);
++                const UINT w = std::max(dst->desc.width >> mip, 1u), h = std::max(dst->desc.height >> mip, 1u);
++                const UINT blockWidth = RenderFormatBlockWidth(dst->desc.format);
++                const UINT wAligned = ((w + blockWidth - 1) / blockWidth) * blockWidth, hAligned = ((h + blockWidth - 1) / blockWidth) * blockWidth;
++                box.right = std::min<UINT>(box.right, blockWidth > 1 ? wAligned : w);
++                box.bottom = std::min<UINT>(box.bottom, blockWidth > 1 ? hAligned : h);
++                if (dst->desc.dimension == RenderTextureDimension::TEXTURE_3D) {
++                    box.back = std::min<UINT>(box.back, std::max(std::max(dst->desc.depth, 1u) >> mip, 1u));
++                }
++                if (box.right <= box.left || box.bottom <= box.top) break;
++                const UINT depthPitch = c.b * UINT(c.f[0]);
++                ctx->UpdateSubresource(dst->d3d.Get(), c.a, &box, src->cpu + c.offset, c.b, depthPitch);
++                break;
++            }
++            case Op::READBACK_TEXTURE_REGION: {
++                auto *dst = const_cast<D3D11Buffer *>(static_cast<const D3D11Buffer *>(c.p0));
++                const auto *src = static_cast<const D3D11Texture *>(c.p1);
++                if (!src->d3d || !dst) break;
++                // A staging copy of the subresource, read into the buffer at map().
++                Microsoft::WRL::ComPtr<ID3D11Resource> staging;
++                UINT stagingSub = 0, stagingW = 0, stagingH = 0;
++                Microsoft::WRL::ComPtr<ID3D11Texture2D> t2;
++                if (SUCCEEDED(src->d3d.As(&t2))) {
++                    D3D11_TEXTURE2D_DESC d;
++                    t2->GetDesc(&d);
++                    const UINT mip = c.a % d.MipLevels;
++                    d.Width = std::max(d.Width >> mip, 1u);
++                    d.Height = std::max(d.Height >> mip, 1u);
++                    stagingW = d.Width, stagingH = d.Height;
++                    d.MipLevels = 1;
++                    d.ArraySize = 1;
++                    d.Usage = D3D11_USAGE_STAGING;
++                    d.BindFlags = 0;
++                    d.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
++                    d.MiscFlags = 0;
++                    Microsoft::WRL::ComPtr<ID3D11Texture2D> st;
++                    if (SUCCEEDED(device->d3d->CreateTexture2D(&d, nullptr, &st))) staging = st;
++                }
++                if (!staging) {
++                    Unsupported("reading back this texture");
++                    break;
++                }
++                ctx->CopySubresourceRegion(staging.Get(), stagingSub, 0, 0, 0, src->d3d.Get(), c.a, nullptr);
++                D3D11Buffer::PendingReadback p;
++                p.staging = staging;
++                p.subresource = stagingSub;
++                p.offset = c.offset;
++                p.rowPitch = c.b;
++                p.rows = c.c;
++                p.depth = c.d;
++                {
++                    // (a staging row holds only the texture's width: the footprint's row is padded to 256
++                    // bytes - a 736-wide Created Superstar portrait read 3072 bytes from 2944-byte rows)
++                    const uint32_t blockWidth = RenderFormatBlockWidth(src->desc.format);
++                    p.rowBytes = ((stagingW + blockWidth - 1) / blockWidth) * RenderFormatSize(src->desc.format);
++                    p.stagingRows = (stagingH + blockWidth - 1) / blockWidth;
++                }
++                std::lock_guard lock(dst->readbackMutex);
++                dst->readbacks.push_back(std::move(p));
++                break;
++            }
++            case Op::COPY_TEXTURE: {
++                const auto *dst = static_cast<const D3D11Texture *>(c.p0);
++                const auto *src = static_cast<const D3D11Texture *>(c.p1);
++                if (dst->d3d && src->d3d) ctx->CopyResource(dst->d3d.Get(), src->d3d.Get());
++                break;
++            }
++            }
++        }
++        const auto t2 = std::chrono::steady_clock::now();
++        device->statDraws += s.draws;
++        device->statUploadNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++        device->statReplayNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t2 - t1).count());
++        ctx->ClearState();
++    }
++
++    // D3D11CommandQueue
++
++    std::unique_ptr<RenderCommandList> D3D11CommandQueue::createCommandList() {
++        return std::make_unique<D3D11CommandList>(device);
++    }
++
++    D3D11CommandQueue::D3D11CommandQueue(D3D11Device *device) : device(device) {
++        device->queue = this;
++        if (D3D11AsyncReplay) thread = std::thread([this] { worker(); });
++    }
++
++    D3D11CommandQueue::~D3D11CommandQueue() {
++        {
++            std::lock_guard lock(mutex);
++            stop = true;
++        }
++        work.notify_all();
++        if (thread.joinable()) thread.join();
++        if (device->queue == this) device->queue = nullptr;
++    }
++
++    void D3D11CommandQueue::worker() {
++        // (looked up: Windows 8.1 has no SetThreadDescription)
++        using SetThreadDescriptionFn = HRESULT(WINAPI *)(HANDLE, PCWSTR);
++        static const auto setThreadDescription = reinterpret_cast<SetThreadDescriptionFn>(
++            reinterpret_cast<void *>(GetProcAddress(GetModuleHandleW(L"kernel32.dll"), "SetThreadDescription")));
++        if (setThreadDescription) setThreadDescription(GetCurrentThread(), L"plume D3D11 replay");
++        for (;;) {
++            Submission s;
++            {
++                std::unique_lock lock(mutex);
++                work.wait(lock, [this] { return stop || !pending.empty(); });
++                if (pending.empty()) return;  // (stop)
++                s = std::move(pending.front());
++                pending.pop_front();
++            }
++            replay(s);
++            {
++                std::lock_guard lock(mutex);
++                replayed = s.number;
++            }
++            done.notify_all();
++        }
++    }
++
++    void D3D11CommandQueue::replay(const Submission &submission) {
++        const auto t0 = std::chrono::steady_clock::now();
++        std::lock_guard lock(*device->contextMutex);
++        const auto t1 = std::chrono::steady_clock::now();
++        device->statLockWaitNs += uint64_t(std::chrono::duration_cast<std::chrono::nanoseconds>(t1 - t0).count());
++        uint32_t draws = 0;
++        for (const RenderCommandList *list : submission.lists) {
++            static_cast<const D3D11CommandList *>(list)->replay();
++            draws += static_cast<const D3D11CommandList *>(list)->drawCount;
++        }
++        if (D3D11CommandFence *fence = submission.fence) {
++            D3D11_QUERY_DESC q = {D3D11_QUERY_EVENT, 0};
++            Microsoft::WRL::ComPtr<ID3D11Query> query;
++            if (SUCCEEDED(device->d3d->CreateQuery(&q, &query))) {
++                device->context->End(query.Get());
++            }
++            std::lock_guard fenceLock(fence->mutex);
++            if (fence->submission == submission.number) fence->query = query;
++        }
++        // Light submissions are flushed (the GPU starts on them at once: steady
++        // frame pacing in the menus); heavy ones aren't - flushing made the
++        // driver process the frame on this thread (~4 ms in heavy entrances),
++        // and the fence wait (GetData) or the presenter's Present flushes them.
++        if (draws < D3D11FlushDrawLimit) {
++            device->context->Flush();
++        }
++    }
++
++    bool D3D11CommandQueue::waitReplayed(uint64_t number, uint32_t timeoutMs) {
++        if (replayed >= number) return true;
++        std::unique_lock lock(mutex);
++        auto ready = [&] { return replayed >= number; };
++        if (timeoutMs == UINT32_MAX) {
++            done.wait(lock, ready);
++            return true;
++        }
++        return done.wait_for(lock, std::chrono::milliseconds(timeoutMs), ready);
++    }
++
++    void D3D11CommandQueue::executeCommandLists(const RenderCommandList **commandLists, uint32_t commandListCount, RenderCommandSemaphore **, uint32_t, RenderCommandSemaphore **, uint32_t, RenderCommandFence *signalFence) {
++        Submission s;
++        s.lists.assign(commandLists, commandLists + commandListCount);
++        s.fence = static_cast<D3D11CommandFence *>(signalFence);
++        s.number = ++submitted;
++        if (s.fence) {
++            std::lock_guard fenceLock(s.fence->mutex);
++            s.fence->submission = s.number;
++            s.fence->query.Reset();
++        }
++        if (!thread.joinable()) {
++            replay(s);
++            replayed = s.number;
++            return;
++        }
++        {
++            std::lock_guard lock(mutex);
++            pending.push_back(std::move(s));
++        }
++        work.notify_one();
++    }
++
++    void D3D11CommandQueue::waitForCommandFence(RenderCommandFence *fence) {
++        waitForCommandFenceTimeout(fence, UINT32_MAX);
++    }
++
++    bool D3D11CommandQueue::waitForCommandFenceTimeout(RenderCommandFence *fence, uint32_t timeoutMs) {
++        auto *f = static_cast<D3D11CommandFence *>(fence);
++        if (!f) return true;
++        const auto start = std::chrono::steady_clock::now();
++        uint64_t number;
++        {
++            std::lock_guard fenceLock(f->mutex);
++            number = f->submission;
++        }
++        if (!number) return true;
++        // Replayed first (the fence's query is made then), then the GPU done.
++        if (!waitReplayed(number, timeoutMs)) return false;
++        Microsoft::WRL::ComPtr<ID3D11Query> query;
++        {
++            std::lock_guard fenceLock(f->mutex);
++            if (f->submission != number) return true;  // (signaled again since: a later wait)
++            query = f->query;
++        }
++        if (!query) return true;
++        for (uint32_t spins = 0;; ++spins) {
++            {
++                std::lock_guard lock(*device->contextMutex);
++                BOOL done = FALSE;
++                const HRESULT hr = device->context->GetData(query.Get(), &done, sizeof(done), 0);
++                if (hr == S_OK || FAILED(hr)) {
++                    return true;
++                }
++            }
++            if (timeoutMs != UINT32_MAX && std::chrono::steady_clock::now() - start >= std::chrono::milliseconds(timeoutMs)) {
++                return false;
++            }
++            if (spins < 64) std::this_thread::yield();
++            else std::this_thread::sleep_for(std::chrono::microseconds(200));
++        }
++    }
++
++    // D3D11Device
++
++    D3D11Device::D3D11Device(ID3D11Device *device, ID3D11DeviceContext *context, std::recursive_mutex *contextMutex, bool constantBufferOffsetting)
++        : d3d(device), context(context), contextMutex(contextMutex), constantBufferOffsetting(constantBufferOffsetting) {
++        featureLevel = device->GetFeatureLevel();
++        Microsoft::WRL::ComPtr<ID3D11DeviceContext> ctx(context);
++        ctx.As(&context1);
++        D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
++        if (SUCCEEDED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options)))) {
++            mapNoOverwriteConstants = options.MapNoOverwriteOnDynamicConstantBuffer;
++        }
++        capabilities.maxTextureSize = featureLevel >= D3D_FEATURE_LEVEL_11_0 ? 16384 : 8192;
++        Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
++        Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
++        DXGI_ADAPTER_DESC adapterDesc = {};
++        if (SUCCEEDED(d3d.As(&dxgiDevice)) && SUCCEEDED(dxgiDevice->GetAdapter(&adapter)) && SUCCEEDED(adapter->GetDesc(&adapterDesc))) {
++            char name[256] = {};
++            WideCharToMultiByte(CP_UTF8, 0, adapterDesc.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
++            description.name = name;
++            description.vendor = RenderDeviceVendor(adapterDesc.VendorId);
++            description.dedicatedVideoMemory = adapterDesc.DedicatedVideoMemory;
++            description.type = adapterDesc.DedicatedVideoMemory ? RenderDeviceType::DISCRETE : RenderDeviceType::INTEGRATED;
++        }
++    }
++
++    std::unique_ptr<RenderDescriptorSet> D3D11Device::createDescriptorSet(const RenderDescriptorSetDesc &desc) {
++        return std::make_unique<D3D11DescriptorSet>(desc);
++    }
++
++    std::unique_ptr<RenderShader> D3D11Device::createShader(const void *data, uint64_t size, const char *entryPointName, RenderShaderFormat format) {
++        if (format != RenderShaderFormat::DXBC) {
++            Unsupported("shader formats other than DXBC");
++            return nullptr;
++        }
++        return std::make_unique<D3D11Shader>(this, data, size);
++    }
++
++    std::unique_ptr<RenderSampler> D3D11Device::createSampler(const RenderSamplerDesc &desc) {
++        D3D11_SAMPLER_DESC d = {};
++        const bool linearMin = desc.minFilter == RenderFilter::LINEAR, linearMag = desc.magFilter == RenderFilter::LINEAR;
++        const bool linearMip = desc.mipmapMode == RenderMipmapMode::LINEAR;
++        if (desc.anisotropyEnabled) {
++            d.Filter = desc.comparisonEnabled ? D3D11_FILTER_COMPARISON_ANISOTROPIC : D3D11_FILTER_ANISOTROPIC;
++        } else {
++            d.Filter = D3D11_ENCODE_BASIC_FILTER(linearMin ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT,
++                                                 linearMag ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT,
++                                                 linearMip ? D3D11_FILTER_TYPE_LINEAR : D3D11_FILTER_TYPE_POINT, desc.comparisonEnabled);
++        }
++        d.AddressU = toD3D11(desc.addressU);
++        d.AddressV = toD3D11(desc.addressV);
++        d.AddressW = toD3D11(desc.addressW);
++        d.MipLODBias = desc.mipLODBias;
++        d.MaxAnisotropy = std::clamp<UINT>(desc.maxAnisotropy, 1, 16);
++        d.ComparisonFunc = toD3D11(desc.comparisonFunc);
++        switch (desc.borderColor) {
++        case RenderBorderColor::OPAQUE_BLACK:
++            d.BorderColor[3] = 1.0f;
++            break;
++        case RenderBorderColor::OPAQUE_WHITE:
++            d.BorderColor[0] = d.BorderColor[1] = d.BorderColor[2] = d.BorderColor[3] = 1.0f;
++            break;
++        default:
++            break;
++        }
++        d.MinLOD = desc.minLOD;
++        d.MaxLOD = desc.maxLOD;
++        auto sampler = std::make_unique<D3D11Sampler>();
++        if (FAILED(d3d->CreateSamplerState(&d, &sampler->d3d))) return nullptr;
++        return sampler;
++    }
++
++    std::unique_ptr<RenderPipeline> D3D11Device::createComputePipeline(const RenderComputePipelineDesc &desc) {
++        Unsupported("compute pipelines");
++        return nullptr;
++    }
++
++    std::unique_ptr<RenderPipeline> D3D11Device::createGraphicsPipeline(const RenderGraphicsPipelineDesc &desc) {
++        auto pipeline = std::make_unique<D3D11GraphicsPipeline>();
++        const auto *vs = static_cast<const D3D11Shader *>(desc.vertexShader);
++        const auto *ps = static_cast<const D3D11Shader *>(desc.pixelShader);
++        if (!vs || !vs->vs) return pipeline;  // (valid = false)
++        pipeline->vs = vs->vs;
++        if (ps) pipeline->ps = ps->ps;
++        D3D11PipelineBindings bindings;
++        bindings.vs = ReadBindings(vs->code);
++        if (ps) bindings.ps = ReadBindings(ps->code);
++
++        // Input layout.
++        if (desc.inputElementsCount) {
++            std::vector<D3D11_INPUT_ELEMENT_DESC> elements(desc.inputElementsCount);
++            for (uint32_t i = 0; i < desc.inputElementsCount; ++i) {
++                const RenderInputElement &e = desc.inputElements[i];
++                D3D11_INPUT_ELEMENT_DESC &d = elements[i];
++                d.SemanticName = e.semanticName;
++                d.SemanticIndex = e.semanticIndex;
++                d.Format = toDXGI(e.format);
++                d.InputSlot = e.slotIndex;
++                d.AlignedByteOffset = e.alignedByteOffset;
++                d.InputSlotClass = D3D11_INPUT_PER_VERTEX_DATA;
++                for (uint32_t s = 0; s < desc.inputSlotsCount; ++s) {
++                    if (desc.inputSlots[s].index == e.slotIndex && desc.inputSlots[s].classification == RenderInputSlotClassification::PER_INSTANCE_DATA) {
++                        d.InputSlotClass = D3D11_INPUT_PER_INSTANCE_DATA;
++                        d.InstanceDataStepRate = 1;
++                    }
++                }
++            }
++            if (FAILED(d3d->CreateInputLayout(elements.data(), UINT(elements.size()), vs->code.data(), vs->code.size(), &pipeline->inputLayout))) {
++                return pipeline;
++            }
++        }
++        for (uint32_t s = 0; s < desc.inputSlotsCount; ++s) {
++            if (desc.inputSlots[s].index < D3D11_IA_VERTEX_INPUT_RESOURCE_SLOT_COUNT) pipeline->strides[desc.inputSlots[s].index] = desc.inputSlots[s].stride;
++        }
++
++        // Blend.
++        D3D11_BLEND_DESC blend = {};
++        blend.AlphaToCoverageEnable = desc.alphaToCoverageEnabled;
++        blend.IndependentBlendEnable = desc.renderTargetCount > 1;
++        for (uint32_t i = 0; i < std::max(desc.renderTargetCount, 1u) && i < 8; ++i) {
++            const RenderBlendDesc &b = desc.renderTargetBlend[i];
++            D3D11_RENDER_TARGET_BLEND_DESC &d = blend.RenderTarget[i];
++            d.BlendEnable = b.blendEnabled;
++            d.SrcBlend = toD3D11(b.srcBlend);
++            d.DestBlend = toD3D11(b.dstBlend);
++            d.BlendOp = toD3D11(b.blendOp);
++            // (alpha factors can't be colour ones in D3D11)
++            auto alpha = [](RenderBlend f) {
++                switch (f) {
++                case RenderBlend::SRC_COLOR: return RenderBlend::SRC_ALPHA;
++                case RenderBlend::INV_SRC_COLOR: return RenderBlend::INV_SRC_ALPHA;
++                case RenderBlend::DEST_COLOR: return RenderBlend::DEST_ALPHA;
++                case RenderBlend::INV_DEST_COLOR: return RenderBlend::INV_DEST_ALPHA;
++                case RenderBlend::SRC1_COLOR: return RenderBlend::SRC1_ALPHA;
++                case RenderBlend::INV_SRC1_COLOR: return RenderBlend::INV_SRC1_ALPHA;
++                default: return f;
++                }
++            };
++            d.SrcBlendAlpha = toD3D11(alpha(b.srcBlendAlpha));
++            d.DestBlendAlpha = toD3D11(alpha(b.dstBlendAlpha));
++            d.BlendOpAlpha = toD3D11(b.blendOpAlpha);
++            d.RenderTargetWriteMask = b.renderTargetWriteMask;
++        }
++        // Rasterizer.
++        D3D11_RASTERIZER_DESC raster = {};
++        raster.FillMode = D3D11_FILL_SOLID;
++        raster.CullMode = desc.cullMode == RenderCullMode::FRONT ? D3D11_CULL_FRONT : desc.cullMode == RenderCullMode::BACK ? D3D11_CULL_BACK : D3D11_CULL_NONE;
++        raster.FrontCounterClockwise = desc.frontFace == RenderFrontFace::COUNTER_CLOCKWISE;
++        raster.DepthBias = desc.depthBias;
++        raster.DepthBiasClamp = desc.depthBiasClamp;
++        raster.SlopeScaledDepthBias = desc.slopeScaledDepthBias;
++        raster.DepthClipEnable = desc.depthClipEnabled;
++        raster.ScissorEnable = TRUE;
++        // Depth / stencil.
++        D3D11_DEPTH_STENCIL_DESC depth = {};
++        depth.DepthEnable = desc.depthEnabled;
++        depth.DepthWriteMask = desc.depthWriteEnabled ? D3D11_DEPTH_WRITE_MASK_ALL : D3D11_DEPTH_WRITE_MASK_ZERO;
++        depth.DepthFunc = toD3D11(desc.depthFunction);
++        depth.StencilEnable = desc.stencilEnabled;
++        depth.StencilReadMask = UINT8(desc.stencilReadMask);
++        depth.StencilWriteMask = UINT8(desc.stencilWriteMask);
++        auto face = [](const RenderStencilFaceDesc &f) {
++            D3D11_DEPTH_STENCILOP_DESC d;
++            d.StencilFailOp = toD3D11(f.failOp);
++            d.StencilDepthFailOp = toD3D11(f.depthFailOp);
++            d.StencilPassOp = toD3D11(f.passOp);
++            d.StencilFunc = toD3D11(f.compareFunction);
++            return d;
++        };
++        depth.FrontFace = face(desc.stencilFrontFace);
++        depth.BackFace = face(desc.stencilBackFace);
++        if (FAILED(d3d->CreateBlendState(&blend, &pipeline->blend)) || FAILED(d3d->CreateRasterizerState(&raster, &pipeline->rasterizer)) ||
++            FAILED(d3d->CreateDepthStencilState(&depth, &pipeline->depthStencil))) {
++            return pipeline;
++        }
++        pipeline->topology = toD3D11(desc.primitiveTopology);
++        pipeline->stencilReference = desc.stencilReference;
++        pipeline->dynamicStencilReference = false;  // (WWE '12: not in our plume)
++        pipeline->dynamicBlendFactor = false;
++        pipeline->valid = true;
++        {
++            std::lock_guard lock(g_bindingsMutex);
++            g_bindings[pipeline.get()] = bindings;
++        }
++        return pipeline;
++    }
++
++    std::unique_ptr<RenderPipeline> D3D11Device::createRaytracingPipeline(const RenderRaytracingPipelineDesc &, const RenderPipeline *) {
++        Unsupported("ray tracing");
++        return nullptr;
++    }
++
++    std::unique_ptr<RenderCommandQueue> D3D11Device::createCommandQueue(RenderCommandListType type) {
++        return std::make_unique<D3D11CommandQueue>(this);
++    }
++
++    std::unique_ptr<RenderBuffer> D3D11Device::createBuffer(const RenderBufferDesc &desc) {
++        auto buffer = std::make_unique<D3D11Buffer>(this, desc);
++        if (!buffer->cpu && !buffer->d3d) return nullptr;
++        return buffer;
++    }
++
++    std::unique_ptr<RenderTexture> D3D11Device::createTexture(const RenderTextureDesc &desc) {
++        auto texture = std::make_unique<D3D11Texture>(this, desc);
++        if (!texture->d3d) return nullptr;
++        return texture;
++    }
++
++    std::unique_ptr<RenderAccelerationStructure> D3D11Device::createAccelerationStructure(const RenderAccelerationStructureDesc &) {
++        Unsupported("ray tracing");
++        return nullptr;
++    }
++
++    std::unique_ptr<RenderPool> D3D11Device::createPool(const RenderPoolDesc &) {
++        Unsupported("pools");
++        return nullptr;
++    }
++
++    std::unique_ptr<RenderPipelineLayout> D3D11Device::createPipelineLayout(const RenderPipelineLayoutDesc &desc) {
++        auto layout = std::make_unique<D3D11PipelineLayout>();
++        for (uint32_t i = 0; i < desc.rootDescriptorDescsCount; ++i) {
++            layout->rootRegisters.push_back(uint8_t(desc.rootDescriptorDescs[i].shaderRegister));
++        }
++        for (uint32_t i = 0; i < desc.pushConstantRangesCount; ++i) {
++            D3D11PipelineLayout::PushRange range;
++            range.reg = uint8_t(desc.pushConstantRanges[i].binding);
++            range.size = desc.pushConstantRanges[i].size;
++            layout->pushRanges.push_back(range);
++        }
++        return layout;
++    }
++
++    std::unique_ptr<RenderCommandFence> D3D11Device::createCommandFence() {
++        return std::make_unique<D3D11CommandFence>();
++    }
++
++    std::unique_ptr<RenderCommandSemaphore> D3D11Device::createCommandSemaphore() {
++        return std::make_unique<D3D11CommandSemaphore>();
++        return nullptr;
++    }
++
++    std::unique_ptr<RenderFramebuffer> D3D11Device::createFramebuffer(const RenderFramebufferDesc &desc) {
++        auto fb = std::make_unique<D3D11Framebuffer>();
++        for (uint32_t i = 0; i < desc.colorAttachmentsCount; ++i) {
++            const auto *view = desc.colorAttachmentViews && desc.colorAttachmentViews[i] ? static_cast<const D3D11TextureView *>(desc.colorAttachmentViews[i]) : nullptr;
++            const auto *texture = view ? view->texture : static_cast<const D3D11Texture *>(desc.colorAttachments[i]);
++            if (!texture || !texture->d3d) return nullptr;
++            D3D11_RENDER_TARGET_VIEW_DESC d = {};
++            d.Format = toDXGI(view && view->desc.format != RenderFormat::UNKNOWN ? view->desc.format : texture->desc.format);
++            d.ViewDimension = D3D11_RTV_DIMENSION_TEXTURE2D;
++            d.Texture2D.MipSlice = view ? view->desc.mipSlice : 0;
++            Microsoft::WRL::ComPtr<ID3D11RenderTargetView> rtv;
++            if (FAILED(d3d->CreateRenderTargetView(texture->d3d.Get(), &d, &rtv))) return nullptr;
++            fb->rtvs.push_back(rtv);
++            fb->width = std::max(texture->desc.width >> d.Texture2D.MipSlice, 1u);
++            fb->height = std::max(texture->desc.height >> d.Texture2D.MipSlice, 1u);
++        }
++        if (desc.depthAttachment || desc.depthAttachmentView) {
++            const auto *view = static_cast<const D3D11TextureView *>(desc.depthAttachmentView);
++            const auto *texture = view ? view->texture : static_cast<const D3D11Texture *>(desc.depthAttachment);
++            if (!texture || !texture->d3d) return nullptr;
++            D3D11_DEPTH_STENCIL_VIEW_DESC d = {};
++            d.Format = toDXGIDepthStencilView(texture->desc.format);
++            d.ViewDimension = D3D11_DSV_DIMENSION_TEXTURE2D;
++            d.Flags = desc.depthAttachmentReadOnly ? (D3D11_DSV_READ_ONLY_DEPTH | D3D11_DSV_READ_ONLY_STENCIL) : 0;
++            if (FAILED(d3d->CreateDepthStencilView(texture->d3d.Get(), &d, &fb->dsv))) return nullptr;
++            if (!fb->width) {
++                fb->width = texture->desc.width;
++                fb->height = texture->desc.height;
++            }
++        }
++        return fb;
++    }
++
++    std::unique_ptr<RenderQueryPool> D3D11Device::createQueryPool(uint32_t) {
++        Unsupported("query pools");
++        return nullptr;
++    }
++
++    // D3D11Interface
++
++    std::unique_ptr<RenderDevice> D3D11Interface::createDevice(const std::string &) {
++        return std::make_unique<D3D11Device>(device.Get(), context, contextMutex, constantBufferOffsetting);
++    }
++
++    std::unique_ptr<RenderInterface> CreateD3D11Interface(ID3D11Device *device, ID3D11DeviceContext *context, std::recursive_mutex *contextMutex, bool constantBufferOffsetting) {
++        if (!device || !context || !contextMutex) return nullptr;
++        auto api = std::make_unique<D3D11Interface>();
++        api->device = device;
++        api->context = context;
++        api->contextMutex = contextMutex;
++        api->constantBufferOffsetting = constantBufferOffsetting;
++        api->capabilities.shaderFormat = RenderShaderFormat::DXBC;
++        return api;
++    }
++
++    // WWE '12 additions (the rest of this backend comes from the SvR 2011 PC port, KaikoClanworth1).
++
++    D3D11Texture::D3D11Texture(D3D11Device *device, const RenderTextureDesc &desc, ID3D11Resource *existing)
++        : device(device), desc(desc) {
++        d3d = existing;
++    }
++
++    void D3D11SetSlotTexture(RenderCommandList *list, uint32_t stages, uint32_t reg, const RenderDescriptorSet *set, uint32_t index) {
++        static_cast<D3D11CommandList *>(list)->setSlot(D3D11CommandList::Op::SET_SLOT_TEXTURE, stages, reg, set, index);
++    }
++
++    void D3D11SetSlotSampler(RenderCommandList *list, uint32_t stages, uint32_t reg, const RenderDescriptorSet *set, uint32_t index) {
++        static_cast<D3D11CommandList *>(list)->setSlot(D3D11CommandList::Op::SET_SLOT_SAMPLER, stages, reg, set, index);
++    }
++
++    uint32_t D3D11SlotSwizzle(const RenderDescriptorSet *set, uint32_t index) {
++        const auto *s = static_cast<const D3D11DescriptorSet *>(set);
++        if (!s || index >= s->mappings.size()) return 0x688;
++        const RenderComponentMapping &m = s->mappings[index];
++        const auto code = [](RenderSwizzle w, uint32_t identity) -> uint32_t {
++            switch (w) {
++            case RenderSwizzle::R: return 0;
++            case RenderSwizzle::G: return 1;
++            case RenderSwizzle::B: return 2;
++            case RenderSwizzle::A: return 3;
++            case RenderSwizzle::ZERO: return 4;
++            case RenderSwizzle::ONE: return 5;
++            default: return identity;
++            }
++        };
++        return code(m.r, 0) | code(m.g, 1) << 3 | code(m.b, 2) << 6 | code(m.a, 3) << 9;
++    }
++
++    // A flip-model swap chain on the queue's device. Buffer 0 is always the one to draw into
++    // (DXGI rotates them), so the renderer sees one texture. Presenting waits until the queue's
++    // thread has replayed everything submitted so far.
++    struct D3D11SwapChain : RenderSwapChain {
++        D3D11CommandQueue *queue = nullptr;
++        D3D11Device *device = nullptr;
++        RenderSwapChainDesc desc;
++        Microsoft::WRL::ComPtr<IDXGISwapChain1> swapChain;
++        HANDLE waitable = nullptr;
++        UINT flags = 0;
++        bool tearing = false;
++        bool vsync = true;
++        uint32_t width = 0, height = 0;
++        std::unique_ptr<D3D11Texture> texture;
++
++        ~D3D11SwapChain() override {
++            if (queue) queue->waitReplayed(queue->submitted.load(), UINT32_MAX);
++            texture.reset();
++            if (waitable) CloseHandle(waitable);
++        }
++
++        void windowSize(uint32_t &w, uint32_t &h) const {
++            RECT rect = {};
++            GetClientRect(desc.renderWindow, &rect);
++            w = uint32_t(std::max<LONG>(rect.right - rect.left, 0));
++            h = uint32_t(std::max<LONG>(rect.bottom - rect.top, 0));
++        }
++
++        void wrapBackBuffer() {
++            Microsoft::WRL::ComPtr<ID3D11Texture2D> back;
++            texture.reset();
++            if (FAILED(swapChain->GetBuffer(0, IID_PPV_ARGS(&back)))) return;
++            RenderTextureDesc t = RenderTextureDesc::Texture2D(width, height, 1, desc.format, RenderTextureFlag::RENDER_TARGET);
++            texture = std::make_unique<D3D11Texture>(device, t, back.Get());
++        }
++
++        bool create() {
++            Microsoft::WRL::ComPtr<IDXGIDevice> dxgiDevice;
++            Microsoft::WRL::ComPtr<IDXGIAdapter> adapter;
++            Microsoft::WRL::ComPtr<IDXGIFactory2> factory;
++            if (FAILED(device->d3d.As(&dxgiDevice)) || FAILED(dxgiDevice->GetAdapter(&adapter)) ||
++                FAILED(adapter->GetParent(IID_PPV_ARGS(&factory)))) {
++                return false;
++            }
++            Microsoft::WRL::ComPtr<IDXGIFactory5> factory5;
++            BOOL allowTearing = FALSE;
++            if (SUCCEEDED(factory.As(&factory5)) &&
++                SUCCEEDED(factory5->CheckFeatureSupport(DXGI_FEATURE_PRESENT_ALLOW_TEARING, &allowTearing, sizeof(allowTearing)))) {
++                tearing = allowTearing != FALSE;
++            }
++            windowSize(width, height);
++            DXGI_SWAP_CHAIN_DESC1 d = {};
++            d.Width = width;
++            d.Height = height;
++            d.Format = toDXGI(desc.format);
++            d.SampleDesc.Count = 1;
++            d.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
++            d.BufferCount = std::max(desc.textureCount, 2u);
++            d.SwapEffect = DXGI_SWAP_EFFECT_FLIP_DISCARD;
++            d.AlphaMode = DXGI_ALPHA_MODE_IGNORE;
++            flags = DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT | (tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0);
++            d.Flags = flags;
++            std::lock_guard lock(*device->contextMutex);
++            if (FAILED(factory->CreateSwapChainForHwnd(device->d3d.Get(), desc.renderWindow, &d, nullptr, nullptr, &swapChain))) {
++                return false;
++            }
++            // (the game handles Alt+Enter itself)
++            factory->MakeWindowAssociation(desc.renderWindow, DXGI_MWA_NO_ALT_ENTER);
++            Microsoft::WRL::ComPtr<IDXGISwapChain2> swapChain2;
++            if (SUCCEEDED(swapChain.As(&swapChain2))) {
++                swapChain2->SetMaximumFrameLatency(std::max(desc.maxFrameLatency, 1u));
++                waitable = swapChain2->GetFrameLatencyWaitableObject();
++            }
++            wrapBackBuffer();
++            return texture != nullptr;
++        }
++
++        bool present(uint32_t, RenderCommandSemaphore **, uint32_t) override {
++            queue->waitReplayed(queue->submitted.load(), UINT32_MAX);
++            std::lock_guard lock(*device->contextMutex);
++            const UINT presentFlags = (!vsync && tearing) ? DXGI_PRESENT_ALLOW_TEARING : 0;
++            return SUCCEEDED(swapChain->Present(vsync ? 1 : 0, presentFlags));
++        }
++
++        void wait() override {
++            if (waitable) WaitForSingleObjectEx(waitable, 1000, TRUE);
++        }
++
++        bool resize() override {
++            uint32_t w = 0, h = 0;
++            windowSize(w, h);
++            if (!w || !h) return false;
++            queue->waitReplayed(queue->submitted.load(), UINT32_MAX);
++            std::lock_guard lock(*device->contextMutex);
++            texture.reset();
++            // (the last replay leaves the back buffer bound)
++            device->context->ClearState();
++            device->context->Flush();
++            if (FAILED(swapChain->ResizeBuffers(0, w, h, DXGI_FORMAT_UNKNOWN, flags))) return false;
++            width = w;
++            height = h;
++            wrapBackBuffer();
++            return texture != nullptr;
++        }
++
++        bool needsResize() const override {
++            uint32_t w = 0, h = 0;
++            windowSize(w, h);
++            return !swapChain || w != width || h != height;
++        }
++
++        void setVsyncEnabled(bool enabled) override { vsync = enabled; }
++        bool isVsyncEnabled() const override { return vsync; }
++        uint32_t getWidth() const override { return width; }
++        uint32_t getHeight() const override { return height; }
++        RenderTexture *getTexture(uint32_t) override { return texture.get(); }
++        uint32_t getTextureCount() const override { return 1; }
++
++        bool acquireTexture(RenderCommandSemaphore *, uint32_t *textureIndex) override {
++            if (textureIndex) *textureIndex = 0;
++            return texture != nullptr;
++        }
++
++        RenderWindow getWindow() const override { return desc.renderWindow; }
++        bool isEmpty() const override { return !swapChain || !width || !height; }
++        uint32_t getRefreshRate() const override { return 0; }
++    };
++
++    std::unique_ptr<RenderSwapChain> D3D11CommandQueue::createSwapChain(const RenderSwapChainDesc &desc) {
++        auto swapChain = std::make_unique<D3D11SwapChain>();
++        swapChain->queue = this;
++        swapChain->device = device;
++        swapChain->desc = desc;
++        if (!swapChain->create()) return nullptr;
++        return swapChain;
++    }
++
++    // The standalone interface: lists the hardware adapters, and creates the device on the one
++    // asked for by name (or, when the name is another API's for the same GPU, by its vendor).
++    struct D3D11OwnInterface : RenderInterface {
++        Microsoft::WRL::ComPtr<IDXGIFactory1> factory;
++        std::vector<Microsoft::WRL::ComPtr<IDXGIAdapter1>> adapters;
++        std::vector<std::string> deviceNames;
++        RenderInterfaceCapabilities capabilities;
++        std::recursive_mutex contextMutex;
++        Microsoft::WRL::ComPtr<ID3D11Device> device;
++        Microsoft::WRL::ComPtr<ID3D11DeviceContext> context;
++
++        bool init() {
++            if (FAILED(CreateDXGIFactory1(IID_PPV_ARGS(&factory)))) return false;
++            Microsoft::WRL::ComPtr<IDXGIAdapter1> adapter;
++            for (UINT i = 0; factory->EnumAdapters1(i, &adapter) != DXGI_ERROR_NOT_FOUND; ++i) {
++                DXGI_ADAPTER_DESC1 d = {};
++                adapter->GetDesc1(&d);
++                if (!(d.Flags & DXGI_ADAPTER_FLAG_SOFTWARE)) {
++                    char name[256] = {};
++                    WideCharToMultiByte(CP_UTF8, 0, d.Description, -1, name, sizeof(name) - 1, nullptr, nullptr);
++                    deviceNames.push_back(name);
++                    adapters.push_back(adapter);
++                }
++                adapter.Reset();
++            }
++            capabilities.shaderFormat = RenderShaderFormat::DXBC;
++            return !adapters.empty();
++        }
++
++        static bool sameVendor(const std::string &a, const std::string &b) {
++            const auto has = [](const std::string &s, const char *w) { return s.find(w) != std::string::npos; };
++            for (const char *v : {"Intel", "NVIDIA", "GeForce", "AMD", "Radeon"}) {
++                if (has(a, v) && (has(b, v) || (std::string(v) == "GeForce" && has(b, "NVIDIA")) ||
++                                  (std::string(v) == "Radeon" && has(b, "AMD")))) {
++                    return true;
++                }
++            }
++            return false;
++        }
++
++        std::unique_ptr<RenderDevice> createDevice(const std::string &preferredDeviceName) override {
++            size_t pick = 0;
++            bool found = false;
++            for (size_t i = 0; i < deviceNames.size() && !found; ++i) {
++                if (deviceNames[i] == preferredDeviceName) { pick = i; found = true; }
++            }
++            for (size_t i = 0; i < deviceNames.size() && !found && !preferredDeviceName.empty(); ++i) {
++                if (sameVendor(preferredDeviceName, deviceNames[i])) { pick = i; found = true; }
++            }
++            static const D3D_FEATURE_LEVEL kLevels[] = {D3D_FEATURE_LEVEL_11_1, D3D_FEATURE_LEVEL_11_0};
++            UINT flags = D3D11_CREATE_DEVICE_BGRA_SUPPORT;
++            // (tests: WWE12_D3D11_LEVEL_11_0=1 caps the device at 11_0, as an older GPU)
++            const char *cap = std::getenv("WWE12_D3D11_LEVEL_11_0");
++            const bool only110 = cap && *cap == '1';
++            HRESULT hr = D3D11CreateDevice(adapters[pick].Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, kLevels + (only110 ? 1 : 0),
++                                           UINT(std::size(kLevels)) - (only110 ? 1 : 0), D3D11_SDK_VERSION, &device, nullptr, &context);
++            if (hr == E_INVALIDARG) {  // (11_1 unknown to an old runtime)
++                hr = D3D11CreateDevice(adapters[pick].Get(), D3D_DRIVER_TYPE_UNKNOWN, nullptr, flags, kLevels + 1, 1,
++                                       D3D11_SDK_VERSION, &device, nullptr, &context);
++            }
++            if (FAILED(hr)) return nullptr;
++            Microsoft::WRL::ComPtr<ID3D11Multithread> multithread;
++            if (SUCCEEDED(context.As(&multithread))) multithread->SetMultithreadProtected(TRUE);
++            D3D11_FEATURE_DATA_D3D11_OPTIONS options = {};
++            const bool offsetting = SUCCEEDED(device->CheckFeatureSupport(D3D11_FEATURE_D3D11_OPTIONS, &options, sizeof(options))) &&
++                                    options.ConstantBufferOffsetting;
++            return std::make_unique<D3D11Device>(device.Get(), context.Get(), &contextMutex, offsetting);
++        }
++
++        const std::vector<std::string> &getDeviceNames() const override { return deviceNames; }
++        const RenderInterfaceCapabilities &getCapabilities() const override { return capabilities; }
++    };
++
++    std::unique_ptr<RenderInterface> CreateD3D11Interface() {
++        auto api = std::make_unique<D3D11OwnInterface>();
++        if (!api->init()) return nullptr;
++        return api;
++    }
++};

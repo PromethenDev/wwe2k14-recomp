@@ -1,0 +1,65 @@
+diff --git a/CMakeLists.txt b/CMakeLists.txt
+index 1cbc506..1721b5c 100644
+--- a/CMakeLists.txt
++++ b/CMakeLists.txt
+@@ -21,6 +21,8 @@ cmake_dependent_option(PLUME_SDL_VULKAN_ENABLED "Enable SDL Vulkan integration"
+ cmake_dependent_option(PLUME_D3D12_AGILITY_SDK_ENABLED "Enable D3D12 Agility SDK" OFF WIN32 OFF)
+ cmake_dependent_option(PLUME_APPLE_RETINA_ENABLED "Enable Apple Retina display support" ON APPLE ON)
+ option(PLUME_BUILD_EXAMPLES "Build example applications" OFF)
++# SvR 2008: lets a Vulkan-only Windows build skip D3D12 (its backend needs Windows SDK 10.0.26100+ headers).
++cmake_dependent_option(PLUME_D3D12_ENABLED "Build the D3D12 backend" ON WIN32 OFF)
+ 
+ # Windows-specific definitions
+ if(WIN32)
+@@ -67,7 +69,7 @@ if(APPLE)
+         plume_apple.mm
+         plume_apple.h
+     )
+-elseif(WIN32)
++elseif(PLUME_D3D12_ENABLED)
+     list(APPEND PLUME_SOURCES
+         plume_d3d12.cpp
+         plume_d3d12.h
+@@ -86,7 +88,7 @@ target_include_directories(plume PUBLIC
+     ${CMAKE_CURRENT_SOURCE_DIR}/contrib/VulkanMemoryAllocator/include
+ )
+ 
+-if(WIN32)
++if(PLUME_D3D12_ENABLED)
+     target_include_directories(plume PUBLIC
+         ${CMAKE_CURRENT_SOURCE_DIR}/contrib/D3D12MemoryAllocator/include
+     )
+diff --git a/plume_vulkan.cpp b/plume_vulkan.cpp
+index 11abda8..f212df1 100644
+--- a/plume_vulkan.cpp
++++ b/plume_vulkan.cpp
+@@ -3250,6 +3250,29 @@ namespace plume {
+             imageCopy.imageExtent.depth = srcLocation.placedFootprint.depth;
+             vkCmdCopyBufferToImage(vk, srcBuffer->vk, dstTexture->vk, toImageLayout(dstTexture->textureLayout), 1, &imageCopy);
+         }
++        else if ((dstLocation.type == RenderTextureCopyType::PLACED_FOOTPRINT) && (srcLocation.type == RenderTextureCopyType::SUBRESOURCE)) {
++            // Texture to buffer (readbacks): the footprint describes the buffer side.
++            assert(dstBuffer != nullptr);
++            assert(srcTexture != nullptr);
++            const uint32_t blockWidth = RenderFormatBlockWidth(srcTexture->desc.format);
++            VkBufferImageCopy imageCopy = {};
++            imageCopy.bufferOffset = dstLocation.placedFootprint.offset;
++            imageCopy.bufferRowLength = ((dstLocation.placedFootprint.rowWidth + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.bufferImageHeight = ((dstLocation.placedFootprint.height + blockWidth - 1) / blockWidth) * blockWidth;
++            imageCopy.imageSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);
++            imageCopy.imageSubresource.baseArrayLayer = srcLocation.subresource.arrayIndex;
++            imageCopy.imageSubresource.layerCount = 1;
++            imageCopy.imageSubresource.mipLevel = srcLocation.subresource.mipLevel;
++            if (srcBox != nullptr) {
++                imageCopy.imageOffset.x = srcBox->left;
++                imageCopy.imageOffset.y = srcBox->top;
++                imageCopy.imageOffset.z = srcBox->front;
++            }
++            imageCopy.imageExtent.width = dstLocation.placedFootprint.width;
++            imageCopy.imageExtent.height = dstLocation.placedFootprint.height;
++            imageCopy.imageExtent.depth = dstLocation.placedFootprint.depth;
++            vkCmdCopyImageToBuffer(vk, srcTexture->vk, toImageLayout(srcTexture->textureLayout), dstBuffer->vk, 1, &imageCopy);
++        }
+         else {
+             VkImageCopy imageCopy = {};
+             imageCopy.srcSubresource.aspectMask = toAspectFlags(srcTexture->desc.format, srcTexture->desc.flags);

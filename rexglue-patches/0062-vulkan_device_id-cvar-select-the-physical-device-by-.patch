@@ -1,7 +1,7 @@
 From 43f7a473eb65fdc88097de9a82c9b10ef4c90d14 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 14:28:54 -0700
-Subject: [PATCH 62/97] vulkan_device_id cvar: select the physical device by
+Subject: [PATCH 062/149] vulkan_device_id cvar: select the physical device by
  vendor:device ID (index order differs between processes on hybrid laptops);
  device list logs type + ID
 
@@ -13,7 +13,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 81 insertions(+), 8 deletions(-)
 
 diff --git a/src/ui/vulkan/vulkan_provider.cpp b/src/ui/vulkan/vulkan_provider.cpp
-index 191adb6..423e100 100644
+index 191adb6e..423e100f 100644
 --- a/src/ui/vulkan/vulkan_provider.cpp
 +++ b/src/ui/vulkan/vulkan_provider.cpp
 @@ -10,6 +10,8 @@

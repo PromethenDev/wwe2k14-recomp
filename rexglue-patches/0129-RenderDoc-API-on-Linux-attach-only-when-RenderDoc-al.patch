@@ -1,0 +1,46 @@
+From 1a8340074bb36a2720805b38098e1b38ea40c52f Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Tue, 27 Oct 2026 14:31:01 -0700
+Subject: [PATCH 129/149] RenderDoc API on Linux: attach only when RenderDoc
+ already injected (RTLD_NOLOAD), never load an installed librenderdoc.so
+ (GitHub #33 'Capturing Vulkan' overlay)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/ui/renderdoc_api.cpp | 13 +++++++++++++
+ 1 file changed, 13 insertions(+)
+
+diff --git a/src/ui/renderdoc_api.cpp b/src/ui/renderdoc_api.cpp
+index ce81e1b9..05c8b8ee 100644
+--- a/src/ui/renderdoc_api.cpp
++++ b/src/ui/renderdoc_api.cpp
+@@ -12,6 +12,10 @@
+ #include <rex/logging.h>
+ #include <rex/ui/renderdoc_api.h>
+ 
++#if defined(__linux__) && !defined(__ANDROID__)
++#include <dlfcn.h>
++#endif
++
+ namespace rex {
+ namespace ui {
+ 
+@@ -23,6 +27,15 @@ std::unique_ptr<RenderDocAPI> RenderDocAPI::CreateIfConnected() {
+   // Try to load the RenderDoc library. If RenderDoc is attached, the library
+   // should already be loaded into the process and this will increment the
+   // reference count. If not attached, the load will fail and we return nullptr.
++#if defined(__linux__) && !defined(__ANDROID__)
++  // A plain dlopen would load an installed librenderdoc.so into the game (SteamOS players saw RenderDoc's
++  // "Capturing Vulkan" overlay, GitHub #33); RTLD_NOLOAD only finds it when RenderDoc already injected it.
++  if (void* attached = dlopen(platform::lib_names::kRenderDoc, RTLD_LAZY | RTLD_NOLOAD)) {
++    dlclose(attached);
++  } else {
++    return nullptr;
++  }
++#endif
+   if (!renderdoc_api->library_.Load(platform::lib_names::kRenderDoc)) {
+     return nullptr;
+   }
+-- 
+2.43.0
+

@@ -1,0 +1,151 @@
+From d49e207363680495b892c0ba54d9c28aafbada42 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 1 Nov 2026 11:19:33 -0800
+Subject: [PATCH 134/149] diagnostics (card S5-2 CAW-match hang): x64 unwind
+ for Windows freeze-report thread stacks + exe_base line; [itrace] per-thread
+ import log armed by CustomSuperStar content create
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/system/kernel_state.h | 26 ++++++++++++++++--
+ src/core/freeze_logger.cpp        | 44 ++++++++++++++++++++-----------
+ src/kernel/xam/xam_content.cpp    |  7 +++++
+ 3 files changed, 60 insertions(+), 17 deletions(-)
+
+diff --git a/include/rex/system/kernel_state.h b/include/rex/system/kernel_state.h
+index 792976ea..d87e0240 100644
+--- a/include/rex/system/kernel_state.h
++++ b/include/rex/system/kernel_state.h
+@@ -47,9 +47,31 @@
+ //   REXKRNL_IMPORT_RESULT("NtCreateFile", "{:#x}", result);
+ //   REXKRNL_IMPORT_FAIL("NtCreateFile", "path='{}' -> {:#x}", path, result);
+ 
+-#define REXKRNL_IMPORT_TRACE(name, fmt, ...) REXKRNL_TRACE("[" name "] " fmt, ##__VA_ARGS__)
++// Card S5-2 (CAW-match endless load): a guest thread armed by xeXamContentCreate (CustomSuperStar content) logs its
++// next import traces at INFO with an [itrace] tag, so one save-worker thread can be followed without trace level.
++namespace rex::system {
++inline thread_local int t_import_trace_budget = 0;
++}  // namespace rex::system
+ 
+-#define REXKRNL_IMPORT_RESULT(name, fmt, ...) REXKRNL_TRACE("[" name "] -> " fmt, ##__VA_ARGS__)
++#define REXKRNL_IMPORT_TRACE(name, fmt, ...)                                \
++  do {                                                                      \
++    if (::rex::system::t_import_trace_budget > 0) {                         \
++      --::rex::system::t_import_trace_budget;                               \
++      REXKRNL_INFO("[itrace] [" name "] " fmt, ##__VA_ARGS__);              \
++    } else {                                                                \
++      REXKRNL_TRACE("[" name "] " fmt, ##__VA_ARGS__);                      \
++    }                                                                       \
++  } while (0)
++
++#define REXKRNL_IMPORT_RESULT(name, fmt, ...)                               \
++  do {                                                                      \
++    if (::rex::system::t_import_trace_budget > 0) {                         \
++      --::rex::system::t_import_trace_budget;                               \
++      REXKRNL_INFO("[itrace] [" name "] -> " fmt, ##__VA_ARGS__);           \
++    } else {                                                                \
++      REXKRNL_TRACE("[" name "] -> " fmt, ##__VA_ARGS__);                   \
++    }                                                                       \
++  } while (0)
+ 
+ #define REXKRNL_IMPORT_FAIL(name, fmt, ...) REXKRNL_WARN("[" name "] FAILED: " fmt, ##__VA_ARGS__)
+ 
+diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
+index c9e231a8..42e7a464 100644
+--- a/src/core/freeze_logger.cpp
++++ b/src/core/freeze_logger.cpp
+@@ -56,7 +56,7 @@ namespace {
+ 
+ constexpr uint32_t kRingSize = 4096;
+ constexpr int kMaxThreads = 64;
+-constexpr uint32_t kMaxCaptureDepth = 24;
++constexpr uint32_t kMaxCaptureDepth = 40;
+ constexpr int kFreezeGapSeconds = 10;
+ // R9: per-thread CPU classification and multi-sample spin PC capture.
+ constexpr int kMaxSpinSamples = 20;
+@@ -429,7 +429,7 @@ void RequestCapture(ThreadSlot* slot) {
+   if (!handle) return;
+   if (SuspendThread(handle) != static_cast<DWORD>(-1)) {
+     CONTEXT context{};
+-    context.ContextFlags = CONTEXT_CONTROL | CONTEXT_INTEGER;
++    context.ContextFlags = CONTEXT_FULL;
+     if (GetThreadContext(handle, &context)) {
+       if (g_spin_sampling.load(std::memory_order_relaxed)) {
+         const uint32_t sample = slot->spin_count.fetch_add(1, std::memory_order_relaxed);
+@@ -438,21 +438,30 @@ void RequestCapture(ThreadSlot* slot) {
+         }
+       }
+       slot->cap_pc[0].store(context.Rip, std::memory_order_relaxed);
++      // Card S5-2: unwind with the x64 unwind tables (the old RBP chain stopped after one frame in optimized code,
++      // so a thread stuck inside the runtime showed only the ntdll wait). A function without an entry is a leaf:
++      // its return address is at [rsp].
+       uint32_t depth = 1;
+-      uint64_t rbp = context.Rbp;
+-      while (depth < kMaxCaptureDepth && rbp) {
+-        MEMORY_BASIC_INFORMATION info{};
+-        if (VirtualQuery(reinterpret_cast<void*>(rbp), &info, sizeof(info)) == 0 ||
+-            info.State != MEM_COMMIT || (info.Protect & PAGE_NOACCESS)) {
+-          break;
++      CONTEXT unwind = context;
++      while (depth < kMaxCaptureDepth) {
++        DWORD64 image_base = 0;
++        PRUNTIME_FUNCTION entry = RtlLookupFunctionEntry(unwind.Rip, &image_base, nullptr);
++        if (entry) {
++          void* handler_data = nullptr;
++          DWORD64 establisher = 0;
++          RtlVirtualUnwind(UNW_FLAG_NHANDLER, image_base, unwind.Rip, entry, &unwind, &handler_data,
++                           &establisher, nullptr);
++        } else {
++          MEMORY_BASIC_INFORMATION info{};
++          if (VirtualQuery(reinterpret_cast<void*>(unwind.Rsp), &info, sizeof(info)) == 0 ||
++              info.State != MEM_COMMIT || (info.Protect & PAGE_NOACCESS)) {
++            break;
++          }
++          unwind.Rip = *reinterpret_cast<DWORD64*>(unwind.Rsp);
++          unwind.Rsp += 8;
+         }
+-        uint64_t* frame = reinterpret_cast<uint64_t*>(rbp);
+-        const uint64_t next = frame[0];
+-        const uint64_t ret = frame[1];
+-        if (ret == 0) break;
+-        slot->cap_pc[depth++].store(ret, std::memory_order_relaxed);
+-        if (next <= rbp) break;
+-        rbp = next;
++        if (unwind.Rip == 0) break;
++        slot->cap_pc[depth++].store(unwind.Rip, std::memory_order_relaxed);
+       }
+       slot->cap_depth.store(depth, std::memory_order_release);
+     }
+@@ -620,6 +629,11 @@ void GenerateReport(uint64_t now_ns, uint64_t last_present_ns) {
+                (unsigned long long)g_vdswap_count.load(std::memory_order_relaxed), vdswap_gap_s);
+   std::fprintf(file, "sync_events_recorded=%llu\n",
+                (unsigned long long)g_event_count.load(std::memory_order_relaxed));
++#if defined(_WIN32)
++  // Card S5-2: image base, so host PCs in this report can be symbolized offline (publics table rva = pc - base).
++  std::fprintf(file, "exe_base=0x%llx\n",
++               (unsigned long long)reinterpret_cast<uintptr_t>(GetModuleHandleW(nullptr)));
++#endif
+ 
+   std::fprintf(file, "\n=== guest threads (%d slots) ===\n", kMaxThreads);
+   for (int i = 0; i < kMaxThreads; ++i) {
+diff --git a/src/kernel/xam/xam_content.cpp b/src/kernel/xam/xam_content.cpp
+index 47378e43..83538908 100644
+--- a/src/kernel/xam/xam_content.cpp
++++ b/src/kernel/xam/xam_content.cpp
+@@ -151,6 +151,13 @@ ppc_u32_result_t xeXamContentCreate(const char* api_name, ppc_u32_t user_index,
+ 
+   auto content_manager = REX_KERNEL_STATE()->content_manager();
+ 
++  // Card S5-2: follow the save worker after it opens a created superstar (CAW-match endless load).
++  if (content_data.file_name().find("CustomSuperStar") != std::string::npos) {
++    rex::system::t_import_trace_budget = 4000;
++    REXKRNL_INFO("[itrace] armed on this thread by {} {} overlapped={:#x}", api_name, content_data.file_name(),
++                 overlapped_ptr.guest_address());
++  }
++
+   if (overlapped_ptr && disposition_ptr) {
+     *disposition_ptr = 0;
+   }
+-- 
+2.43.0
+

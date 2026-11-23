@@ -1,0 +1,25 @@
+[package]
+name = "nihav_codec_support"
+version = "0.1.0"
+authors = ["Kostya Shishkov <kostya.shishkov@gmail.com>"]
+edition = "2018"
+
+[dependencies.nihav_core]
+path = "../nihav-core"
+
+[features]
+default = []
+
+blockdsp = []
+jpeg = []
+h263 = ["blockdsp"]
+qt_pal = []
+
+dsp = []
+dct = ["dsp"]
+fft = ["dsp"]
+lpc = ["dsp"]
+mdct = ["fft", "dsp"]
+qmf = ["dsp"]
+dsp_window = ["dsp"]
+vq = []

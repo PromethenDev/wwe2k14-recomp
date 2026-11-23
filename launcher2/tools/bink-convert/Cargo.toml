@@ -1,0 +1,20 @@
+[package]
+name = "wwe2k14-bink-convert"
+version = "1.0.0"
+edition = "2021"
+license = "AGPL-3.0-only"
+description = "Convert WWE '13 KB2d titantrons to WWE 2K14-compatible BIKi movies"
+
+[dependencies]
+nihav_core = { path = "vendor/nihav/nihav-core" }
+nihav_codec_support = { path = "vendor/nihav/nihav-codec-support" }
+nihav_rad = { path = "vendor/nihav/nihav-rad", default-features = false, features = [
+    "demuxer_bink", "decoder_bink2"
+] }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = true
+

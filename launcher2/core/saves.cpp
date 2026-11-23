@@ -2,6 +2,7 @@
 
 #include "internal/archive.h"
 #include "internal/util.h"
+#include "update.h"
 
 #include <algorithm>
 #include <chrono>
@@ -22,6 +23,7 @@ namespace {
 constexpr std::string_view kAccountId = "B13EBABEBABEBABE";
 constexpr std::string_view kTitleId = "545408B2";
 constexpr std::string_view kSaveFile = "SaveData.Dat";
+constexpr std::string_view kLastPlayMarker = ".wwe2k14-last-play";
 
 std::string Lower(std::string value) {
   std::transform(value.begin(), value.end(), value.begin(), [](unsigned char ch) {
@@ -150,12 +152,72 @@ std::optional<std::string> NormalizeArchiveName(std::string name) {
 }
 
 bool IsAutoBackup(const fs::path& path) {
-  return Lower(internal::PathToUtf8(path.filename())).ends_with("-auto.zip");
+  const std::string name = Lower(internal::PathToUtf8(path.filename()));
+  return name.ends_with("-auto.zip") && !name.starts_with("wwe2k14-saves-import-");  // an import keeps the name it came with
+}
+
+fs::path BackupTagMarkerPath(const fs::path& backup) {
+  fs::path marker = backup;
+  marker += ".tag";
+  return marker;
+}
+
+std::optional<bool> ReadSaveTag(const fs::path& path) {
+  std::string contents;
+  if (!internal::ReadTextFile(path, contents)) return std::nullopt;
+  if (contents == "MODDED\n") return true;
+  if (contents == "NORMAL\n") return false;
+  return std::nullopt;
+}
+
+Result WriteSaveTag(const fs::path& path, std::optional<bool> modded) {
+  std::error_code error;
+  if (!modded) {
+    fs::remove(path, error);
+    return error ? Result::Fail("The save tag could not be updated.") : Result::Ok();
+  }
+  fs::path temporary = path;
+  temporary += ".tmp";
+  const std::string_view contents = *modded ? "MODDED\n" : "NORMAL\n";
+  if (!internal::WriteBinaryFile(temporary, contents.data(), contents.size())) {
+    fs::remove(temporary, error);
+    return Result::Fail("The save tag could not be saved.");
+  }
+  fs::rename(temporary, path, error);
+  if (error) {
+    error.clear();
+    fs::remove(path, error);  // Windows rename does not replace an existing marker.
+    if (!error) {
+      fs::rename(temporary, path, error);
+    }
+  }
+  if (!error) return Result::Ok();
+  fs::remove(temporary, error);
+  return Result::Fail("The save tag could not be saved.");
+}
+
+std::optional<bool> LastPlayModded(const Paths& paths) {
+  return ReadSaveTag(paths.userdata_dir / std::string(kLastPlayMarker));
 }
 
 }  // namespace
 
+bool SaveOperationsAllowed(bool game_process_running) noexcept {
+  return !game_process_running;
+}
+
+std::vector<BackupInfo> ListBackupsImpl(const Paths& paths);
+
 std::vector<BackupInfo> ListBackups(const Paths& paths) {
+  std::vector<BackupInfo> backups;
+  try {
+    return ListBackupsImpl(paths);
+  } catch (...) {
+    return backups;  // never throws: callers refresh the list after a committed change
+  }
+}
+
+std::vector<BackupInfo> ListBackupsImpl(const Paths& paths) {
   std::vector<BackupInfo> backups;
   std::error_code error;
   fs::directory_iterator iterator(paths.backups_dir, fs::directory_options::skip_permission_denied, error);
@@ -173,6 +235,10 @@ std::vector<BackupInfo> ListBackups(const Paths& paths) {
     info.bytes = entry.file_size(error);
     if (error) info.bytes = 0;
     info.automatic = IsAutoBackup(entry.path());
+    if (const auto tag = ReadSaveTag(BackupTagMarkerPath(entry.path()))) {
+      info.tag_known = true;
+      info.modded = *tag;
+    }
     backups.push_back(std::move(info));
   }
   std::sort(backups.begin(), backups.end(), [](const BackupInfo& left, const BackupInfo& right) {
@@ -186,6 +252,9 @@ std::vector<BackupInfo> ListBackups(const Paths& paths) {
 }
 
 Result BackupSaves(const Paths& paths, bool automatic, BackupInfo* created) {
+  if (!SaveOperationsAllowed(GameProcessRunning(paths))) {
+    return Result::Fail(kGameRunningBackupMessage);
+  }
   try {
     const fs::path account = paths.userdata_dir / std::string(kAccountId);
     if (!HasAnyFiles(account) && !fs::is_regular_file(paths.settings_file)) {
@@ -201,11 +270,20 @@ Result BackupSaves(const Paths& paths, bool automatic, BackupInfo* created) {
       fs::remove(destination, error);
       return Result::Fail("The launcher could not create a save backup.");
     }
+    const std::optional<bool> modded = LastPlayModded(paths);
+    const Result marker = WriteSaveTag(BackupTagMarkerPath(destination), modded);
+    if (!marker.ok) {
+      std::error_code error;
+      fs::remove(destination, error);
+      return Result::Fail("The launcher could not save the backup tag.");
+    }
     if (created) {
       created->file = destination;
       created->when = internal::LocalTimestamp(std::chrono::system_clock::now(), "%Y-%m-%dT%H:%M:%S");
       created->bytes = fs::file_size(destination);
       created->automatic = automatic;
+      created->tag_known = modded.has_value();
+      created->modded = modded.value_or(false);
     }
     if (automatic) {
       std::vector<BackupInfo> automatic_backups;
@@ -213,6 +291,8 @@ Result BackupSaves(const Paths& paths, bool automatic, BackupInfo* created) {
       for (size_t index = 5; index < automatic_backups.size(); ++index) {
         std::error_code error;
         fs::remove(automatic_backups[index].file, error);
+        error.clear();
+        fs::remove(BackupTagMarkerPath(automatic_backups[index].file), error);
       }
     }
     return Result::Ok();
@@ -221,7 +301,17 @@ Result BackupSaves(const Paths& paths, bool automatic, BackupInfo* created) {
   }
 }
 
+Result MarkLastPlayModded(const Paths& paths, bool modded) {
+  if (!internal::EnsureDirectory(paths.userdata_dir)) {
+    return Result::Fail("The save tag could not be saved.");
+  }
+  return WriteSaveTag(paths.userdata_dir / std::string(kLastPlayMarker), modded);
+}
+
 Result RestoreBackup(const Paths& paths, const fs::path& backup_zip) {
+  if (!SaveOperationsAllowed(GameProcessRunning(paths))) {
+    return Result::Fail(kGameRunningRestoreMessage);
+  }
   try {
     internal::ZipReader zip;
     if (!zip.Open(backup_zip)) return Result::Fail(zip.error());
@@ -300,6 +390,8 @@ Result RestoreBackup(const Paths& paths, const fs::path& backup_zip) {
     if (ini_data && !internal::WriteBinaryFile(paths.settings_file, *ini_data)) {
       return Result::Fail("The saved game was restored, but launcher settings could not be restored.");
     }
+    // The save in place is now this backup's: the next backup is tagged as this one was, or left untagged if unknown.
+    (void)WriteSaveTag(paths.userdata_dir / std::string(kLastPlayMarker), ReadSaveTag(BackupTagMarkerPath(backup_zip)));
     return Result::Ok();
   } catch (...) {
     return Result::Fail("The launcher could not restore this save backup.");

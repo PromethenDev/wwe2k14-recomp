@@ -1,7 +1,7 @@
 From 2b6f64160e1071b71a8541d7b9cad213ae99c2f1 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Thu, 24 Sep 2026 15:19:05 -0700
-Subject: [PATCH 23/97] diagnostics: steady_ns on [rate-census]; WAIT_REG_MEM
+Subject: [PATCH 023/149] diagnostics: steady_ns on [rate-census]; WAIT_REG_MEM
  poll-iteration census
 
 [rate-census] lines carry steady_ns (steady_clock) so profiler samples can be
@@ -20,7 +20,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  3 files changed, 110 insertions(+), 35 deletions(-)
 
 diff --git a/include/rex/diagnostics/rate_census.h b/include/rex/diagnostics/rate_census.h
-index ffde2f5..250f2eb 100644
+index ffde2f5f..250f2eb1 100644
 --- a/include/rex/diagnostics/rate_census.h
 +++ b/include/rex/diagnostics/rate_census.h
 @@ -71,8 +71,11 @@ uint64_t NowNs();
@@ -38,7 +38,7 @@ index ffde2f5..250f2eb 100644
  // census is on): owner is the host tid holding the lock (0 if unknown).
  // OnGlobalLockContended may send SIGPROF to the owner (WWE13_LOCK_OWNER_SAMPLE=1,
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index 3caab3e..9563ff0 100644
+index 3caab3e3..9563ff04 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -63,6 +63,12 @@ struct WaitTarget {
@@ -232,7 +232,7 @@ index 3caab3e..9563ff0 100644
  
  }  // namespace rex::diagnostics::rate_census
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 0b3d722..59d12fc 100644
+index 0b3d722d..59d12fc5 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -1152,16 +1152,24 @@ bool CommandProcessor::ExecutePacketType3_WAIT_REG_MEM(memory::RingBuffer* reade

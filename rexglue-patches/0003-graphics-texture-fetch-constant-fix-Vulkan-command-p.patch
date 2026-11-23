@@ -1,7 +1,7 @@
 From 1c256349a86fe319218bf8a0b845cc8a8ba76cb4 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 12:48:59 -0700
-Subject: [PATCH 03/97] graphics: texture fetch-constant fix, Vulkan command
+Subject: [PATCH 003/149] graphics: texture fetch-constant fix, Vulkan command
  processor, content probe
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 src/graphics/util/content_probe.cpp
 
 diff --git a/include/rex/graphics/command_processor.h b/include/rex/graphics/command_processor.h
-index 6998a45..d3402fb 100644
+index 6998a459..d3402fb5 100644
 --- a/include/rex/graphics/command_processor.h
 +++ b/include/rex/graphics/command_processor.h
 @@ -24,6 +24,7 @@
@@ -71,7 +71,7 @@ index 6998a45..d3402fb 100644
    uint32_t primary_buffer_size_ = 0;
  
 diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
-index e0679b8..6a9a12b 100644
+index e0679b8f..6a9a12bf 100644
 --- a/include/rex/graphics/flags.h
 +++ b/include/rex/graphics/flags.h
 @@ -50,6 +50,7 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
@@ -84,7 +84,7 @@ index e0679b8..6a9a12b 100644
  REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
 diff --git a/include/rex/graphics/util/content_probe.h b/include/rex/graphics/util/content_probe.h
 new file mode 100644
-index 0000000..d2004c6
+index 00000000..d2004c61
 --- /dev/null
 +++ b/include/rex/graphics/util/content_probe.h
 @@ -0,0 +1,280 @@
@@ -369,7 +369,7 @@ index 0000000..d2004c6
 +
 +}  // namespace rex::graphics::content_probe
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index 4b76791..5169d14 100644
+index 4b76791f..5169d140 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -26,6 +26,7 @@
@@ -446,7 +446,7 @@ index 4b76791..5169d14 100644
  
  }  // namespace rex::graphics::vulkan
 diff --git a/src/graphics/CMakeLists.txt b/src/graphics/CMakeLists.txt
-index 8f4f218..a977ca5 100644
+index 8f4f2184..a977ca5d 100644
 --- a/src/graphics/CMakeLists.txt
 +++ b/src/graphics/CMakeLists.txt
 @@ -4,6 +4,7 @@
@@ -458,7 +458,7 @@ index 8f4f218..a977ca5 100644
      pipeline/texture/info.cpp
      pipeline/texture/info_formats.cpp
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 60efcd3..55666da 100644
+index 60efcd3a..55666da2 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -427,6 +427,17 @@ void CommandProcessor::WriteRegister(uint32_t index, uint32_t value) {
@@ -499,7 +499,7 @@ index 60efcd3..55666da 100644
        result = ExecutePacketType3_SET_CONSTANT(reader, packet, count);
        break;
 diff --git a/src/graphics/flags.cpp b/src/graphics/flags.cpp
-index e2983a4..6c33960 100644
+index e2983a4e..6c339603 100644
 --- a/src/graphics/flags.cpp
 +++ b/src/graphics/flags.cpp
 @@ -15,6 +15,8 @@
@@ -512,7 +512,7 @@ index e2983a4..6c33960 100644
  REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
  REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
 diff --git a/src/graphics/pipeline/texture/cache.cpp b/src/graphics/pipeline/texture/cache.cpp
-index bef2db1..7e21439 100644
+index bef2db15..7e214390 100644
 --- a/src/graphics/pipeline/texture/cache.cpp
 +++ b/src/graphics/pipeline/texture/cache.cpp
 @@ -10,6 +10,7 @@
@@ -624,7 +624,7 @@ index bef2db1..7e21439 100644
            "has \"invalid\" type! This is incorrect behavior, but you can try "
 diff --git a/src/graphics/util/content_probe.cpp b/src/graphics/util/content_probe.cpp
 new file mode 100644
-index 0000000..05a8d2f
+index 00000000..05a8d2f9
 --- /dev/null
 +++ b/src/graphics/util/content_probe.cpp
 @@ -0,0 +1,217 @@
@@ -846,7 +846,7 @@ index 0000000..05a8d2f
 +
 +}  // namespace rex::graphics::content_probe
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index a40436e..f282e3d 100644
+index a40436e9..f282e3d0 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -11,6 +11,7 @@
@@ -1258,7 +1258,7 @@ index a40436e..f282e3d 100644
  #if XE_GPU_FINE_GRAINED_DRAW_SCOPES
    SCOPE_profile_cpu_f("gpu");
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 05d1e5c..26ec054 100644
+index 05d1e5c1..26ec0542 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -1495,6 +1495,13 @@ bool VulkanRenderTargetCache::Resolve(const memory::Memory& memory,
@@ -1286,7 +1286,7 @@ index 05d1e5c..26ec054 100644
      cleared = true;
    }
 diff --git a/src/ui/vulkan/vulkan_util.cpp b/src/ui/vulkan/vulkan_util.cpp
-index 2106800..a93dcd7 100644
+index 21068005..a93dcd7f 100644
 --- a/src/ui/vulkan/vulkan_util.cpp
 +++ b/src/ui/vulkan/vulkan_util.cpp
 @@ -9,9 +9,13 @@

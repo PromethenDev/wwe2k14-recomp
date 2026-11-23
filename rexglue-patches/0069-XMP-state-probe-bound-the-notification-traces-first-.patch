@@ -1,7 +1,7 @@
 From 6bcefbdef95f33950b22233250179e04edac737f Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 29 Sep 2026 17:56:50 -0700
-Subject: [PATCH 69/97] XMP state probe: bound the notification traces (first
+Subject: [PATCH 069/149] XMP state probe: bound the notification traces (first
  64, then 1 in 100) - reviewer finding
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
@@ -10,7 +10,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 16 insertions(+), 5 deletions(-)
 
 diff --git a/src/kernel/xam/apps/xmp_app.cpp b/src/kernel/xam/apps/xmp_app.cpp
-index 87514b0..a276d42 100644
+index 87514b03..a276d42f 100644
 --- a/src/kernel/xam/apps/xmp_app.cpp
 +++ b/src/kernel/xam/apps/xmp_app.cpp
 @@ -61,6 +61,17 @@ bool XmpStateProbeEnabled() {

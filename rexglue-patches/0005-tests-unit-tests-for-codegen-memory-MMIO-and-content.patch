@@ -1,8 +1,8 @@
 From 85c972faa72b95962496e246cfc4f32409eb2ef2 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 12:48:59 -0700
-Subject: [PATCH 05/97] tests: unit tests for codegen, memory, MMIO and content
- probe
+Subject: [PATCH 005/149] tests: unit tests for codegen, memory, MMIO and
+ content probe
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  create mode 100644 tests/unit/system/mmio_handler_test.cpp
 
 diff --git a/tests/unit/CMakeLists.txt b/tests/unit/CMakeLists.txt
-index 940052f..1ec8d08 100644
+index 940052f3..1ec8d08f 100644
 --- a/tests/unit/CMakeLists.txt
 +++ b/tests/unit/CMakeLists.txt
 @@ -2,6 +2,8 @@
@@ -68,7 +68,7 @@ index 940052f..1ec8d08 100644
  
 diff --git a/tests/unit/codegen/jump_table_bias_test.cpp b/tests/unit/codegen/jump_table_bias_test.cpp
 new file mode 100644
-index 0000000..cae32e3
+index 00000000..cae32e35
 --- /dev/null
 +++ b/tests/unit/codegen/jump_table_bias_test.cpp
 @@ -0,0 +1,641 @@
@@ -715,7 +715,7 @@ index 0000000..cae32e3
 +}
 diff --git a/tests/unit/core/content_probe_test.cpp b/tests/unit/core/content_probe_test.cpp
 new file mode 100644
-index 0000000..79605f1
+index 00000000..79605f1f
 --- /dev/null
 +++ b/tests/unit/core/content_probe_test.cpp
 @@ -0,0 +1,778 @@
@@ -1499,7 +1499,7 @@ index 0000000..79605f1
 +
 diff --git a/tests/unit/memory/access_violation_recovery_test.cpp b/tests/unit/memory/access_violation_recovery_test.cpp
 new file mode 100644
-index 0000000..17993be
+index 00000000..17993bea
 --- /dev/null
 +++ b/tests/unit/memory/access_violation_recovery_test.cpp
 @@ -0,0 +1,326 @@
@@ -1830,7 +1830,7 @@ index 0000000..17993be
 +  CHECK_FALSE(InvokeAccessViolationCallback(memory, page.host_address, /*is_write=*/false));
 +}
 diff --git a/tests/unit/memory/heap_allocation_test.cpp b/tests/unit/memory/heap_allocation_test.cpp
-index 7a83256..0780031 100644
+index 7a832562..07800317 100644
 --- a/tests/unit/memory/heap_allocation_test.cpp
 +++ b/tests/unit/memory/heap_allocation_test.cpp
 @@ -11,31 +11,12 @@
@@ -1870,7 +1870,7 @@ index 7a83256..0780031 100644
  // Size and Alignment Rounding Tests
 diff --git a/tests/unit/memory/test_memory.h b/tests/unit/memory/test_memory.h
 new file mode 100644
-index 0000000..431b475
+index 00000000..431b4757
 --- /dev/null
 +++ b/tests/unit/memory/test_memory.h
 @@ -0,0 +1,43 @@
@@ -1919,7 +1919,7 @@ index 0000000..431b475
 +}  // namespace rex::test
 diff --git a/tests/unit/system/mmio_handler_test.cpp b/tests/unit/system/mmio_handler_test.cpp
 new file mode 100644
-index 0000000..8eb13a8
+index 00000000..8eb13a83
 --- /dev/null
 +++ b/tests/unit/system/mmio_handler_test.cpp
 @@ -0,0 +1,630 @@

@@ -1,5 +1,51 @@
 # Changelog
 
+## v1.7.0 - 2026-11-23
+
+- **New renderer (Windows):** the WWE '13 v1.6 native renderer by iMrBurn (GPL-3.0) now draws the game: smoother and much
+  faster to start (Intel UHD 630, 720p match: about 42 -> 58 fps; first picture in a few seconds instead of about 40;
+  AMD Radeon 780M: same 60 / 30 fps with about half the stutters).
+- **Renderer choice:** Vulkan (recommended), DirectX 12, DirectX 11 or Xbox. Old settings start on Vulkan.
+- **New Settings page:** one row per setting with arrows, plus a help box for the highlighted row.
+- **Graphics card choice** now applies to the new renderer too.
+- **Fixed:** imported WWE '13 arenas with DLC packs stayed on the title screen (GitHub #171, #175, #176).
+- **Fixed:** the Mods page showed "Nothing imported yet" after a WWE 2K15 import (GitHub #178).
+- **WWE 2K15 titantrons** convert with the right colours (GitHub #155).
+- **Crash reports** now name the reason for crashes that used to leave no log (GitHub #174, #177, #179).
+- **Linux** keeps the previous native renderer.
+
+## v1.6.1 - 2026-11-17
+
+- **Imported wrestlers in the main select grid (new):** your WWE '13 and WWE 2K15 imports now appear in the main
+  Superstars and Divas grids with their own faces, so you no longer have to open Downloaded Superstars. They fill the
+  free places first; press **Down** past the bottom row for the next page of imports and **Up** past the top row to go
+  back. Every row can be reached with Up and Down. Turn it off in **Mods > Gameplay** if you prefer the old way.
+- **Faces for wrestlers you imported before:** when you press Play, the launcher adds a select-screen face for every
+  imported wrestler that has none. No need to import again; the first Play after updating takes a few seconds longer.
+- **Unlock everything (new):** **Mods > Gameplay > Unlock everything** opens every Unlockable and every 30 Years of
+  WrestleMania era and match. Your save keeps what is unlocked, so a save backup is made first (GitHub #109).
+- **Import in any order:** you can import from WWE '13 while WWE 2K15 wrestlers are imported; the launcher takes the
+  WWE 2K15 wrestlers out and puts them back by itself.
+- **WWE 2K15 wrestlers** bring their own entrance themes, and the ring announcer says their names.
+- **Capes and long coats** of imported WWE '13 wrestlers (Ministry Undertaker, Undertaker '13) now hang and swing instead
+  of floating.
+- **Fixed:** imported wrestlers sometimes came out to a stock WWE 2K14 theme instead of their own.
+- **Keyboard (new option):** keep keys bound to buttons working while you type names (GitHub #87).
+- **WWE '13 import into a folder changed by another copy of the launcher** now repairs that folder first, then imports
+  (GitHub #141).
+- **Mods page** has a tidier layout: **Wrestlers**, **Import** and **Gameplay** tabs, with one card per game for importing
+  and undoing.
+- **Linux: WWE '13 / WWE 2K15 imports** no longer show placeholder portraits or load matches endlessly (add-on files are now loaded in the right order).
+- **Moving to a new folder** now keeps your imported wrestlers instead of showing "Error Roster" (GitHub #132).
+- **Created-wrestler import** should accept more saves that it used to refuse (GitHub #115, #75): anything it doesn't recognise is left untouched, and a full backup is still made first. If yours is still refused, please send a bug report.
+- **Black outfits** (GitHub #105): a missing graphics helper file is now warned about.
+- **Select screen** can list more than 32 add-on wrestlers per pack.
+- **WWE 2K15 import:** all 74 WWE 2K15 wrestlers can be imported.
+- **WWE '13 imports** get their victory motions (GitHub #142) and more free row numbers (GitHub #141).
+- **Linux WWE '13 import** finds files in any letter case (GitHub #135).
+- **Add-ons installed twice** (in two userdata folders) are now loaded only once.
+- **Bug reports** include more information, and a stuck loading screen now saves a report.
+
 ## v1.6.0 - 2026-11-13
 
 - **WWE 2K15 import (new):** in **Mods**, click **Import from WWE 2K15**: the launcher searches this PC for your own WWE 2K15 (Xbox 360) disc image

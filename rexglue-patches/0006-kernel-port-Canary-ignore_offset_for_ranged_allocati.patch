@@ -1,7 +1,7 @@
 From 47d1b14ed553465f4307dac866263a696e6a0f31 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 13:44:22 -0700
-Subject: [PATCH 06/97] kernel: port Canary
+Subject: [PATCH 006/149] kernel: port Canary
  ignore_offset_for_ranged_allocations for WWE '13
 
 WWE '13 (545108B4) compares MmAllocatePhysicalMemoryEx results with
@@ -15,7 +15,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 11 insertions(+), 4 deletions(-)
 
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
-index 149093b..37f23ba 100644
+index 149093b7..37f23ba4 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_memory.cpp
 @@ -15,6 +15,7 @@

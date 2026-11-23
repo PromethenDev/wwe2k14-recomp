@@ -1,0 +1,590 @@
+From b3f24cbfb563eac46d223521cae20d8721c05387 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 31 Oct 2026 20:40:21 -0700
+Subject: [PATCH 132/149] nr: D3D12 shared device + external swap handoff for
+ the native renderer (card C3, owner OK 2026-10-31; cvar
+ nr_d3d12_shared_device default off)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/graphics/draw_observer.h     |  35 ++++++
+ include/rex/ui/d3d12/d3d12_api.h         |   2 +-
+ include/rex/ui/d3d12/d3d12_presenter.h   |  14 ++-
+ src/graphics/command_processor.cpp       |  52 +++++++++
+ src/graphics/d3d12/command_processor.cpp |  55 +++++++++-
+ src/ui/d3d12/d3d12_presenter.cpp         | 132 ++++++++++++++++++-----
+ src/ui/d3d12/d3d12_provider.cpp          |   7 ++
+ 7 files changed, 265 insertions(+), 32 deletions(-)
+
+diff --git a/include/rex/graphics/draw_observer.h b/include/rex/graphics/draw_observer.h
+index 00479468..d71f93b5 100644
+--- a/include/rex/graphics/draw_observer.h
++++ b/include/rex/graphics/draw_observer.h
+@@ -141,6 +141,41 @@ struct NrExternalSwap {
+   uint64_t external_cpu_fence_value = 0;
+ };
+ void SetNrExternalSwap(const NrExternalSwap& swap);
++// [wwe2k14 nr] card C3: D3D12 shared-device direct presentation. Opaque pointers keep D3D12 headers out of this
++// backend-neutral observer interface.
++struct NrD3D12Device {
++  void* device = nullptr;        // ID3D12Device*
++  void* direct_queue = nullptr;  // ID3D12CommandQueue*
++  void* dxgi_factory = nullptr;  // IDXGIFactory2*
++  uint32_t adapter_luid_low = 0;
++  int32_t adapter_luid_high = 0;
++  void* submission_fence = nullptr;  // ID3D12Fence*, signalled with the SDK submission number
++};
++// False unless the D3D12 command-processor context is up and nr_d3d12_shared_device is enabled. Returned pointers are
++// SDK-owned and valid until command-processor shutdown; a caller retaining one beyond the call must AddRef it.
++bool GetNrD3D12Device(NrD3D12Device* out);
++// The next D3D12 IssueSwap presents this resource in place of the guest frontbuffer; fetch constant 0 is not read.
++// Consume by calling on the GPU command-processor thread (DrawObserver::OnBeforeSwap). The resource must be a
++// one-mip, single-sample TEXTURE2D created on the device returned by GetNrD3D12Device. Once wait_fence reaches
++// wait_value (or the producer's earlier same-queue submission completes when wait_fence is null), it must be in a
++// state containing NON_PIXEL_SHADER_RESOURCE. The SDK samples it through an SRV and issues no barrier; it leaves
++// the state unchanged. The producer retains the resource until GetNrD3D12SwapCompletion reaches the value returned
++// after this swap (or until a later swap sampling another resource completes).
++struct NrD3D12ExternalSwap {
++  void* resource = nullptr;  // ID3D12Resource*
++  // Presented area. The swap samples by pixel index from (0, 0).
++  uint32_t width = 0, height = 0;
++  // Guest frontbuffer size; zero means width / height.
++  uint32_t width_unscaled = 0, height_unscaled = 0;
++  uint32_t srv_format = 0;         // DXGI_FORMAT; 0 = DXGI_FORMAT_R8G8B8A8_UNORM
++  uint32_t component_mapping = 0;  // D3D12 Shader4ComponentMapping; 0 = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING
++  void* wait_fence = nullptr;      // ID3D12Fence*, GPU-waited by the SDK's direct queue
++  uint64_t wait_value = 0;
++};
++// The SDK applies its guest 8-bit gamma table to this frontbuffer, as for k_8_8_8_8.
++void SetNrD3D12ExternalSwap(const NrD3D12ExternalSwap& swap);
++// Submission number of the latest SDK swap that sampled an external resource; 0 before the first such swap.
++uint64_t GetNrD3D12SwapCompletion();
+ // [wwe2k14 nr] card S3-44: called on the guest thread for every CP_RB_WPTR write (the guest kicked the ring past
+ // everything it wrote so far). Set before the title starts; null = off.
+ using NrWritePointerHook = void (*)(uint32_t value);
+diff --git a/include/rex/ui/d3d12/d3d12_api.h b/include/rex/ui/d3d12/d3d12_api.h
+index d0e72528..971e63aa 100644
+--- a/include/rex/ui/d3d12/d3d12_api.h
++++ b/include/rex/ui/d3d12/d3d12_api.h
+@@ -19,7 +19,7 @@
+ #define NOMINMAX
+ #endif
+ #include <windows.h>
+-#include <ObjBase.h>
++#include <objbase.h>
+ 
+ #include <DXProgrammableCapture.h>
+ #include <d3d12.h>
+diff --git a/include/rex/ui/d3d12/d3d12_presenter.h b/include/rex/ui/d3d12/d3d12_presenter.h
+index 83d09f7b..82eaf0a5 100644
+--- a/include/rex/ui/d3d12/d3d12_presenter.h
++++ b/include/rex/ui/d3d12/d3d12_presenter.h
+@@ -172,7 +172,7 @@ class D3D12Presenter final : public Presenter {
+     PaintContext(const PaintContext& paint_context) = delete;
+     PaintContext& operator=(const PaintContext& paint_context) = delete;
+ 
+-    static constexpr uint32_t kSwapChainBufferCount = 3;
++    static constexpr uint32_t kMaxSwapChainBufferCount = 3;
+ 
+     enum RTVIndex : UINT {
+       // Swap chain buffers - updated when creating the swap chain
+@@ -181,7 +181,7 @@ class D3D12Presenter final : public Presenter {
+ 
+       // Intermediate textures - the last usage is
+       // guest_output_intermediate_texture_paint_last_usage_.
+-      kRTVIndexGuestOutputIntermediate0 = kRTVIndexSwapChainBuffer0 + kSwapChainBufferCount,
++      kRTVIndexGuestOutputIntermediate0 = kRTVIndexSwapChainBuffer0 + kMaxSwapChainBufferCount,
+ 
+       kRTVCount = kRTVIndexGuestOutputIntermediate0 + kGuestOutputMailboxSize - 1,
+     };
+@@ -216,7 +216,7 @@ class D3D12Presenter final : public Presenter {
+     // Signaled after presenting.
+     D3D12SubmissionTracker present_submission_tracker;
+ 
+-    std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kSwapChainBufferCount>
++    std::array<Microsoft::WRL::ComPtr<ID3D12CommandAllocator>, kMaxSwapChainBufferCount>
+         command_allocators;
+     Microsoft::WRL::ComPtr<ID3D12GraphicsCommandList> command_list;
+ 
+@@ -250,9 +250,15 @@ class D3D12Presenter final : public Presenter {
+ 
+     uint32_t swap_chain_width = 0;
+     uint32_t swap_chain_height = 0;
++    uint32_t swap_chain_buffer_count = kMaxSwapChainBufferCount;
++    uint32_t swap_chain_frame_latency = 0;
+     bool swap_chain_allows_tearing = false;
++    bool creation_settings_latched = false;
++    bool creation_settings_logged = false;
++    UINT swap_chain_flags = 0;
++    HANDLE swap_chain_waitable_object = nullptr;
+     Microsoft::WRL::ComPtr<IDXGISwapChain3> swap_chain;
+-    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kSwapChainBufferCount> swap_chain_buffers;
++    std::array<Microsoft::WRL::ComPtr<ID3D12Resource>, kMaxSwapChainBufferCount> swap_chain_buffers;
+   };
+ 
+   explicit D3D12Presenter(HostGpuLossCallback host_gpu_loss_callback, const D3D12Provider& provider)
+diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
+index c9026def..d0369066 100644
+--- a/src/graphics/command_processor.cpp
++++ b/src/graphics/command_processor.cpp
+@@ -63,6 +63,9 @@ REXCVAR_DEFINE_BOOL(nr_skip_host_draws, false, "GPU",
+                     "Native-renderer replace mode: draw and copy packets still reach the draw observer, "
+                     "but this backend does not execute them (the observer renders, writes copy-outs to "
+                     "guest memory and the swap presents from guest memory). Off by default");
++REXCVAR_DEFINE_BOOL(nr_d3d12_shared_device, false, "GPU",
++                    "[wwe2k14 nr] card C3: expose the D3D12 device, direct queue and submission fence to a native "
++                    "renderer for direct presentation; off by default");
+ REXCVAR_DEFINE_BOOL(nr_compare_trace_same_frame, false, "GPU",
+                     "Native-renderer compare windows: the frame trace (trace_gpu_prefix) is requested at "
+                     "the frame boundary that opens the window, so trace and window are the same frame "
+@@ -1780,6 +1783,55 @@ void SetNrWritePointerHook(void (*fn)(uint32_t)) { g_nr_wptr_hook = fn; }
+ NrWritePointerHook GetNrWritePointerHook() { return g_nr_wptr_hook; }
+ DrawObserver* GetDrawObserver() { return g_draw_observer; }
+ 
++// [wwe2k14 nr] card C3: backend-neutral storage for the D3D12 shared-present handoff.
++namespace {
++NrD3D12Device g_nr_d3d12_device;
++bool g_nr_d3d12_device_set = false;
++NrD3D12ExternalSwap g_nr_d3d12_swap;
++bool g_nr_d3d12_swap_set = false;
++std::atomic<uint64_t> g_nr_d3d12_swap_completion{0};
++}  // namespace
++
++void NrSetD3D12Device(const NrD3D12Device* device) {
++  g_nr_d3d12_device_set = device != nullptr;
++  g_nr_d3d12_device = device ? *device : NrD3D12Device{};
++}
++
++bool GetNrD3D12Device(NrD3D12Device* out) {
++  if (!out || !g_nr_d3d12_device_set || !REXCVAR_GET(nr_d3d12_shared_device)) return false;
++  *out = g_nr_d3d12_device;
++  return true;
++}
++
++void SetNrD3D12ExternalSwap(const NrD3D12ExternalSwap& swap) {
++  g_nr_d3d12_swap = swap;
++  g_nr_d3d12_swap_set = swap.resource != nullptr;
++}
++
++bool NrTakeD3D12ExternalSwap(NrD3D12ExternalSwap* out) {
++  if (!g_nr_d3d12_swap_set || !out) return false;
++  *out = g_nr_d3d12_swap;
++  g_nr_d3d12_swap_set = false;
++  return true;
++}
++
++void NrNoteD3D12SwapSubmission(uint64_t submission) {
++  g_nr_d3d12_swap_completion.store(submission, std::memory_order_release);
++}
++
++uint64_t GetNrD3D12SwapCompletion() {
++  return g_nr_d3d12_swap_completion.load(std::memory_order_acquire);
++}
++
++#if !REX_HAS_VULKAN
++// D3D12-only builds still link the Vulkan direct-present entry points used by the native app.
++bool GetNrVulkanDevice(NrVulkanDevice* out) {
++  (void)out;
++  return false;
++}
++void SetNrExternalSwap(const NrExternalSwap& swap) { (void)swap; }
++#endif
++
+ void CommandProcessor::DumpEdramAfterDraw(uint32_t ordinal) {
+   const std::string& spec = REXCVAR_GET(draw_edram_dump);
+   if (spec.empty()) {
+diff --git a/src/graphics/d3d12/command_processor.cpp b/src/graphics/d3d12/command_processor.cpp
+index fd2d483c..7761952d 100644
+--- a/src/graphics/d3d12/command_processor.cpp
++++ b/src/graphics/d3d12/command_processor.cpp
+@@ -23,6 +23,7 @@
+ #include <rex/graphics/d3d12/command_processor.h>
+ #include <rex/graphics/d3d12/graphics_system.h>
+ #include <rex/graphics/d3d12/shader.h>
++#include <rex/graphics/draw_observer.h>
+ #include <rex/graphics/flags.h>
+ #include <rex/graphics/registers.h>
+ #include <rex/graphics/util/draw.h>
+@@ -33,6 +34,12 @@
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_util.h>
+ 
++namespace rex::graphics {
++void NrSetD3D12Device(const NrD3D12Device* device);
++bool NrTakeD3D12ExternalSwap(NrD3D12ExternalSwap* out);
++void NrNoteD3D12SwapSubmission(uint64_t submission);
++}  // namespace rex::graphics
++
+ REXCVAR_DEFINE_BOOL(d3d12_bindless, true, "GPU/D3D12", "Use bindless resources where available")
+     .lifecycle(rex::cvar::Lifecycle::kRequiresRestart);
+ 
+@@ -1648,10 +1655,24 @@ bool D3D12CommandProcessor::SetupContext() {
+   // Just not to expose uninitialized memory.
+   std::memset(&system_constants_, 0, sizeof(system_constants_));
+ 
++  {
++    // D3D12 shared device for a native renderer, exposed only when nr_d3d12_shared_device is enabled.
++    NrD3D12Device nr_device;
++    nr_device.device = provider.GetDevice();
++    nr_device.direct_queue = provider.GetDirectQueue();
++    nr_device.dxgi_factory = provider.GetDXGIFactory();
++    const LUID luid = provider.GetDevice()->GetAdapterLuid();
++    nr_device.adapter_luid_low = luid.LowPart;
++    nr_device.adapter_luid_high = luid.HighPart;
++    nr_device.submission_fence = submission_fence_;
++    NrSetD3D12Device(&nr_device);
++  }
++
+   return true;
+ }
+ 
+ void D3D12CommandProcessor::ShutdownContext() {
++  NrSetD3D12Device(nullptr);
+   AwaitAllQueueOperationsCompletion();
+   InvalidateAllVertexBufferResidency();
+   ShutdownOcclusionQueryResources();
+@@ -1942,9 +1963,33 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   D3D12_SHADER_RESOURCE_VIEW_DESC swap_texture_srv_desc;
+   xenos::TextureFormat frontbuffer_format;
+   uint32_t frontbuffer_width_unscaled = 0, frontbuffer_height_unscaled = 0;
+-  ID3D12Resource* swap_texture_resource =
+-      texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
+-                                         &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
++  ID3D12Resource* swap_texture_resource = nullptr;
++  NrD3D12ExternalSwap nr_swap;
++  const bool have_nr_swap = NrTakeD3D12ExternalSwap(&nr_swap) && nr_swap.width && nr_swap.height;
++  if (have_nr_swap) {
++    swap_texture_resource = static_cast<ID3D12Resource*>(nr_swap.resource);
++    if (nr_swap.wait_fence) {
++      // Queue a GPU wait before the swap submission that samples the native image.
++      GetD3D12Provider().GetDirectQueue()->Wait(static_cast<ID3D12Fence*>(nr_swap.wait_fence), nr_swap.wait_value);
++    }
++    swap_texture_srv_desc.Format =
++        nr_swap.srv_format ? DXGI_FORMAT(nr_swap.srv_format) : DXGI_FORMAT_R8G8B8A8_UNORM;
++    swap_texture_srv_desc.ViewDimension = D3D12_SRV_DIMENSION_TEXTURE2D;
++    swap_texture_srv_desc.Shader4ComponentMapping =
++        nr_swap.component_mapping ? UINT(nr_swap.component_mapping) : D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
++    swap_texture_srv_desc.Texture2D.MostDetailedMip = 0;
++    swap_texture_srv_desc.Texture2D.MipLevels = 1;
++    swap_texture_srv_desc.Texture2D.PlaneSlice = 0;
++    swap_texture_srv_desc.Texture2D.ResourceMinLODClamp = 0.0f;
++    frontbuffer_format = xenos::TextureFormat::k_8_8_8_8;
++    frontbuffer_width_unscaled = nr_swap.width_unscaled ? nr_swap.width_unscaled : nr_swap.width;
++    frontbuffer_height_unscaled = nr_swap.height_unscaled ? nr_swap.height_unscaled : nr_swap.height;
++    NrNoteD3D12SwapSubmission(submission_current_);
++  } else {
++    swap_texture_resource =
++        texture_cache_->RequestSwapTexture(swap_texture_srv_desc, frontbuffer_format,
++                                           &frontbuffer_width_unscaled, &frontbuffer_height_unscaled);
++  }
+   if (!swap_texture_resource) {
+     // Dump texture fetch constant 0 for debugging
+     const auto& regs = *register_file_;
+@@ -1960,6 +2005,10 @@ void D3D12CommandProcessor::IssueSwap(uint32_t frontbuffer_ptr, uint32_t frontbu
+   // from the swap packet, scaled proportionally to the actual source texture.
+   uint32_t source_width_scaled = uint32_t(swap_texture_desc.Width);
+   uint32_t source_height_scaled = uint32_t(swap_texture_desc.Height);
++  if (have_nr_swap) {
++    source_width_scaled = std::min(source_width_scaled, nr_swap.width);
++    source_height_scaled = std::min(source_height_scaled, nr_swap.height);
++  }
+   auto get_active_swap_dimension = [](uint32_t packet_unscaled, uint32_t source_unscaled,
+                                       uint32_t source_scaled) -> uint32_t {
+     if (!source_scaled) {
+diff --git a/src/ui/d3d12/d3d12_presenter.cpp b/src/ui/d3d12/d3d12_presenter.cpp
+index 8c1b5dbf..a756faa9 100644
+--- a/src/ui/d3d12/d3d12_presenter.cpp
++++ b/src/ui/d3d12/d3d12_presenter.cpp
+@@ -32,6 +32,12 @@
+ 
+ REXCVAR_DEFINE_BOOL(d3d12_allow_variable_refresh_rate_and_tearing, true, "UI/D3D12",
+                     "Allow variable refresh rate and tearing");
++REXCVAR_DEFINE_BOOL(nr_d3d12_vsync_fifo, false, "GPU/D3D12",
++                    "[wwe2k14 nr] Use FIFO present pacing for the native D3D12 renderer");
++REXCVAR_DEFINE_INT32(nr_d3d12_latency, 0, "GPU/D3D12",
++                     "[wwe2k14 nr] D3D12 swap-chain maximum frame latency (creation-time; 0 disables)");
++REXCVAR_DEFINE_INT32(nr_d3d12_scan_buffers, 3, "GPU/D3D12",
++                     "[wwe2k14 nr] D3D12 swap-chain buffer count (creation-time)");
+ 
+ namespace rex::ui::d3d12 {
+ 
+@@ -350,22 +356,21 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   if (paint_context_.swap_chain) {
+     if (was_paintable && paint_context_.swap_chain_width == new_swap_chain_width &&
+         paint_context_.swap_chain_height == new_swap_chain_height) {
+-      is_vsync_implicit_out = false;
++      is_vsync_implicit_out = REXCVAR_GET(nr_d3d12_vsync_fifo);
+       return SurfacePaintConnectResult::kSuccessUnchanged;
+     }
+     paint_context_.AwaitSwapChainUsageCompletion();
+     // Using the current swap_chain_allows_tearing_ value that's consistent with
+     // the creation of the swap chain because ResizeBuffers can't toggle the
+     // tearing flag.
+-    for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref :
+-         paint_context_.swap_chain_buffers) {
+-      swap_chain_buffer_ref.Reset();
++    for (uint32_t i = 0; i < paint_context_.swap_chain_buffer_count; ++i) {
++      paint_context_.swap_chain_buffers[i].Reset();
+     }
+     bool swap_chain_resized = SUCCEEDED(paint_context_.swap_chain->ResizeBuffers(
+         0, UINT(new_swap_chain_width), UINT(new_swap_chain_height), DXGI_FORMAT_UNKNOWN,
+-        paint_context_.swap_chain_allows_tearing ? DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING : 0));
++        paint_context_.swap_chain_flags));
+     if (swap_chain_resized) {
+-      for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
++      for (uint32_t i = 0; i < paint_context_.swap_chain_buffer_count; ++i) {
+         if (FAILED(paint_context_.swap_chain->GetBuffer(
+                 i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
+           swap_chain_resized = false;
+@@ -386,6 +391,14 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+ 
+   if (!paint_context_.swap_chain) {
+     // Create a new swap chain.
++    if (!paint_context_.creation_settings_latched) {
++      int32_t requested_latency = REXCVAR_GET(nr_d3d12_latency);
++      paint_context_.swap_chain_frame_latency =
++          requested_latency >= 1 && requested_latency <= 3 ? uint32_t(requested_latency) : 0;
++      paint_context_.swap_chain_buffer_count =
++          REXCVAR_GET(nr_d3d12_scan_buffers) == 2 ? 2 : PaintContext::kMaxSwapChainBufferCount;
++      paint_context_.creation_settings_latched = true;
++    }
+     Surface::TypeIndex surface_type = new_surface.GetType();
+     DXGI_SWAP_CHAIN_DESC1 swap_chain_desc;
+     swap_chain_desc.Width = UINT(new_swap_chain_width);
+@@ -395,7 +408,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+     swap_chain_desc.SampleDesc.Count = 1;
+     swap_chain_desc.SampleDesc.Quality = 0;
+     swap_chain_desc.BufferUsage = DXGI_USAGE_RENDER_TARGET_OUTPUT;
+-    swap_chain_desc.BufferCount = UINT(PaintContext::kSwapChainBufferCount);
++    swap_chain_desc.BufferCount = UINT(paint_context_.swap_chain_buffer_count);
+     // DXGI_SCALING_STRETCH may cause the content to "shake" while resizing,
+     // with relayout done for the guest output twice visually rather than once,
+     // and the UI becoming stretched and then jumping to normal. If it's
+@@ -413,6 +426,9 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+       // rate.
+       swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING;
+     }
++    if (paint_context_.swap_chain_frame_latency) {
++      swap_chain_desc.Flags |= DXGI_SWAP_CHAIN_FLAG_FRAME_LATENCY_WAITABLE_OBJECT;
++    }
+     IDXGIFactory2* dxgi_factory = provider_.GetDXGIFactory();
+     ID3D12CommandQueue* direct_queue = provider_.GetDirectQueue();
+     Microsoft::WRL::ComPtr<IDXGISwapChain1> swap_chain_1;
+@@ -420,9 +436,17 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+ #if WINAPI_FAMILY_PARTITION(WINAPI_PARTITION_DESKTOP | WINAPI_PARTITION_GAMES)
+       case Surface::kTypeIndex_Win32Hwnd: {
+         HWND surface_hwnd = static_cast<const Win32HwndSurface&>(new_surface).hwnd();
+-        if (FAILED(dxgi_factory->CreateSwapChainForHwnd(
+-                direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1))) {
+-          REXLOG_ERROR("D3D12Presenter: Failed to create a swap chain for the HWND");
++        HRESULT swap_chain_result = dxgi_factory->CreateSwapChainForHwnd(
++            direct_queue, surface_hwnd, &swap_chain_desc, nullptr, nullptr, &swap_chain_1);
++        if (FAILED(swap_chain_result)) {
++          REXLOG_ERROR(
++              "D3D12Presenter: Failed to create a swap chain for the HWND "
++              "(HRESULT=0x{:08X}, desc: width={}, height={}, format={}, buffer_count={}, "
++              "swap_effect={}, flags=0x{:08X})",
++              static_cast<unsigned>(swap_chain_result), swap_chain_desc.Width,
++              swap_chain_desc.Height, static_cast<unsigned>(swap_chain_desc.Format),
++              swap_chain_desc.BufferCount, static_cast<unsigned>(swap_chain_desc.SwapEffect),
++              static_cast<unsigned>(swap_chain_desc.Flags));
+           return SurfacePaintConnectResult::kFailure;
+         }
+         // Disable automatic Alt+Enter handling - DXGI fullscreen doesn't
+@@ -449,17 +473,42 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+     // before returning.
+     paint_context_.swap_chain_width = new_swap_chain_width;
+     paint_context_.swap_chain_height = new_swap_chain_height;
++    paint_context_.swap_chain_flags = swap_chain_desc.Flags;
+     paint_context_.swap_chain_allows_tearing =
+         (swap_chain_desc.Flags & DXGI_SWAP_CHAIN_FLAG_ALLOW_TEARING) != 0;
+-    for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
++    if (paint_context_.swap_chain_frame_latency) {
++      HRESULT maximum_latency_result = paint_context_.swap_chain->SetMaximumFrameLatency(
++          paint_context_.swap_chain_frame_latency);
++      if (FAILED(maximum_latency_result)) {
++        REXLOG_ERROR("[d3d12-present] SetMaximumFrameLatency({}) failed (HRESULT=0x{:08X})",
++                     paint_context_.swap_chain_frame_latency,
++                     static_cast<unsigned>(maximum_latency_result));
++        paint_context_.DestroySwapChain();
++        return SurfacePaintConnectResult::kFailure;
++      }
++      paint_context_.swap_chain_waitable_object =
++          paint_context_.swap_chain->GetFrameLatencyWaitableObject();
++      if (!paint_context_.swap_chain_waitable_object) {
++        REXLOG_ERROR("[d3d12-present] GetFrameLatencyWaitableObject failed");
++        paint_context_.DestroySwapChain();
++        return SurfacePaintConnectResult::kFailure;
++      }
++    }
++    for (uint32_t i = 0; i < paint_context_.swap_chain_buffer_count; ++i) {
+       if (FAILED(paint_context_.swap_chain->GetBuffer(
+-              i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
++                i, IID_PPV_ARGS(&paint_context_.swap_chain_buffers[i])))) {
+         REXLOG_ERROR("D3D12Presenter: Failed to get buffer {} of a {}-buffer swap chain", i,
+-                     PaintContext::kSwapChainBufferCount);
++                     paint_context_.swap_chain_buffer_count);
+         paint_context_.DestroySwapChain();
+         return SurfacePaintConnectResult::kFailure;
+       }
+     }
++    if (!paint_context_.creation_settings_logged) {
++      REXLOG_INFO("[d3d12-present] latency={} scan_buffers={} waitable={} (creation-time)",
++                  paint_context_.swap_chain_frame_latency, paint_context_.swap_chain_buffer_count,
++                  paint_context_.swap_chain_waitable_object ? 1 : 0);
++      paint_context_.creation_settings_logged = true;
++    }
+   }
+ 
+   ID3D12Device* device = provider_.GetDevice();
+@@ -471,7 +520,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+   rtv_desc.ViewDimension = D3D12_RTV_DIMENSION_TEXTURE2D;
+   rtv_desc.Texture2D.MipSlice = 0;
+   rtv_desc.Texture2D.PlaneSlice = 0;
+-  for (uint32_t i = 0; i < PaintContext::kSwapChainBufferCount; ++i) {
++  for (uint32_t i = 0; i < paint_context_.swap_chain_buffer_count; ++i) {
+     ID3D12Resource* swap_chain_buffer = paint_context_.swap_chain_buffers[i].Get();
+     rtv_desc.Format = kSwapChainFormat;
+     device->CreateRenderTargetView(
+@@ -479,7 +528,7 @@ D3D12Presenter::ConnectOrReconnectPaintingToSurfaceFromUIThread(Surface& new_sur
+         provider_.OffsetRTVDescriptor(rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + i));
+   }
+ 
+-  is_vsync_implicit_out = false;
++  is_vsync_implicit_out = REXCVAR_GET(nr_d3d12_vsync_fifo);
+   return SurfacePaintConnectResult::kSuccess;
+ }
+ 
+@@ -542,15 +591,19 @@ bool D3D12Presenter::RefreshGuestOutputImpl(
+ }
+ 
+ void D3D12Presenter::PaintContext::DestroySwapChain() {
+-  if (!swap_chain) {
+-    return;
++  if (swap_chain) {
++    AwaitSwapChainUsageCompletion();
++    for (uint32_t i = 0; i < swap_chain_buffer_count; ++i) {
++      swap_chain_buffers[i].Reset();
++    }
++    swap_chain.Reset();
+   }
+-  AwaitSwapChainUsageCompletion();
+-  for (Microsoft::WRL::ComPtr<ID3D12Resource>& swap_chain_buffer_ref : swap_chain_buffers) {
+-    swap_chain_buffer_ref.Reset();
++  if (swap_chain_waitable_object) {
++    CloseHandle(swap_chain_waitable_object);
++    swap_chain_waitable_object = nullptr;
+   }
+-  swap_chain.Reset();
+   swap_chain_allows_tearing = false;
++  swap_chain_flags = 0;
+   swap_chain_height = 0;
+   swap_chain_width = 0;
+ }
+@@ -576,6 +629,11 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   D3D12_CPU_DESCRIPTOR_HANDLE rtv_heap_start =
+       paint_context_.rtv_heap->GetCPUDescriptorHandleForHeapStart();
+   UINT back_buffer_index = paint_context_.swap_chain->GetCurrentBackBufferIndex();
++  if (back_buffer_index >= paint_context_.swap_chain_buffer_count) {
++    REXLOG_ERROR("[d3d12-present] back-buffer index {} outside {}-buffer swap chain", back_buffer_index,
++                 paint_context_.swap_chain_buffer_count);
++    return PaintResult::kNotPresented;
++  }
+   D3D12_CPU_DESCRIPTOR_HANDLE back_buffer_rtv = provider_.OffsetRTVDescriptor(
+       rtv_heap_start, PaintContext::kRTVIndexSwapChainBuffer0 + back_buffer_index);
+   ID3D12Resource* back_buffer = paint_context_.swap_chain_buffers[back_buffer_index].Get();
+@@ -583,6 +641,18 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   bool back_buffer_bound = false;
+   bool back_buffer_clear_needed = true;
+   const float kBackBufferClearColor[] = {0.0f, 0.0f, 0.0f, 1.0f};
++  auto wait_for_back_buffer = [this]() {
++    if (!paint_context_.swap_chain_waitable_object) {
++      return true;
++    }
++    DWORD wait_result =
++        WaitForSingleObjectEx(paint_context_.swap_chain_waitable_object, INFINITE, FALSE);
++    if (wait_result != WAIT_OBJECT_0) {
++      REXLOG_ERROR("[d3d12-present] frame-latency wait failed (result={})", wait_result);
++      return false;
++    }
++    return true;
++  };
+ 
+   // Draw the guest output.
+ 
+@@ -822,6 +892,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+         if (is_final_effect) {
+           effect_dest_resource = back_buffer;
+           if (!back_buffer_acquired) {
++            if (!wait_for_back_buffer()) {
++              return PaintResult::kNotPresented;
++            }
+             D3D12_RESOURCE_BARRIER barrier_present_to_rtv;
+             barrier_present_to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+             barrier_present_to_rtv.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+@@ -1060,6 +1133,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+             // The next effect draws to the back buffer - merge into one
+             // ResourceBarrier command.
+             if (!back_buffer_acquired) {
++              if (!wait_for_back_buffer()) {
++                return PaintResult::kNotPresented;
++              }
+               assert_true(barrier_count < rex::countof(barriers));
+               D3D12_RESOURCE_BARRIER& barrier_present_to_rtv = barriers[barrier_count++];
+               barrier_present_to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+@@ -1101,6 +1177,9 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // RTV hasn't been done yet, and it's needed to clear it, and optionally to
+   // draw the UI.
+   if (!back_buffer_acquired) {
++    if (!wait_for_back_buffer()) {
++      return PaintResult::kNotPresented;
++    }
+     D3D12_RESOURCE_BARRIER barrier_present_to_rtv;
+     barrier_present_to_rtv.Type = D3D12_RESOURCE_BARRIER_TYPE_TRANSITION;
+     barrier_present_to_rtv.Flags = D3D12_RESOURCE_BARRIER_FLAG_NONE;
+@@ -1156,9 +1235,14 @@ Presenter::PaintResult D3D12Presenter::PaintAndPresentImpl(bool execute_ui_drawe
+   // fullscreen is ever used in, the allow tearing flag must not be passed in
+   // fullscreen, but DXGI fullscreen is largely unneeded with the flip
+   // presentation model used in Direct3D 12).
+-  HRESULT present_result = paint_context_.swap_chain->Present(
+-      0, DXGI_PRESENT_RESTART |
+-             (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++  HRESULT present_result;
++  if (REXCVAR_GET(nr_d3d12_vsync_fifo)) {
++    present_result = paint_context_.swap_chain->Present(1, 0);
++  } else {
++    present_result = paint_context_.swap_chain->Present(
++        0, DXGI_PRESENT_RESTART |
++               (paint_context_.swap_chain_allows_tearing ? DXGI_PRESENT_ALLOW_TEARING : 0));
++  }
+   // Even if presentation has failed, work might have been enqueued anyway
+   // internally before the failure according to Jesse Natalie from the DirectX
+   // Discord server.
+diff --git a/src/ui/d3d12/d3d12_provider.cpp b/src/ui/d3d12/d3d12_provider.cpp
+index bf8252b1..f50a2a09 100644
+--- a/src/ui/d3d12/d3d12_provider.cpp
++++ b/src/ui/d3d12/d3d12_provider.cpp
+@@ -17,6 +17,7 @@
+ #include <rex/ui/d3d12/d3d12_immediate_drawer.h>
+ #include <rex/ui/d3d12/d3d12_presenter.h>
+ #include <rex/ui/d3d12/d3d12_provider.h>
++#include <rex/ui/renderdoc_api.h>
+ 
+ #include <malloc.h>
+ 
+@@ -121,6 +122,12 @@ bool D3D12Provider::EnableIncreaseBasePriorityPrivilege() {
+ }
+ 
+ bool D3D12Provider::Initialize() {
++  static std::unique_ptr<rex::ui::RenderDocAPI> renderdoc_api =
++      rex::ui::RenderDocAPI::CreateIfConnected();
++  if (renderdoc_api) {
++    REXLOG_INFO("RenderDoc detected (D3D12): in-app API loaded before device creation");
++  }
++
+   // Load the core libraries.
+   library_dxgi_ = LoadLibraryW(L"dxgi.dll");
+   library_d3d12_ = LoadLibraryW(L"D3D12.dll");
+-- 
+2.43.0
+

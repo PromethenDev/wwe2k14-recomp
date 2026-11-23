@@ -1,11 +1,11 @@
 From 58f90a1a257284048597ec70549f2039a8d2e5b6 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Mon, 5 Oct 2026 06:17:04 -0700
-Subject: [PATCH 93/97] Always-on freeze logger: 1 Hz watchdog (no present for
- 10 s after the first) + lock-free 4096-entry kernel sync-event ring (123
+Subject: [PATCH 093/149] Always-on freeze logger: 1 Hz watchdog (no present
+ for 10 s after the first) + lock-free 4096-entry kernel sync-event ring (123
  ns/push); one report per freeze in the logs folder (threads, wait objects,
  host backtraces, ring, last 200 log lines); WWE2K14_FREEZE_LOG=0 disables,
- WWE2K14_FREEZE_TEST_BLOCK test hook
+ WWE2K14_FREEZE_TEST_BLOCK test hook (DeepSeek Flash worker, Claude reviewed)
 
 Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 ---
@@ -21,7 +21,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
 
 diff --git a/include/rex/diagnostics/freeze_logger.h b/include/rex/diagnostics/freeze_logger.h
 new file mode 100644
-index 0000000..7e9da6d
+index 00000000..7e9da6d5
 --- /dev/null
 +++ b/include/rex/diagnostics/freeze_logger.h
 @@ -0,0 +1,59 @@
@@ -85,7 +85,7 @@ index 0000000..7e9da6d
 +
 +}  // namespace rex::diagnostics::freeze_logger
 diff --git a/src/core/CMakeLists.txt b/src/core/CMakeLists.txt
-index a085a7f..8e65ebc 100644
+index a085a7fc..8e65ebc6 100644
 --- a/src/core/CMakeLists.txt
 +++ b/src/core/CMakeLists.txt
 @@ -9,6 +9,7 @@ add_library(rexcore STATIC
@@ -98,7 +98,7 @@ index a085a7f..8e65ebc 100644
      logging.cpp
 diff --git a/src/core/freeze_logger.cpp b/src/core/freeze_logger.cpp
 new file mode 100644
-index 0000000..507c754
+index 00000000..507c7543
 --- /dev/null
 +++ b/src/core/freeze_logger.cpp
 @@ -0,0 +1,580 @@
@@ -683,7 +683,7 @@ index 0000000..507c754
 +
 +}  // namespace rex::diagnostics::freeze_logger
 diff --git a/src/core/rate_census.cpp b/src/core/rate_census.cpp
-index 09e1334..07dfff3 100644
+index 09e13346..07dfff36 100644
 --- a/src/core/rate_census.cpp
 +++ b/src/core/rate_census.cpp
 @@ -3,6 +3,7 @@
@@ -715,7 +715,7 @@ index 09e1334..07dfff3 100644
  void RecordGpuBusyStart() { g_rate_census.RecordGpuBusyStart(); }
  
 diff --git a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
-index 5397189..375c641 100644
+index 53971895..375c641c 100644
 --- a/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 +++ b/src/kernel/xboxkrnl/xboxkrnl_threading.cpp
 @@ -14,11 +14,14 @@
@@ -895,7 +895,7 @@ index 5397189..375c641 100644
      result = X_STATUS_INVALID_HANDLE;
    }
 diff --git a/src/system/xthread.cpp b/src/system/xthread.cpp
-index 489f57f..f648300 100644
+index 489f57f8..f648300c 100644
 --- a/src/system/xthread.cpp
 +++ b/src/system/xthread.cpp
 @@ -18,6 +18,7 @@

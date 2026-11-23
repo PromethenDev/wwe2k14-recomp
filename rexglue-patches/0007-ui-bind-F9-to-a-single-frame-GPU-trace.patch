@@ -1,7 +1,7 @@
 From 0bbddfb974d1617adab00bf4469347b7637794fd Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Tue, 22 Sep 2026 16:29:34 -0700
-Subject: [PATCH 07/97] ui: bind F9 to a single-frame GPU trace
+Subject: [PATCH 007/149] ui: bind F9 to a single-frame GPU trace
 
 Registers bind_gpu_frame_trace (default F9) calling
 GraphicsSystem::RequestFrameTrace(), which was implemented but had no
@@ -14,7 +14,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  1 file changed, 10 insertions(+)
 
 diff --git a/src/ui/rex_app.cpp b/src/ui/rex_app.cpp
-index 04a31de..25f26e8 100644
+index 04a31de3..25f26e8f 100644
 --- a/src/ui/rex_app.cpp
 +++ b/src/ui/rex_app.cpp
 @@ -233,6 +233,14 @@ bool ReXApp::OnInitialize() {

@@ -1,0 +1,33 @@
+From dc0b069114f4aebe208fd1e7e1fcd51f86a3d623 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 06:55:05 -0800
+Subject: [PATCH 149/149] ui: ImGuiDrawer::HasDialogs is public
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ui/imgui_drawer.h | 2 +-
+ 1 file changed, 1 insertion(+), 1 deletion(-)
+
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index 0648ee87..7420a731 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -38,6 +38,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+  public:
+   ImGuiDrawer(Window* window, size_t z_order);
+   ~ImGuiDrawer();
++  bool HasDialogs() const { return !dialogs_.empty(); }  // detached overlay mode: draw only when a dialog is open
+ 
+   ImGuiIO& GetIO();
+ 
+@@ -79,7 +80,6 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
+ 
+   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
+-  bool HasDialogs() const { return !dialogs_.empty(); }  // detached overlay mode: draw only when a dialog is open
+   void DetachIfLastDialogRemoved();
+ 
+   std::optional<ImGuiKey> VirtualKeyToImGuiKey(VirtualKey vkey);
+-- 
+2.43.0
+

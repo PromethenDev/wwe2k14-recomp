@@ -1,7 +1,7 @@
 From 986a15a04ff0bcb4472edba6149c818fe70cb5aa Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Fri, 25 Sep 2026 09:58:41 -0700
-Subject: [PATCH 32/97] diagnostics: resolve log, readback range filter and
+Subject: [PATCH 032/149] diagnostics: resolve log, readback range filter and
  guest read watch
 
 Env-gated, off by default:
@@ -23,7 +23,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  4 files changed, 130 insertions(+), 3 deletions(-)
 
 diff --git a/include/rex/graphics/vulkan/command_processor.h b/include/rex/graphics/vulkan/command_processor.h
-index e5fbfcd..443e922 100644
+index e5fbfcdf..443e922d 100644
 --- a/include/rex/graphics/vulkan/command_processor.h
 +++ b/include/rex/graphics/vulkan/command_processor.h
 @@ -476,6 +476,7 @@ class VulkanCommandProcessor : public CommandProcessor {
@@ -35,7 +35,7 @@ index e5fbfcd..443e922 100644
    bool IssueDraw_MemexportReadbackFullPath(uint32_t total_size);
    bool IssueDraw_MemexportReadbackFastPath(uint32_t total_size);
 diff --git a/include/rex/system/mmio_handler.h b/include/rex/system/mmio_handler.h
-index bb44a1a..2e4e8f3 100644
+index bb44a1a8..2e4e8f30 100644
 --- a/include/rex/system/mmio_handler.h
 +++ b/include/rex/system/mmio_handler.h
 @@ -38,6 +38,10 @@ struct MMIORange {
@@ -50,7 +50,7 @@ index bb44a1a..2e4e8f3 100644
  class MMIOHandler {
   public:
 diff --git a/src/graphics/vulkan/command_processor.cpp b/src/graphics/vulkan/command_processor.cpp
-index 7446d0b..21890d1 100644
+index 7446d0b1..21890d1e 100644
 --- a/src/graphics/vulkan/command_processor.cpp
 +++ b/src/graphics/vulkan/command_processor.cpp
 @@ -38,6 +38,7 @@
@@ -142,7 +142,7 @@ index 7446d0b..21890d1 100644
      return true;
    }
 diff --git a/src/system/mmio_handler.cpp b/src/system/mmio_handler.cpp
-index e698b0b..813abab 100644
+index e698b0be..813abab3 100644
 --- a/src/system/mmio_handler.cpp
 +++ b/src/system/mmio_handler.cpp
 @@ -9,7 +9,12 @@

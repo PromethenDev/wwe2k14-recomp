@@ -1,0 +1,26 @@
+From 153f7fd5c1b8e5aad2a4d90544ffa3c6ab5dd151 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sun, 22 Nov 2026 06:54:22 -0800
+Subject: [PATCH 148/149] ui: ImGuiDrawer::HasDialogs (detached overlay mode
+ draws only while a dialog is open)
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ include/rex/ui/imgui_drawer.h | 1 +
+ 1 file changed, 1 insertion(+)
+
+diff --git a/include/rex/ui/imgui_drawer.h b/include/rex/ui/imgui_drawer.h
+index ff323fba..0648ee87 100644
+--- a/include/rex/ui/imgui_drawer.h
++++ b/include/rex/ui/imgui_drawer.h
+@@ -79,6 +79,7 @@ class ImGuiDrawer : public WindowInputListener, public UIDrawer {
+   void SwitchToPhysicalMouseAndUpdateMousePosition(const MouseEvent& e);
+ 
+   bool IsDrawingDialogs() const { return dialog_loop_next_index_ != SIZE_MAX; }
++  bool HasDialogs() const { return !dialogs_.empty(); }  // detached overlay mode: draw only when a dialog is open
+   void DetachIfLastDialogRemoved();
+ 
+   std::optional<ImGuiKey> VirtualKeyToImGuiKey(VirtualKey vkey);
+-- 
+2.43.0
+

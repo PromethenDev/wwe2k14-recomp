@@ -1,7 +1,7 @@
 From 41d5e1b38db3c8c93e9e4529b9798f1d2187bf3c Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Mon, 28 Sep 2026 11:57:54 -0700
-Subject: [PATCH 61/97] logging: InitLogging re-init adds the requested
+Subject: [PATCH 061/149] logging: InitLogging re-init adds the requested
  file/console sink (log_file was lost whenever a REX_* env override logged
  before InitLogging)
 
@@ -16,7 +16,7 @@ Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
  2 files changed, 36 insertions(+), 2 deletions(-)
 
 diff --git a/include/rex/logging/api.h b/include/rex/logging/api.h
-index 1bbf6a0..70c5e72 100644
+index 1bbf6a07..70c5e72f 100644
 --- a/include/rex/logging/api.h
 +++ b/include/rex/logging/api.h
 @@ -40,7 +40,8 @@ namespace rex {
@@ -30,7 +30,7 @@ index 1bbf6a0..70c5e72 100644
   * @param config  Logging configuration.
   */
 diff --git a/src/core/logging.cpp b/src/core/logging.cpp
-index 63e3a4e..32fe427 100644
+index 63e3a4e1..32fe427e 100644
 --- a/src/core/logging.cpp
 +++ b/src/core/logging.cpp
 @@ -42,6 +42,7 @@ std::vector<LogCategoryEntry> g_registry;

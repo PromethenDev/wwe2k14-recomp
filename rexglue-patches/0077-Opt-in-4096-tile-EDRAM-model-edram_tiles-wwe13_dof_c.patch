@@ -1,7 +1,7 @@
 From ff203efa62ded6e4c03b296e4c27501682638365 Mon Sep 17 00:00:00 2001
 From: PromethenDev <PromethenDev@users.noreply.github.com>
 Date: Wed, 30 Sep 2026 22:57:48 -0700
-Subject: [PATCH 77/97] Opt-in 4096-tile EDRAM model (edram_tiles) +
+Subject: [PATCH 077/149] Opt-in 4096-tile EDRAM model (edram_tiles) +
  wwe13_dof_composite_nop cvar for the 1080p scene path
 
 The 1920x1080 internal scene exceeds the 2048-tile Xenos EDRAM; edram_tiles=4096 (default 2048)
@@ -26,7 +26,7 @@ one draw (opt-in, set only by the game at 1080).
  14 files changed, 189 insertions(+), 110 deletions(-)
 
 diff --git a/include/rex/graphics/flags.h b/include/rex/graphics/flags.h
-index 6a9a12b..49c065a 100644
+index 6a9a12bf..49c065a5 100644
 --- a/include/rex/graphics/flags.h
 +++ b/include/rex/graphics/flags.h
 @@ -51,6 +51,7 @@ REXCVAR_DECLARE(bool, direct_host_resolve);
@@ -38,7 +38,7 @@ index 6a9a12b..49c065a 100644
  REXCVAR_DECLARE(int32_t, anisotropic_override);
  REXCVAR_DECLARE(int32_t, texture_cache_memory_limit_render_to_texture);
 diff --git a/include/rex/graphics/trace_protocol.h b/include/rex/graphics/trace_protocol.h
-index c200d0c..8981b4d 100644
+index c200d0c1..8981b4d0 100644
 --- a/include/rex/graphics/trace_protocol.h
 +++ b/include/rex/graphics/trace_protocol.h
 @@ -113,10 +113,12 @@ struct MemoryCommand {
@@ -59,7 +59,7 @@ index c200d0c..8981b4d 100644
    TraceCommandType type;
    // Encoding format of the data in the trace file.
 diff --git a/include/rex/graphics/xenos.h b/include/rex/graphics/xenos.h
-index f7fd14e..bdb2dfe 100644
+index f7fd14e7..bdb2dfe9 100644
 --- a/include/rex/graphics/xenos.h
 +++ b/include/rex/graphics/xenos.h
 @@ -283,6 +283,9 @@ enum class SurfaceNumberFormat : uint32_t {
@@ -91,7 +91,7 @@ index f7fd14e..bdb2dfe 100644
  // RB_SURFACE_INFO::surface_pitch width.
  constexpr uint32_t kEdramPitchPixelsBits = 14;
 diff --git a/src/graphics/command_processor.cpp b/src/graphics/command_processor.cpp
-index 4b69858..0fdb7bc 100644
+index 4b69858d..0fdb7bc5 100644
 --- a/src/graphics/command_processor.cpp
 +++ b/src/graphics/command_processor.cpp
 @@ -28,6 +28,7 @@
@@ -124,7 +124,7 @@ index 4b69858..0fdb7bc 100644
        // shader has memexport.
        // TODO(Triang3l || JoelLinn): Handle this properly in the render
 diff --git a/src/graphics/d3d12/render_target_cache.cpp b/src/graphics/d3d12/render_target_cache.cpp
-index 9a7acf5..13576d8 100644
+index 9a7acf52..13576d83 100644
 --- a/src/graphics/d3d12/render_target_cache.cpp
 +++ b/src/graphics/d3d12/render_target_cache.cpp
 @@ -205,7 +205,7 @@ bool D3D12RenderTargetCache::Initialize() {
@@ -247,7 +247,7 @@ index 9a7acf5..13576d8 100644
    // r0.x = X sample position within the tile
    // r0.y = Y sample position within the tile
 diff --git a/src/graphics/flags.cpp b/src/graphics/flags.cpp
-index 6c33960..bf1ec43 100644
+index 6c339603..bf1ec439 100644
 --- a/src/graphics/flags.cpp
 +++ b/src/graphics/flags.cpp
 @@ -17,6 +17,12 @@ REXCVAR_DEFINE_BOOL(gpu_allow_invalid_fetch_constants, false, "GPU",
@@ -264,7 +264,7 @@ index 6c33960..bf1ec43 100644
  REXCVAR_DEFINE_BOOL(depth_float24_round, false, "GPU", "Round float24 depth values");
  REXCVAR_DEFINE_BOOL(depth_float24_convert_in_pixel_shader, false, "GPU",
 diff --git a/src/graphics/pipeline/render_target/cache.cpp b/src/graphics/pipeline/render_target/cache.cpp
-index cf0477c..525b4e7 100644
+index cf0477c9..525b4e78 100644
 --- a/src/graphics/pipeline/render_target/cache.cpp
 +++ b/src/graphics/pipeline/render_target/cache.cpp
 @@ -199,8 +199,8 @@ uint32_t RenderTargetCache::Transfer::GetRangeRectangles(uint32_t start_tiles, u
@@ -551,7 +551,7 @@ index cf0477c..525b4e7 100644
    if (debug_rt_cache_ownership && transfers_append_out) {
      for (const Transfer& transfer : *transfers_append_out) {
 diff --git a/src/graphics/pipeline/shader/dxbc_translator_om.cpp b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
-index a7d508a..d39ce92 100644
+index a7d508a9..d39ce920 100644
 --- a/src/graphics/pipeline/shader/dxbc_translator_om.cpp
 +++ b/src/graphics/pipeline/shader/dxbc_translator_om.cpp
 @@ -322,7 +322,7 @@ void DxbcShaderTranslator::StartPixelShader_LoadROVParameters() {
@@ -576,7 +576,7 @@ index a7d508a..d39ce92 100644
      if (!(shader_writes_color_targets & (1 << i))) {
        continue;
 diff --git a/src/graphics/pipeline/shader/spirv_translator_rb.cpp b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
-index 43144ba..42541e5 100644
+index 43144bad..42541e5c 100644
 --- a/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 +++ b/src/graphics/pipeline/shader/spirv_translator_rb.cpp
 @@ -906,7 +906,7 @@ void SpirvShaderTranslator::CompleteFragmentShaderInMain() {
@@ -598,7 +598,7 @@ index 43144ba..42541e5 100644
    if (current_shader().writes_color_targets()) {
      // Get the offset of the sample 0 within a 32bpp surface, with samples
 diff --git a/src/graphics/trace_player.cpp b/src/graphics/trace_player.cpp
-index 2517601..f2edbdd 100644
+index 25176018..f2edbdd1 100644
 --- a/src/graphics/trace_player.cpp
 +++ b/src/graphics/trace_player.cpp
 @@ -9,8 +9,13 @@
@@ -642,7 +642,7 @@ index 2517601..f2edbdd 100644
          command_processor->RestoreEdramSnapshot(edram_snapshot.get());
          break;
 diff --git a/src/graphics/trace_writer.cpp b/src/graphics/trace_writer.cpp
-index 2a35689..63181fc 100644
+index 2a356892..63181fc7 100644
 --- a/src/graphics/trace_writer.cpp
 +++ b/src/graphics/trace_writer.cpp
 @@ -255,7 +255,7 @@ void TraceWriter::WriteEdramSnapshot(const void* snapshot) {
@@ -667,7 +667,7 @@ index 2a35689..63181fc 100644
  }
  
 diff --git a/src/graphics/util/draw.cpp b/src/graphics/util/draw.cpp
-index 70c8a7e..db2eaeb 100644
+index 70c8a7e3..db2eaeb5 100644
 --- a/src/graphics/util/draw.cpp
 +++ b/src/graphics/util/draw.cpp
 @@ -1247,7 +1247,7 @@ bool GetResolveInfo(const RegisterFile& regs, const memory::Memory& memory,
@@ -689,7 +689,7 @@ index 70c8a7e..db2eaeb 100644
      color_edram_info.format = uint32_t(color_info.color_format);
      color_edram_info.format_is_64bpp = is_64bpp;
 diff --git a/src/graphics/vulkan/render_target_cache.cpp b/src/graphics/vulkan/render_target_cache.cpp
-index 6414d1c..443e528 100644
+index 6414d1c4..443e5281 100644
 --- a/src/graphics/vulkan/render_target_cache.cpp
 +++ b/src/graphics/vulkan/render_target_cache.cpp
 @@ -488,7 +488,7 @@ bool VulkanRenderTargetCache::Initialize(uint32_t shared_memory_binding_count) {
@@ -839,7 +839,7 @@ index 6414d1c..443e528 100644
            spv::OpIAdd, type_uint,
            builder.createBinOp(spv::OpIMul, type_uint, const_tile_width, tile_sample_y),
 diff --git a/src/graphics/xenos.cpp b/src/graphics/xenos.cpp
-index 4140de7..3133e18 100644
+index 4140de71..3133e186 100644
 --- a/src/graphics/xenos.cpp
 +++ b/src/graphics/xenos.cpp
 @@ -11,13 +11,35 @@

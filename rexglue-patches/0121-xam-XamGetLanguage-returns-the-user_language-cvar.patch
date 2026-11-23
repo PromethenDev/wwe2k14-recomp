@@ -1,0 +1,87 @@
+From d0d3f5711a30a51d8e1484936bc050b0d5bdfe10 Mon Sep 17 00:00:00 2001
+From: PromethenDev <PromethenDev@users.noreply.github.com>
+Date: Sat, 24 Oct 2026 00:02:03 -0700
+Subject: [PATCH 121/149] xam: XamGetLanguage returns the user_language cvar
+
+WWE 2K14 language setting (launcher --user_language).
+
+Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>
+---
+ src/kernel/xam/xam_locale.cpp |  5 ++++-
+ tests/unit/core/cvar_test.cpp | 16 ++++++++++++++++
+ 2 files changed, 20 insertions(+), 1 deletion(-)
+
+diff --git a/src/kernel/xam/xam_locale.cpp b/src/kernel/xam/xam_locale.cpp
+index 74e15d9b..af47aaec 100644
+--- a/src/kernel/xam/xam_locale.cpp
++++ b/src/kernel/xam/xam_locale.cpp
+@@ -16,6 +16,7 @@
+ #include <rex/logging.h>
+ #include <rex/ppc/function.h>
+ #include <rex/ppc/types.h>
++#include <rex/system/flags.h>
+ #include <rex/system/kernel_state.h>
+ #include <rex/system/xenumerator.h>
+ #include <rex/system/xthread.h>
+@@ -217,6 +218,8 @@ ppc_u32_result_t XamGetLocale_entry() {
+   return static_cast<uint8_t>(xeXamGetLocale());
+ }
+ 
++ppc_u32_result_t XamGetLanguage_entry() { return REXCVAR_GET(user_language); }
++
+ ppc_u32_result_t XamGetOnlineCountryFromLocale_entry(ppc_u32_t id) {
+   return xeXamGetOnlineCountryFromLocale(id);
+ }
+@@ -402,6 +405,7 @@ ppc_u32_result_t XamGetLocaleEx_entry(ppc_u32_t max_country_id, ppc_u32_t max_lo
+ }  // namespace rex
+ 
+ XAM_EXPORT(__imp__XamGetLocale, rex::kernel::xam::XamGetLocale_entry)
++XAM_EXPORT(__imp__XamGetLanguage, rex::kernel::xam::XamGetLanguage_entry)
+ XAM_EXPORT(__imp__XamGetOnlineCountryFromLocale,
+            rex::kernel::xam::XamGetOnlineCountryFromLocale_entry)
+ XAM_EXPORT(__imp__XamGetOnlineCountryString, rex::kernel::xam::XamGetOnlineCountryString_entry)
+@@ -425,7 +429,6 @@ XAM_EXPORT_STUB(__imp__XamFormatMessage);
+ XAM_EXPORT_STUB(__imp__XamFormatSystemDateString);
+ XAM_EXPORT_STUB(__imp__XamGetCountry);
+ XAM_EXPORT_STUB(__imp__XamGetCurrencyFormat);
+-XAM_EXPORT_STUB(__imp__XamGetLanguage);
+ XAM_EXPORT_STUB(__imp__XamGetLanguageLocaleFallbackString);
+ XAM_EXPORT_STUB(__imp__XamGetLanguageTypeface);
+ XAM_EXPORT_STUB(__imp__XamGetLanguageTypefacePatch);
+diff --git a/tests/unit/core/cvar_test.cpp b/tests/unit/core/cvar_test.cpp
+index 07265661..ff990385 100644
+--- a/tests/unit/core/cvar_test.cpp
++++ b/tests/unit/core/cvar_test.cpp
+@@ -13,6 +13,12 @@
+ #include <catch2/catch_test_macros.hpp>
+ 
+ #include <rex/cvar.h>
++#include <rex/ppc/types.h>
++#include <rex/system/flags.h>
++
++namespace rex::kernel::xam {
++ppc_u32_result_t XamGetLanguage_entry();
++}  // namespace rex::kernel::xam
+ 
+ // Test cvars
+ REXCVAR_DEFINE_BOOL(test_bool_flag, false, "Test", "Test boolean flag");
+@@ -77,6 +83,16 @@ TEST_CASE("cvar REXCVAR_SET and REXCVAR_GET macros", "[cvar]") {
+   }
+ }
+ 
++TEST_CASE("XamGetLanguage returns the configured user language", "[cvar][kernel]") {
++  rex::cvar::ResetToDefault("user_language");
++  CHECK(rex::kernel::xam::XamGetLanguage_entry() == 1u);
++
++  REXCVAR_SET(user_language, 9u);
++  CHECK(rex::kernel::xam::XamGetLanguage_entry() == 9u);
++
++  rex::cvar::ResetToDefault("user_language");
++}
++
+ TEST_CASE("cvar SetFlagByName and GetFlagByName string API", "[cvar]") {
+   SECTION("Set and get by name with string conversion") {
+     REQUIRE(rex::cvar::SetFlagByName("test_bool_flag", "true"));
+-- 
+2.43.0
+
