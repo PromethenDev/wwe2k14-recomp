@@ -11,7 +11,9 @@
 #include <thread>
 #include <unordered_set>
 
+#if defined(_WIN32)
 #include <windows.h>
+#endif
 
 #include <rex/cvar.h>
 
@@ -48,7 +50,9 @@ std::deque<PipelineState> g_queue;
 std::unordered_set<u64> g_queued;
 
 void CompileWorker() {
+#if defined(_WIN32)
   SetThreadPriority(GetCurrentThread(), THREAD_PRIORITY_BELOW_NORMAL);
+#endif
   u64 built = 0;
   for (;;) {
     PipelineState state;

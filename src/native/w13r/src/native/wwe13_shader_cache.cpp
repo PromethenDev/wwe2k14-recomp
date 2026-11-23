@@ -9,9 +9,13 @@
 // shader is ready, re:Blue finds no entry for it and skips the draws that need it: nothing
 // crashes, the picture fills in as conversions finish. The cache file is never shipped.
 
+#if defined(_WIN32)
 #include <windows.h>
 #include <objidl.h>  // IUnknown, IStream for dxcapi.h (the build defines WIN32_LEAN_AND_MEAN)
 #include <unknwn.h>
+#else
+#include <dlfcn.h>  // Linux: libdxcompiler.so beside the executable
+#endif
 
 #include <algorithm>
 #include <atomic>
@@ -19,6 +23,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <cstdio>
+#include <cstring>
 #include <deque>
 #include <filesystem>
 #include <memory>
@@ -89,9 +94,22 @@ std::chrono::steady_clock::time_point g_first_request;
 std::mutex g_file_mutex;
 std::filesystem::path g_cache_path;
 
+#if defined(_WIN32)
 HMODULE g_dxc_module = nullptr;
+#else
+void *g_dxc_module = nullptr;
+#endif
 DxcCreateInstanceProc g_dxc_create = nullptr;
 bool g_dxc_missing_logged = false;
+
+FILE *OpenCacheFile(const std::filesystem::path &path, const char *mode) {
+#if defined(_WIN32)
+  const std::wstring wmode(mode, mode + std::strlen(mode));
+  return _wfopen(path.c_str(), wmode.c_str());
+#else
+  return std::fopen(path.c_str(), mode);
+#endif
+}
 
 uint32_t CommonTag() {
   uint32_t h = 2166136261u;
@@ -109,7 +127,7 @@ void Insert(uint64_t hash, uint32_t spec_mask, std::vector<uint8_t> smol) {
 
 void LoadCacheFile() {
   g_cache_path = rex::filesystem::GetExecutableFolder() / "cache" / "native_shaders.bin";
-  FILE *f = _wfopen(g_cache_path.c_str(), L"rb");
+  FILE *f = OpenCacheFile(g_cache_path, "rb");
   if (!f) {
 #if !defined(WWE13_BUILTIN_SPIRV)
     BD_INFO("Native shaders: no cache yet ({}); the game's shaders are converted on this first "
@@ -152,7 +170,7 @@ void Append(uint64_t hash, uint32_t spec_mask, const std::vector<uint8_t> &smol)
   std::error_code ec;
   std::filesystem::create_directories(g_cache_path.parent_path(), ec);
   const bool fresh = !std::filesystem::exists(g_cache_path, ec);
-  FILE *f = _wfopen(g_cache_path.c_str(), L"ab");
+  FILE *f = OpenCacheFile(g_cache_path, "ab");
   if (!f) {
     // Read-only folder (Program Files, a locked copy): the converted shaders still work for this
     // session, they are just converted again at the next launch.
@@ -181,11 +199,19 @@ void Append(uint64_t hash, uint32_t spec_mask, const std::vector<uint8_t> &smol)
 bool LoadDxc() {
   if (g_dxc_create)
     return true;
+#if defined(_WIN32)
   const auto dll = rex::filesystem::GetExecutableFolder() / "dxcompiler.dll";
   g_dxc_module = LoadLibraryW(dll.c_str());
   if (g_dxc_module)
     g_dxc_create =
         reinterpret_cast<DxcCreateInstanceProc>(GetProcAddress(g_dxc_module, "DxcCreateInstance"));
+#else
+  const auto dll = rex::filesystem::GetExecutableFolder() / "libdxcompiler.so";
+  g_dxc_module = dlopen(dll.c_str(), RTLD_NOW | RTLD_LOCAL);
+  if (g_dxc_module)
+    g_dxc_create =
+        reinterpret_cast<DxcCreateInstanceProc>(dlsym(g_dxc_module, "DxcCreateInstance"));
+#endif
   if (!g_dxc_create && !g_dxc_missing_logged) {
     g_dxc_missing_logged = true;
 #if defined(WWE13_BUILTIN_SPIRV)

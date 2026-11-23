@@ -150,7 +150,7 @@ Result SetModThemeVolume(const fs::path& pack, uint64_t offset, float db);
 enum class Renderer { kNative, kXbox };
 // v1.7.0 (owner 2026-11-22): "Native" now means the new renderer (the WWE '13 v1.6 renderer, decision 0008), shipped as
 // three game programs beside wwe2k14.exe: wwe2k14-vulkan.exe, wwe2k14-d3d12.exe, wwe2k14-d3d11.exe. wwe2k14.exe stays
-// for the Xbox renderer. Linux ships no new-renderer program yet: there the native choice keeps wwe2k14.
+// for the Xbox renderer. v1.7.1: Linux runs it too (Linux-x86_64/wwe2k14-vulkan, Vulkan only); wwe2k14 = Xbox there.
 enum class NativeApi { kVulkan, kD3D12, kD3D11 };
 // v1.7.0: the game program a launch uses. Xbox -> paths.game_exe; native on Windows -> wwe2k14-<api>.exe in the same
 // folder; native elsewhere -> paths.game_exe. Every game program name (for "is the game running" checks).

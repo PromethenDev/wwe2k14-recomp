@@ -358,7 +358,17 @@ void TestLaunchPlan(const fs::path& root) {
     settings.game_folder = root / "launch" / "Masaüstü" / "WWE 2K14";
     settings.explicit_choice = true;
     const LaunchPlan plan = BuildLaunchPlan(paths, settings, gpus);
-    assert(plan.executable == paths.game_exe);
+    // v1.7.1: the default (native) choice starts the new renderer: wwe2k14-vulkan(.exe) beside the game program.
+#ifdef _WIN32
+    assert(plan.executable == paths.game_exe.parent_path() / "wwe2k14-vulkan.exe");
+#else
+    assert(plan.executable == paths.game_exe.parent_path() / "wwe2k14-vulkan");
+#endif
+    {
+      Settings xbox = settings;
+      xbox.renderer = Renderer::kXbox;
+      assert(BuildLaunchPlan(paths, xbox, gpus).executable == paths.game_exe);  // Xbox keeps wwe2k14(.exe)
+    }
     assert(plan.working_directory == paths.exe_dir);
     const std::vector<std::string> fixed = {
         wwe2k14::launcher::internal::PathToUtf8(settings.game_folder),

@@ -37,6 +37,9 @@
 #include "gpu/output.h"
 #include "gpu/settings.h"
 #include "platform/platform.h"
+// WWE 2K14 (v1.7.1): this renderer presents itself, so it tells the SDK freeze watchdog about each frame;
+// without it real freezes were never reported and on-demand reports said "no frame presented".
+#include <rex/diagnostics/freeze_logger.h>
 
 bool Wwe12LoadTurboSkipPresent();  // native/wwe12_load_turbo.cpp
 #if defined(SVR_NATIVE_RENDERER)
@@ -209,7 +212,8 @@ void WaitAllFrames(VideoState &s) {
 }
 #endif
 
-void RebuildSwapChain(VideoState &s, plume::RenderWindow new_window = nullptr) {
+// {} default: the Linux X11 RenderWindow is a struct (2K14 v1.7.1).
+void RebuildSwapChain(VideoState &s, plume::RenderWindow new_window = {}) {
   SubmitOpenListLocked(s);
   for (u32 i = 0; i < kNumFrames; ++i) {
     if (s.command_list_submitted[i]) {
@@ -665,6 +669,8 @@ void Video::Present(GuestTexture *frontBuffer) {
     if (!s.swap_chain->present(texture_index, signals, 1)) {
       if (!CheckDeviceRemoved("swapchain present"))
         s.resize_requested.store(true, std::memory_order_release);
+    } else {
+      rex::diagnostics::freeze_logger::RecordPresent();
     }
     present_call_ms = MsSince(present_start);
     swap_ms += present_call_ms;
@@ -795,6 +801,8 @@ void Video::PresentOverlayFrame() {
   ApplyVsync(s);
   if (!s.swap_chain->present(texture_index, signals, 1)) {
     CheckDeviceRemoved("swapchain present (overlay)");
+  } else {
+    rex::diagnostics::freeze_logger::RecordPresent();
   }
   AdvanceAndWaitReused(s);
   const u32 reclaimed = s.frame.load(std::memory_order_relaxed);

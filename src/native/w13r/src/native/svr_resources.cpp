@@ -6,6 +6,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
+#include <filesystem>
 #include <mutex>
 #include <shared_mutex>
 #include <string>
@@ -14,7 +16,13 @@
 
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
+#if defined(_WIN32)
 #include <windows.h>
+#else
+#include <sched.h>
+#include <sys/resource.h>
+#include <thread>
+#endif
 
 #include <fmt/format.h>
 
@@ -227,8 +235,18 @@ REXCVAR_DEFINE_INT32(svr_lowend_cpu_count, 0, "SvR",
                      "Test: pretend the PC has this many logical processors for svr_auto_lowend (0 = detect)")
     .range(0, 256);
 
+// Diagnostic dumps: a wide-char path on Windows, the UTF-8 path elsewhere.
+static FILE *SvrOpenWrite(const std::filesystem::path &path) {
+#if defined(_WIN32)
+  return _wfopen(path.c_str(), L"wb");
+#else
+  return std::fopen(path.c_str(), "wb");
+#endif
+}
+
 static unsigned LogicalProcessorsAvailable() {
   if (const int forced = REXCVAR_GET(svr_lowend_cpu_count); forced > 0) return unsigned(forced);
+#if defined(_WIN32)
   unsigned n = unsigned(GetActiveProcessorCount(ALL_PROCESSOR_GROUPS));
   DWORD_PTR proc = 0, sys = 0;
   if (GetProcessAffinityMask(GetCurrentProcess(), &proc, &sys) && proc) {
@@ -236,6 +254,12 @@ static unsigned LogicalProcessorsAvailable() {
     for (DWORD_PTR m = proc; m; m &= m - 1) ++a;
     n = std::min(n, a);
   }
+#else
+  unsigned n = std::thread::hardware_concurrency();
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof(set), &set) == 0 && CPU_COUNT(&set) > 0)
+    n = n ? std::min(n, unsigned(CPU_COUNT(&set))) : unsigned(CPU_COUNT(&set));
+#endif
   return n ? n : 1;
 }
 
@@ -915,7 +939,7 @@ void FinishReadBack(u32 texture_va, GuestTexture *dst, std::vector<u8> &pixels, 
       const auto path = rex::filesystem::GetExecutableFolder() / "logs" /
                         fmt::format("readback_{:02}_{:08X}_{}x{}.rgba", n, texture_va, dst->width,
                                     dst->height);
-      if (FILE *f = _wfopen(path.c_str(), L"wb")) {
+      if (FILE *f = SvrOpenWrite(path)) {
         const u32 header[4] = {dst->width, dst->height, row_pitch, texture_va};
         std::fwrite(header, 4, 4, f);
         std::fwrite(pixels.data(), 1, pixels.size(), f);
@@ -974,7 +998,7 @@ void FinishReadBack(u32 texture_va, GuestTexture *dst, std::vector<u8> &pixels, 
       const auto path = rex::filesystem::GetExecutableFolder() / "logs" /
                         fmt::format("guestmem_{:02}_{:08X}_{}x{}.raw", n, texture_va, guest_w,
                                     guest_h);
-      if (FILE *f = _wfopen(path.c_str(), L"wb")) {
+      if (FILE *f = SvrOpenWrite(path)) {
         const u32 header[4] = {guest_w, guest_h, pitch_blocks, texture_va};
         std::fwrite(header, 4, 4, f);
         std::fwrite(raw.data(), 1, raw.size(), f);
@@ -1426,11 +1450,19 @@ static void LoadStatsTick() {
   static double last_cpu_ms = 0;
   double cpu_now_ms = 0;
   {
+#if defined(_WIN32)
     FILETIME created, exited, kernel, user;
     if (GetProcessTimes(GetCurrentProcess(), &created, &exited, &kernel, &user)) {
       const auto ticks = [](const FILETIME &f) { return double((uint64_t(f.dwHighDateTime) << 32) | f.dwLowDateTime); };
       cpu_now_ms = (ticks(kernel) + ticks(user)) / 10000.0;
     }
+#else
+    rusage ru{};
+    if (getrusage(RUSAGE_SELF, &ru) == 0) {
+      const auto ms = [](const timeval &t) { return double(t.tv_sec) * 1000.0 + double(t.tv_usec) / 1000.0; };
+      cpu_now_ms = ms(ru.ru_utime) + ms(ru.ru_stime);
+    }
+#endif
   }
   const double cpu_ms = cpu_now_ms - last_cpu_ms;
   last_cpu_ms = cpu_now_ms;

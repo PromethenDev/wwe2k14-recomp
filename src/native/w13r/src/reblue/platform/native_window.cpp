@@ -169,6 +169,57 @@ bool GetNativeRenderWindow(rex::ui::Window *window, plume::RenderWindow &out) {
   return true;
 }
 
+#elif defined(__linux__) && !defined(PLUME_SDL_VULKAN_ENABLED)
+
+} // namespace bd::platform
+
+// WWE 2K14 (SDK 0.7.3): the game window is the SDK's GTK window on X11. plume's Xlib surface needs the X display and
+// the X window of the drawing area, the same window the SDK's own presenter draws into (GTKWindow::CreateSurfaceImpl).
+#include <rex/ui/window_gtk.h>
+// The forced compat headers undefine some Xlib macros; Xutil.h (via gdkx.h) still needs Status.
+#ifndef Status
+#define Status int
+#endif
+#include <gdk/gdkx.h>
+
+namespace bd::platform {
+namespace {
+GtkWidget *FindDrawingArea(GtkWidget *widget) {
+  if (!widget) return nullptr;
+  if (GTK_IS_DRAWING_AREA(widget)) return widget;
+  if (!GTK_IS_CONTAINER(widget)) return nullptr;
+  GList *children = gtk_container_get_children(GTK_CONTAINER(widget));
+  GtkWidget *found = nullptr;
+  for (GList *child = children; child && !found; child = child->next)
+    found = FindDrawingArea(GTK_WIDGET(child->data));
+  g_list_free(children);
+  return found;
+}
+} // namespace
+
+bool GetNativeRenderWindow(rex::ui::Window *window, plume::RenderWindow &out) {
+  auto *gtk_window = dynamic_cast<rex::ui::GTKWindow *>(window);
+  GtkWidget *top = gtk_window ? gtk_window->window() : nullptr;
+  if (!top) {
+    BD_ERROR("No GTK window available for the Vulkan surface");
+    return false;
+  }
+  GdkDisplay *display = gtk_widget_get_display(top);
+  if (!GDK_IS_X11_DISPLAY(display)) {
+    BD_ERROR("The game window is not on X11 (Wayland needs XWayland): no Vulkan surface");
+    return false;
+  }
+  GtkWidget *area = FindDrawingArea(top);
+  GdkWindow *gdk_window = gtk_widget_get_window(area ? area : top);
+  if (!gdk_window) {
+    BD_ERROR("The GTK window is not realized yet: no Vulkan surface");
+    return false;
+  }
+  out.display = gdk_x11_display_get_xdisplay(display);
+  out.window = gdk_x11_window_get_xid(gdk_window);
+  return out.display && out.window;
+}
+
 #else
 
 bool GetNativeRenderWindow(rex::ui::Window *window, plume::RenderWindow &out) {

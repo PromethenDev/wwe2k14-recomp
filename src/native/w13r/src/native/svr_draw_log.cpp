@@ -16,9 +16,11 @@
 
 #include <fmt/format.h>
 
+#if defined(_WIN32)
 #define WIN32_LEAN_AND_MEAN
 #define NOMINMAX
 #include <windows.h>
+#endif
 
 #include "core/logging.h"
 #include "core/memory_helpers.h"
@@ -57,7 +59,12 @@ static bool KeyFrameActive() {
   static std::atomic<u64> s_polled{~0ull};
   static std::atomic<u64> s_target{0};
   const u64 frame = SvrFrameIndex();
-  if (s_polled.exchange(frame) != frame && (GetAsyncKeyState(VK_F9) & 1)) {
+#if defined(_WIN32)
+  const bool f9 = s_polled.exchange(frame) != frame && (GetAsyncKeyState(VK_F9) & 1);
+#else
+  const bool f9 = false;  // diagnostic hotkey: Windows only (the draw log cvars still work)
+#endif
+  if (f9) {
     s_target = frame + 1;
     BD_INFO("[drawlog] F9: logging frame {}", frame + 1);
   }

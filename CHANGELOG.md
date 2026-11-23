@@ -1,5 +1,10 @@
 # Changelog
 
+## v1.7.1 - 2026-11-23
+
+- **New renderer on Linux too** (Vulkan): Settings > Renderer offers Vulkan (recommended) or Xbox on Linux.
+- **Freeze reports** work again with the new renderer (Windows and Linux).
+
 ## v1.7.0 - 2026-11-23
 
 - **New renderer (Windows):** the WWE '13 v1.6 native renderer by iMrBurn (GPL-3.0) now draws the game: smoother and much

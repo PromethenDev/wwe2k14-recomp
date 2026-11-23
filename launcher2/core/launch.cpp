@@ -297,13 +297,15 @@ const char* NativeApiName(NativeApi api) {
 }
 
 fs::path GameExecutableFor(const Paths& paths, Renderer renderer, NativeApi api) {
-#ifdef _WIN32
   if (renderer == Renderer::kNative && !paths.game_exe.empty()) {
+#ifdef _WIN32
     return paths.game_exe.parent_path() / ("wwe2k14-" + std::string(NativeApiName(api)) + ".exe");
-  }
 #else
-  (void)renderer; (void)api;
+    // v1.7.1 (owner 11-23): Linux runs the new renderer too, Vulkan only (Linux-x86_64/wwe2k14-vulkan).
+    (void)api;
+    return paths.game_exe.parent_path() / "wwe2k14-vulkan";
 #endif
+  }
   return paths.game_exe;
 }
 
@@ -313,6 +315,8 @@ std::vector<fs::path> AllGameExecutables(const Paths& paths) {
   for (NativeApi api : {NativeApi::kVulkan, NativeApi::kD3D12, NativeApi::kD3D11}) {
     result.push_back(GameExecutableFor(paths, Renderer::kNative, api));
   }
+#else
+  result.push_back(GameExecutableFor(paths, Renderer::kNative, NativeApi::kVulkan));
 #endif
   return result;
 }

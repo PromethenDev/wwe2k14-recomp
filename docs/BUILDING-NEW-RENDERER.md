@@ -1,10 +1,10 @@
-# Building the new renderer (v1.7.0)
+# Building the new renderer (v1.7.1)
 
 From v1.7.0 the Windows release has three extra game programs: `wwe2k14-vulkan.exe`, `wwe2k14-d3d12.exe` and
-`wwe2k14-d3d11.exe`. They are WWE 2K14 drawn through the WWE '13 Recomp v1.6 native renderer by iMrBurn
+`wwe2k14-d3d11.exe`; from v1.7.1 the Linux release has `Linux-x86_64/wwe2k14-vulkan`. They are WWE 2K14 drawn through the WWE '13 Recomp v1.6 native renderer by iMrBurn
 (`src/native/w13r`, GPL-3.0, see `src/native/w13r/LICENSE.GPL-3.0` and `src/native/w13r/THIRD_PARTY.wwe13.md`).
-Because they contain that code, these three programs as a whole are distributed under GPL-3.0; this repository
-(tag `v1.7.0`) is their source. `wwe2k14.exe` (Xbox renderer) and the launcher keep the BSD 3-Clause licence.
+Because they contain that code, these programs as a whole are distributed under GPL-3.0; this repository
+(tag `v1.7.1`) is their source. `wwe2k14.exe` (Xbox renderer) and the launcher keep the BSD 3-Clause licence.
 
 Not included, as for every build of this project: the game, the code recompiled from your `default.xex`
 (`generated/`, made by `tools/codegen.sh`), and the game's shaders the Direct3D builds pre-convert (see step 3).
@@ -12,7 +12,7 @@ Not included, as for every build of this project: the game, the code recompiled 
 ## 1. SDK
 
 The same as the main build (`docs/BUILDING.md`): `tools/setup.sh` clones rexglue-sdk-yukes at
-`987593c0fc6612850a2e1b247b2b03aa5281e663` and applies `rexglue-patches/*.patch` (149 patches for v1.7.0).
+`987593c0fc6612850a2e1b247b2b03aa5281e663` and applies `rexglue-patches/*.patch` (149 patches for v1.7.1).
 
 ## 2. Renderer dependencies (plume, XenosRecomp)
 
@@ -77,3 +77,19 @@ the launcher, with `dxcompiler.dll` and `dxil.dll` from the DirectX Shader Compi
 
 The launcher's source is in `launcher2/`. Its Settings page starts `wwe2k14-<api>.exe` for the Vulkan, DirectX 12
 and DirectX 11 choices and `wwe2k14.exe` for the Xbox choice (`launcher2/core/launch.cpp`, `GameExecutableFor`).
+
+## Linux (v1.7.1)
+
+The Linux program `Linux-x86_64/wwe2k14-vulkan` is the same renderer built natively on Linux (Vulkan only), with the
+Linux SDK from `docs/BUILDING.md`:
+
+```bash
+cmake -S . -B out/build/linux-amd64-w13r -G "Ninja Multi-Config" -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++ \
+  -DCMAKE_PREFIX_PATH=<the Linux SDK install that tools/setup.sh makes> \
+  -DWWE2K14_HAS_NR=OFF -DWWE2K14_W13R=ON -DWWE2K14_W13R_API=vulkan -DWWE2K14_TEST_TOOLS=OFF
+cmake --build out/build/linux-amd64-w13r --config RelWithDebInfo --target wwe2k14
+```
+
+Rename the result to `wwe2k14-vulkan`; the build copies `libdxcompiler.so` and `libdxil.so` (from reblue-XenosRecomp's
+`thirdparty/dxc-bin/lib/x64`) beside it. The SDK's Linux window is a GTK window on X11, so plume is built without its
+SDL integration and draws into the window's X11 drawing area (`src/native/w13r/src/reblue/platform/native_window.cpp`).

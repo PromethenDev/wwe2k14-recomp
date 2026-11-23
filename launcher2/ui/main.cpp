@@ -2,11 +2,7 @@
 // v1.7.0: the new-renderer Settings layout (Vulkan / DirectX 12 / DirectX 11 / Xbox) is the Windows UI; screenshot
 // builds on Linux can force it with -DWWE2K14_NEW_RENDERER_UI=1.
 #ifndef WWE2K14_NEW_RENDERER_UI
-#ifdef _WIN32
-#define WWE2K14_NEW_RENDERER_UI 1
-#else
-#define WWE2K14_NEW_RENDERER_UI 0
-#endif
+#define WWE2K14_NEW_RENDERER_UI 1  // v1.7.1: Linux too (Vulkan + Xbox choices there)
 #endif
 #include "grid_face_repair.h"
 #include "launcher_version.h"
@@ -3188,6 +3184,9 @@ std::string FrameRateName(FrameRate rate) {
 const char* RendererLabel(const Settings& s) {
   if (s.renderer == Renderer::kXbox) return "Xbox";
 #if WWE2K14_NEW_RENDERER_UI
+#ifndef _WIN32
+  return "Vulkan";  // Linux: the new renderer is Vulkan only
+#endif
   switch (s.native_api) {
     case NativeApi::kD3D12: return "DirectX 12";
     case NativeApi::kD3D11: return "DirectX 11";
@@ -4362,10 +4361,25 @@ void DrawSettingsMenuStyle(AppState& app) {
     }};
     int index = 3;
     if (!xbox) index = current.native_api == NativeApi::kD3D12 ? 1 : current.native_api == NativeApi::kD3D11 ? 2 : 0;
+#ifndef _WIN32
+    // Linux: Vulkan (new renderer) or Xbox only; DirectX choices do not exist there.
+    if (!xbox) index = 0;
+    static const std::array<int, 2> kLinuxChoices{0, 3};
+    const int linux_slot = xbox ? 1 : 0;
+#endif
     SettingsMenuRow row{"Renderer", kChoices[index].name, kChoices[index].name, kChoices[index].help, nullptr};
     if (!xbox) row.help += "\n\nIn the game: F1 (or Back + Start) opens the game's own settings, F3 shows the frame rate.";
-    row.change = [&app, index](int direction) {
+    row.change = [&app, index
+#ifndef _WIN32
+                  , linux_slot
+#endif
+    ](int direction) {
+#ifndef _WIN32
+      const Choice& next = kChoices[kLinuxChoices[CycleIndex(linux_slot, 2, direction)]];
+      (void)index;
+#else
       const Choice& next = kChoices[CycleIndex(index, 4, direction)];
+#endif
       app.settings.renderer = next.renderer;
       if (next.renderer == Renderer::kNative) app.settings.native_api = next.api;
       SaveSettings(app);
@@ -4373,17 +4387,21 @@ void DrawSettingsMenuStyle(AppState& app) {
     rows.push_back(row);
   }
   if (!xbox) {
-    static const std::array<PictureSize, 7> kSizes{PictureSize::k360p, PictureSize::k480p, PictureSize::k540p,
-                                                   PictureSize::k720p, PictureSize::k1080p, PictureSize::k1440p,
-                                                   PictureSize::k4k};
-    int index = 3;
-    for (int i = 0; i < 7; ++i) if (kSizes[i] == current.picture_size) index = i;
-    rows.push_back({"Picture size", PictureSizeName(current.picture_size), PictureSizeName(current.picture_size),
-                    "The size the game draws at. Lower is faster: 360p to 540p suit integrated graphics; 1080p and "
-                    "above need a stronger card.",
+    // The new renderer draws at 480p, 720p, 1080p, 1440p or 4K (w13r_bridge.cpp maps the launcher's scale to one of
+    // them: an older 360p setting draws at 480p, 540p at 720p), so only those five are offered (Fable v1.7.0 item 6).
+    static const std::array<PictureSize, 5> kSizes{PictureSize::k480p, PictureSize::k720p, PictureSize::k1080p,
+                                                   PictureSize::k1440p, PictureSize::k4k};
+    PictureSize shown = current.picture_size;
+    if (shown == PictureSize::k360p) shown = PictureSize::k480p;
+    if (shown == PictureSize::k540p) shown = PictureSize::k720p;
+    int index = 1;
+    for (int i = 0; i < 5; ++i) if (kSizes[i] == shown) index = i;
+    rows.push_back({"Picture size", PictureSizeName(shown), PictureSizeName(shown),
+                    "The size the game draws at. Lower is faster: 480p suits integrated graphics; 1080p and above "
+                    "need a stronger card.",
                     [&app, index](int direction) {
                       KeepManualSettings(app, RecommendedField::kPictureSize);
-                      app.settings.picture_size = kSizes[CycleIndex(index, 7, direction)];
+                      app.settings.picture_size = kSizes[CycleIndex(index, 5, direction)];
                       SaveSettings(app);
                     }});
   } else {
@@ -4427,12 +4445,13 @@ void DrawSettingsMenuStyle(AppState& app) {
                       SaveSettings(app);
                     }});
   }
-  rows.push_back({"Stretch to fill wide screens", on_off(current.stretch_to_fill_wide_screens), "Stretch to fill",
-                  "Fills a 21:9 or 16:10 screen by stretching the 16:9 picture.", [&app](int) {
-                    app.settings.stretch_to_fill_wide_screens = !app.settings.stretch_to_fill_wide_screens;
-                    SaveSettings(app);
-                  }});
+  // Stretch and Sync frames act only on the Xbox renderer: the new renderer presents by itself (Fable v1.7.0 item 5).
   if (xbox) {
+    rows.push_back({"Stretch to fill wide screens", on_off(current.stretch_to_fill_wide_screens), "Stretch to fill",
+                    "Fills a 21:9 or 16:10 screen by stretching the 16:9 picture.", [&app](int) {
+                      app.settings.stretch_to_fill_wide_screens = !app.settings.stretch_to_fill_wide_screens;
+                      SaveSettings(app);
+                    }});
     rows.push_back({"Anti-aliasing", on_off(current.xbox_anti_aliasing), "Anti-aliasing",
                     "Smooths edges in the finished picture. Turning it off may improve speed.", [&app](int) {
                       app.settings.xbox_anti_aliasing = !app.settings.xbox_anti_aliasing;
@@ -4473,12 +4492,14 @@ void DrawSettingsMenuStyle(AppState& app) {
                     SaveSettings(app);
                     if (app.settings.check_updates) StartUpdateCheck(app);
                   }});
-  rows.push_back({"Sync frames to the monitor", on_off(app.settings.sync_frames_to_monitor), "Sync frames",
-                  "Keep this on. Turn it off only if the game runs too fast or stutters on a high-refresh display.",
-                  [&app](int) {
-                    app.settings.sync_frames_to_monitor = !app.settings.sync_frames_to_monitor;
-                    SaveSettings(app);
-                  }});
+  if (xbox) {
+    rows.push_back({"Sync frames to the monitor", on_off(app.settings.sync_frames_to_monitor), "Sync frames",
+                    "Keep this on. Turn it off only if the game runs too fast or stutters on a high-refresh display.",
+                    [&app](int) {
+                      app.settings.sync_frames_to_monitor = !app.settings.sync_frames_to_monitor;
+                      SaveSettings(app);
+                    }});
+  }
 #ifndef WWE2K14_LAUNCHER_NO_TEST_TOOLS
   if (!TestBuildMarkerRoot(app.paths).empty()) {
     rows.push_back({"Graphics capture mode", on_off(app.settings.glitch_capture_mode), "Graphics capture mode",
@@ -4610,7 +4631,7 @@ void DrawSettingsMenuStyle(AppState& app) {
     ImGui::PushFont(app.fonts.barlow_medium);
     if (AccentButton(app, "Recommended settings for my PC", ImVec2(-1.0f, S(app, 36.0f)))) RequestRecommendedSettings(app);
     ImGui::PopFont();
-    DrawSecondaryWrapped(app, "Suggests a renderer, picture size and frame rate for this PC. You review the changes first.",
+    DrawSecondaryWrapped(app, "Suggests a picture size and frame rate for this PC. You review the changes first.",
                          kMuted);
   }
   ImGui::EndChild();
@@ -4640,7 +4661,7 @@ void DrawSettings(AppState& app) {
     ImGui::PopFont();
     ImGui::TableNextColumn();
     DrawSecondaryWrapped(app,
-                         "Suggests a renderer, picture size and frame rate for this PC. Review changes before applying.",
+                         "Suggests a picture size and frame rate for this PC. Review changes before applying.",
                          kSecondary);
     ImGui::EndTable();
   }

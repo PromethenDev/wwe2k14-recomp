@@ -81,6 +81,11 @@ if(WIN32 AND (WWE13_D3D12_EXE OR WWE13_D3D11_EXE))
 else()
     set(PLUME_D3D12_ENABLED OFF CACHE BOOL "" FORCE)
 endif()
+# Linux (v1.7.1): WWE 2K14's SDK (0.7.3) opens a GTK window on X11, not an SDL window like WWE '13's SDK 0.10, so plume
+# uses its Xlib surface (RenderWindow = Display* + Window; platform/native_window.cpp takes them from the GTK window).
+if(NOT WIN32 AND NOT APPLE AND NOT ANDROID)
+    set(PLUME_SDL_VULKAN_ENABLED OFF CACHE BOOL "" FORCE)
+endif()
 add_subdirectory("${WWE13_PLUME_DIR}" "${CMAKE_BINARY_DIR}/plume" EXCLUDE_FROM_ALL)
 # w13r: plume's VMA beside the SDK's (different versions): rename plume's copy (compat/w13r_vma_rename.h).
 target_compile_options(plume PRIVATE -include "${WWE13_NATIVE_ROOT}/compat/w13r_vma_rename.h")
@@ -359,10 +364,19 @@ function(wwe13_add_native_renderer target)
             target_sources(${target} PRIVATE "${WWE13_SHADER_CACHE}")
         endif()
         target_link_libraries(${target} PRIVATE wwe13_xenosrecomp)
-        add_custom_command(TARGET ${target} POST_BUILD
-            COMMAND ${CMAKE_COMMAND} -E copy_if_different "${WWE13_DXCOMPILER_DLL}"
-                "$<TARGET_FILE_DIR:${target}>/dxcompiler.dll"
-            VERBATIM)
+        if(WIN32)
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${WWE13_DXCOMPILER_DLL}"
+                    "$<TARGET_FILE_DIR:${target}>/dxcompiler.dll"
+                VERBATIM)
+        else()
+            # Linux: DXC for shaders missing from the built-in cache (libdxcompiler.so dlopens libdxil.so).
+            set(_dxc_lib "${WWE13_XENOS_DIR}/thirdparty/dxc-bin/lib/x64")
+            add_custom_command(TARGET ${target} POST_BUILD
+                COMMAND ${CMAKE_COMMAND} -E copy_if_different "${_dxc_lib}/libdxcompiler.so"
+                    "${_dxc_lib}/libdxil.so" "$<TARGET_FILE_DIR:${target}>"
+                VERBATIM)
+        endif()
     endif()
     target_sources(${target} PRIVATE ${sources} ${host_shaders})
     target_include_directories(${target} PRIVATE
@@ -381,6 +395,11 @@ function(wwe13_add_native_renderer target)
         set(_names_include "-include;${WWE13_NATIVE_ROOT}/compat/w13r_vma_rename.h;-include;${WWE13_NATIVE_ROOT}/compat/w13r_compat.h;-include;${WWE13_NATIVE_ROOT}/src/native/wwe2k14_d3d_names.h")
     endif()
     set_source_files_properties(${WWE13_NATIVE_SOURCES} PROPERTIES COMPILE_OPTIONS "${_names_include}")
+    if(NOT WIN32)
+        # dxcapi.h off Windows (WinAdapter.h) declares its COM interfaces with __declspec(uuid).
+        set_property(SOURCE "${WWE13_NATIVE_ROOT}/src/native/wwe13_shader_cache.cpp" APPEND PROPERTY
+            COMPILE_OPTIONS -fms-extensions)
+    endif()
     # w13r: the generated shader caches use the SDK 0.10 type names too.
     foreach(_gen IN ITEMS "${WWE13_SHADER_CACHE}" "${WWE13_LINKED_SHADER_CACHE}" "${WWE13_DXBC_SHADER_CACHE}")
         if(_gen)
