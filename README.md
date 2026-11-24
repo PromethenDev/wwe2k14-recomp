@@ -1,8 +1,18 @@
-# WWE 2K14 Recomp v1.7.1
+# WWE 2K14 Recomp v1.7.2
 
 An unofficial static recompilation of the **Xbox 360 version of WWE 2K14** for 64-bit Windows and Linux. The original PowerPC
 game code is translated ahead of time to C++ and built into a native executable using the ReXGlue SDK; this is not an
 Xbox 360 emulator.
+
+## What's new in v1.7.2
+
+- **Faster match loading on the new renderer:** matches load about as fast as on the Xbox renderer again. On an Intel
+  UHD 630 the wait from the arena to the entrance went from about 23 to 8 seconds on Vulkan (DirectX 12: 25 to 8,
+  DirectX 11: 15 to 8). The game's loading work was only getting a tiny turn each frame (GitHub #193).
+- **Possible fix for a black screen on DirectX 12 with older Intel graphics** (HD 520 and similar): when the graphics
+  driver refuses one kind of memory the new renderer uses, it now switches to another kind instead of drawing nothing.
+  Not confirmed on an HD 520 yet (GitHub #46).
+- **Bug reports** now say whether the game was closed by the player or crashed.
 
 ## What's new in v1.7.1
 
@@ -306,7 +316,7 @@ Xbox 360 emulator.
 - **Lower CPU use** (Native renderer), **Language** setting, Xbox renderer **Frame rate** and
   **Anti-aliasing** options, Custom Music fixes, Superstar Threads faces, F3 counter fix, 4K memory crash fix, Linux
   start fixes and the game/launcher icon.
-- **Coming from an older version?** Extract v1.7.1 into a new folder and start the launcher: it offers to **bring
+- **Coming from an older version?** Extract v1.7.2 into a new folder and start the launcher: it offers to **bring
   everything over** (game folder, title update, DLC, saves, created superstars, music, keys and settings). Updating
   with the launcher's **Update** button keeps everything in place.
 
@@ -337,8 +347,8 @@ is a compiled recompilation derived from the game; it is not a substitute for su
 
 ## Install and play
 
-1. Download `WWE2K14-Recomp-v1.7.1-x64.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
-   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.7.1-x64.zip`.
+1. Download `WWE2K14-Recomp-v1.7.2-x64.zip` (the combined Windows and Linux package) and extract it to a normal folder such as Documents or Desktop (not
+   `C:\Program Files`). For a manual Linux-only download, use `Linux-WWE2K14-Recomp-v1.7.2-x64.zip`.
 2. Start **`WWE 2K14 Launcher.exe`** (Linux: `Linux-x86_64/wwe2k14-launcher`).
 3. In **Game files**, do one of the following:
    - put your game folder in the `WWE 2K14` folder beside the launcher, or
@@ -482,7 +492,7 @@ thread and what it was waiting on at the moment it stopped presenting.
   [Xenia](https://github.com/xenia-project/xenia). See their licenses in `third-party-licenses/`.
 - **New renderer** (`wwe2k14-vulkan.exe`, `wwe2k14-d3d12.exe`, `wwe2k14-d3d11.exe` and `Linux-x86_64/wwe2k14-vulkan`):
   the WWE '13 Recomp v1.6 native renderer by **iMrBurn**, released jointly with PromethenDev under the **GNU General
-  Public License v3**. These programs are therefore distributed under GPL-3.0; their source code is the `v1.7.1` tag
+  Public License v3**. These programs are therefore distributed under GPL-3.0; their source code is the `v1.7.2` tag
   of this repository. Parts:
   re:Blue (BSD 3-Clause), plume (MIT), the Direct3D 11 backend from Kaiko's WWE SmackDown vs. Raw 2011 PC port (used with
   permission), XenosRecomp (MIT). See `third-party-licenses/new-renderer/`.

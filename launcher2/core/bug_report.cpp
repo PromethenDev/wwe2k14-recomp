@@ -371,8 +371,20 @@ Result SaveBugReport(const Paths& paths, fs::path* created_zip, const fs::path& 
         raw.name = "logs/crash-watch/" + internal::PathToUtf8(note.filename());
         raw.bytes = bytes;
         entries.push_back(std::move(raw));
-        const std::string decoded = "Game log: " + internal::PathToUtf8(note.filename()).substr(
-            0, internal::PathToUtf8(note.filename()).size() - 5) + "\n" + DescribeExitNote(text);
+        const std::string log_name = internal::PathToUtf8(note.filename()).substr(
+            0, internal::PathToUtf8(note.filename()).size() - 5);
+        std::string decoded = "Game log: " + log_name + "\n" + DescribeExitNote(text);
+        // The exit code alone reads "crash" after a normal close too (the known exit crash, GitHub #193 report):
+        // add how the launcher's session list classifies the run.
+        std::error_code log_error;
+        const fs::path game_log = paths.logs_dir / internal::PathFromUtf8(log_name);
+        if (fs::is_regular_file(game_log, log_error) && !log_error) {
+          const GameSession session = ReadGameSession(paths, game_log);
+          decoded += session.end == SessionEnd::kClosed    ? "Session: closed by the player (a crash code after that is the known exit crash)\n"
+                     : session.end == SessionEnd::kCrashed ? "Session: crashed while playing\n"
+                     : session.end == SessionEnd::kFroze   ? "Session: froze (freeze report written)\n"
+                                                           : "Session: no ending in the log (forced close, power loss or still running)\n";
+        }
         internal::ZipEntry end;
         end.name = "session-end.txt";
         end.bytes.assign(decoded.begin(), decoded.end());

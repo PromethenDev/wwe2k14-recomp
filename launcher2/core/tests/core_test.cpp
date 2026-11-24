@@ -1163,6 +1163,18 @@ void TestBugReportSessionExtras(const fs::path& root) {
   assert(names.count("logs/crash-watch/wwe2k14-20261108-194320.log.exit"));
   assert(names.count("missing-shaders/AAAA.vs.ucode") && names.count("missing-shaders/BBBB.ps.ucode"));
   assert(end_text.find("memory access") != std::string::npos);
+  assert(end_text.find("Session: crashed while playing") != std::string::npos);
+  {  // A crash code after the game logged its close = the known exit crash: the report says the player closed it.
+    std::ofstream(log) << "game log\n[core] Execution complete\n";
+    fs::path closed_report;
+    assert(SaveBugReport(paths, &closed_report, log).ok);
+    std::set<std::string> closed_names;
+    std::string closed_system, closed_end;
+    read(closed_report, closed_names, closed_system, closed_end);
+    assert(closed_end.find("Session: closed by the player") != std::string::npos);
+    fs::remove(closed_report);
+    std::ofstream(log) << "game log\n";
+  }
   assert(system_text.find("own-slots.txt): MISSING") != std::string::npos);
   assert(system_text.find("mods/wwe13/roster.tsv 2 rows") != std::string::npos);
   assert(system_text.find(paths.exe_dir.string()) == std::string::npos);

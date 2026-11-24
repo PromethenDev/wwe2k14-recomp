@@ -1,5 +1,13 @@
 # Changelog
 
+## v1.7.2 - 2026-11-23
+
+- **Faster match loading on the new renderer** (Vulkan, DirectX 12, DirectX 11): about as fast as the Xbox renderer
+  again (Intel UHD 630, arena to entrance: Vulkan 23 -> 8 s, DirectX 12 25 -> 8 s, DirectX 11 15 -> 8 s) (GitHub #193).
+- **Possible fix: DirectX 12 black screen on older Intel graphics** (HD 520): falls back to another kind of graphics
+  memory when the driver refuses one (GitHub #46). Not confirmed on an HD 520 yet.
+- **Bug reports** now say whether the game was closed by the player or crashed.
+
 ## v1.7.1 - 2026-11-23
 
 - **New renderer on Linux too** (Vulkan): Settings > Renderer offers Vulkan (recommended) or Xbox on Linux.

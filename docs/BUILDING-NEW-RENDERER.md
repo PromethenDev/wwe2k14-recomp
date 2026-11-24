@@ -1,10 +1,10 @@
-# Building the new renderer (v1.7.1)
+# Building the new renderer (v1.7.2)
 
 From v1.7.0 the Windows release has three extra game programs: `wwe2k14-vulkan.exe`, `wwe2k14-d3d12.exe` and
 `wwe2k14-d3d11.exe`; from v1.7.1 the Linux release has `Linux-x86_64/wwe2k14-vulkan`. They are WWE 2K14 drawn through the WWE '13 Recomp v1.6 native renderer by iMrBurn
 (`src/native/w13r`, GPL-3.0, see `src/native/w13r/LICENSE.GPL-3.0` and `src/native/w13r/THIRD_PARTY.wwe13.md`).
 Because they contain that code, these programs as a whole are distributed under GPL-3.0; this repository
-(tag `v1.7.1`) is their source. `wwe2k14.exe` (Xbox renderer) and the launcher keep the BSD 3-Clause licence.
+(tag `v1.7.2`) is their source. `wwe2k14.exe` (Xbox renderer) and the launcher keep the BSD 3-Clause licence.
 
 Not included, as for every build of this project: the game, the code recompiled from your `default.xex`
 (`generated/`, made by `tools/codegen.sh`), and the game's shaders the Direct3D builds pre-convert (see step 3).
@@ -12,7 +12,7 @@ Not included, as for every build of this project: the game, the code recompiled 
 ## 1. SDK
 
 The same as the main build (`docs/BUILDING.md`): `tools/setup.sh` clones rexglue-sdk-yukes at
-`987593c0fc6612850a2e1b247b2b03aa5281e663` and applies `rexglue-patches/*.patch` (149 patches for v1.7.1).
+`987593c0fc6612850a2e1b247b2b03aa5281e663` and applies `rexglue-patches/*.patch` (150 patches for v1.7.2).
 
 ## 2. Renderer dependencies (plume, XenosRecomp)
 

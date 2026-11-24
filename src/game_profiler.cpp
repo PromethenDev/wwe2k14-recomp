@@ -47,6 +47,16 @@ constexpr size_t kStackBytes = 32768;      // stack bytes scanned per sample
 constexpr uint32_t kMaxSamplesPerThread = kTicksPerReport + 4;
 constexpr double kLogPct = 5.0;            // log threads using >= 5 % of one CPU
 constexpr double kSamplePct = 10.0;        // PC-sample threads that used >= 10 % of one CPU last window
+// SLOWLOAD 11-23 (test only): WWE2K14_PROFILE_SAMPLE_PCT=<pct> lowers the sample/log threshold; WWE2K14_PROFILE_EXE_ONLY=1
+// keeps only samples whose leaf is in the exe (running game code, not parked in a kernel wait) and logs 8 leaves/5 stacks.
+double EnvPct(const char* name, double fallback) {
+  const char* v = std::getenv(name);
+  return v && *v ? std::strtod(v, nullptr) : fallback;
+}
+bool ExeOnly() {
+  static const bool on = [] { const char* v = std::getenv("WWE2K14_PROFILE_EXE_ONLY"); return v && *v == '1'; }();
+  return on;
+}
 
 std::once_flag g_once;
 uintptr_t g_base = 0, g_end = 0;
@@ -400,6 +410,7 @@ void Run() {
   gpu_perf.Init();
   const char* pc_env = std::getenv("WWE2K14_PROFILE_PC");
   const bool pc_sampling = pc_env && std::strcmp(pc_env, "1") == 0;
+  const double sample_pct = EnvPct("WWE2K14_PROFILE_SAMPLE_PCT", kSamplePct);
   REXLOG_INFO("[prof] thread PC sampling {} (WWE2K14_PROFILE_PC)", pc_sampling ? "on" : "off");
   std::unordered_map<DWORD, Thread> threads;
   Refresh(threads, self, pid);
@@ -411,7 +422,7 @@ void Run() {
       for (auto& [tid, t] : threads) {
         if (!t.sample || t.samples.size() >= kMaxSamplesPerThread) continue;
         Sample s;
-        if (SampleOne(t.h, s)) t.samples.push_back(s);
+        if (SampleOne(t.h, s) && (!ExeOnly() || InExe(s.pc))) t.samples.push_back(s);
       }
     }
     const uint64_t now = NowNs();
@@ -444,7 +455,7 @@ void Run() {
       gpu_perf.Log(window);
     }
     for (const Row& r : rows) {
-      if (r.pct < kLogPct) break;
+      if (r.pct < (sample_pct < kLogPct ? sample_pct : kLogPct)) break;
       std::string leaf = "-", stack = "-";
       if (!r.t->samples.empty()) {
         std::unordered_map<std::string, uint32_t> lm, sm;
@@ -454,8 +465,8 @@ void Run() {
           for (uint32_t i = 0; i < s.ncand && i < 5; ++i) sig += (i ? ">" : "") + Where(s.cand[i]);
           ++sm[sig.empty() ? "-" : sig];
         }
-        leaf = Top(lm, 4);
-        stack = Top(sm, 2);
+        leaf = Top(lm, ExeOnly() ? 8 : 4);
+        stack = Top(sm, ExeOnly() ? 5 : 2);
       }
       REXLOG_INFO("[prof] s={} tid={} name={} cpu_pct={:.0f} kernel_pct={:.0f} samples={} leaf={} stack={}", window,
                   r.t->tid, r.t->name, r.pct, r.kpct, r.t->samples.size(), leaf, stack);
@@ -467,7 +478,7 @@ void Run() {
       t.samples.clear();
     }
     for (const Row& r : rows) {
-      if (!pc_sampling || chosen >= kMaxSampled || r.pct < kSamplePct) break;
+      if (!pc_sampling || chosen >= kMaxSampled || r.pct < sample_pct) break;
       r.t->sample = true;
       ++chosen;
     }

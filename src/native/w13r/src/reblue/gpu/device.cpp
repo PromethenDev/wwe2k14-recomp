@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <format>
 #include <memory>
 #include <mutex>
@@ -928,20 +929,48 @@ CreateHostBuffer(plume::RenderDevice *device,
     BD_ERROR("CreateHostBuffer({}): no host device", tag ? tag : "?");
     return nullptr;
   }
-  auto buffer = device->createBuffer(desc);
   // plume returns a non-null wrapper even when the allocation failed, so probe
   // the backend handle. GPU_UPLOAD makes that reachable: DEVICE_LOCAL and
   // HOST_VISIBLE are requiredFlags, so unlike UPLOAD it has no fallback heap.
-  if (!buffer
+  auto backend_null = [](const std::unique_ptr<plume::RenderBuffer> &b) {
+    return !b
 #if defined(REBLUE_D3D11)
-      || (!static_cast<plume::D3D11Buffer *>(buffer.get())->d3d &&
-          !static_cast<plume::D3D11Buffer *>(buffer.get())->cpu)
+           || (!static_cast<plume::D3D11Buffer *>(b.get())->d3d &&
+               !static_cast<plume::D3D11Buffer *>(b.get())->cpu)
 #elif defined(REBLUE_D3D12)
-      || static_cast<plume::D3D12Buffer *>(buffer.get())->d3d == nullptr
+           || static_cast<plume::D3D12Buffer *>(b.get())->d3d == nullptr
 #else
-      || static_cast<plume::VulkanBuffer *>(buffer.get())->vk == VK_NULL_HANDLE
+           || static_cast<plume::VulkanBuffer *>(b.get())->vk == VK_NULL_HANDLE
 #endif
-  ) {
+        ;
+  };
+  auto buffer = device->createBuffer(desc);
+  // WWE2K14_W13R_TEST_FAIL_GPU_UPLOAD=1 makes the first GPU_UPLOAD create count
+  // as failed, so the fallback below can be checked on hardware where the heap
+  // works (GH #46 test only).
+  static std::atomic<bool> s_test_fail{[] {
+    const char *v = std::getenv("WWE2K14_W13R_TEST_FAIL_GPU_UPLOAD");
+    return v && v[0] == '1';
+  }()};
+  if (desc.heapType == plume::RenderHeapType::GPU_UPLOAD &&
+      s_test_fail.exchange(false))
+    buffer.reset();
+  // GH #46: on an Intel HD 520 (Windows 10, driver 101.2115) plume's UMA
+  // stand-in for GPU_UPLOAD (a custom UPLOAD-like heap) refuses buffers while
+  // plain UPLOAD works; the lost quad-list index buffer left the picture black.
+  // Turn GPU_UPLOAD off for the rest of the session (GeometryHeapType then
+  // answers UPLOAD) and retry this buffer in UPLOAD.
+  if (desc.heapType == plume::RenderHeapType::GPU_UPLOAD &&
+      backend_null(buffer)) {
+    BD_WARN("CreateHostBuffer({}): GPU_UPLOAD heap refused {} bytes; "
+            "geometry uses the UPLOAD heap from now on",
+            tag ? tag : "?", desc.size);
+    rex::cvar::SetFlagByName("bd_geometry_gpu_upload", "false");
+    plume::RenderBufferDesc retry = desc;
+    retry.heapType = plume::RenderHeapType::UPLOAD;
+    buffer = device->createBuffer(retry);
+  }
+  if (backend_null(buffer)) {
     BD_ERROR(
         "CreateHostBuffer({}) failed: backend resource null (size={} bytes)",
         tag ? tag : "?", desc.size);
